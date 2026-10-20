@@ -2442,7 +2442,7 @@ mod auto_review_tests {
     #[test]
     fn classifier_preserves_priority_on_supported_codex_override() {
         for (configured, expected) in [
-            (None, "gpt-5.6-luna-fast"),
+            (None, "gpt-6-luna-fast"),
             (Some("gpt-5.6-sol"), "gpt-5.6-sol-fast"),
             (Some("grok-4.5"), "grok-4.5"),
         ] {
