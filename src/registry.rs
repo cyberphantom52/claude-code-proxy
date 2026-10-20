@@ -189,6 +189,14 @@ impl Registry {
             }
         }
 
+        let base = crate::providers::codex::translate::model_allowlist::split_tier_suffix(&normalized)
+            .map_or(normalized.as_str(), |(base, _)| base);
+        if crate::providers::codex::translate::model_catalog::catalog_model(base)
+            .is_some_and(|model| model.supported_in_api)
+        {
+            return self.handlers.get("codex").cloned();
+        }
+
         None
     }
 
@@ -321,11 +329,18 @@ const GROK_CLI: PlaceholderCli = PlaceholderCli { provider: "grok" };
 fn expand_codex_models() -> Vec<String> {
     let mut set = HashSet::new();
     let mut out = Vec::new();
-    for model in CODEX_MODELS {
-        if set.insert((*model).to_string()) {
-            out.push((*model).to_string());
+    // Baseline ∪ models the Codex CLI advertises in its own model cache, so a
+    // model OpenAI ships to Codex routes here before a proxy release lists it.
+    let catalog = crate::providers::codex::translate::model_allowlist::listed_catalog_models();
+    for model in CODEX_MODELS
+        .iter()
+        .map(|model| (*model).to_string())
+        .chain(catalog)
+    {
+        if set.insert(model.clone()) {
+            out.push(model.clone());
         }
-        for variant in tier_model_variants(model) {
+        for variant in tier_model_variants(&model) {
             if set.insert(variant.clone()) {
                 out.push(variant);
             }
