@@ -113,6 +113,18 @@ Quota telemetry reports the most recently observed upstream snapshot. It is
 not a fresh account-usage query. Subscription model access and live OAuth or
 generation acceptance require signing in and trying the service.
 
+## Validation
+
+Verified on Rust 1.98.1:
+
+- `cargo test --all --locked`: 1,205 tests passed; baseline main had 1,119.
+- `cargo clippy --all-targets --locked -- -D warnings`: passed.
+- `cargo fmt --all -- --check`: passed.
+- `cargo build --release --locked`: passed; the release binary starts and prints its version.
+
+Provider tests use synthetic credentials and local mock servers. Live ChatGPT
+login and generation are not verified by these checks.
+
 ## Excluded pull requests
 
 | PRs | Reason |
