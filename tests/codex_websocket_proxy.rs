@@ -1,6 +1,8 @@
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
-use claude_code_proxy::providers::codex::websocket::clear_codex_websocket_pool_for_tests;
+use claude_code_proxy::providers::codex::websocket::{
+    clear_codex_websocket_pool_for_tests, reset_codex_websocket_connect_gate_for_tests,
+};
 use claude_code_proxy::{registry::Registry, server::app};
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
@@ -311,6 +313,7 @@ async fn check_transport_policy(
     close_after_send: bool,
 ) {
     clear_codex_websocket_pool_for_tests();
+    reset_codex_websocket_connect_gate_for_tests().await;
     let (origin_url, captured, stop, task) = spawn_transport_origin(close_after_send).await;
     let result = {
         let _retry_delay = ZeroRetryDelayGuard::new();

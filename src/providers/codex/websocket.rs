@@ -368,6 +368,14 @@ pub fn clear_codex_websocket_pool_for_tests() {
     guard.clear();
 }
 
+#[doc(hidden)]
+pub async fn reset_codex_websocket_connect_gate_for_tests() {
+    let mut state = WS_CONNECT_GATE.state.lock().await;
+    state.last_start = None;
+    state.spacing = WS_CONNECT_GATE.floor;
+    state.successes = 0;
+}
+
 #[cfg(test)]
 pub(crate) async fn lock_codex_websocket_pool_for_tests() -> tokio::sync::MutexGuard<'static, ()> {
     WS_POOL_TEST_LOCK.lock().await
