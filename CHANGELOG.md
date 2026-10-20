@@ -3,6 +3,12 @@ title: Changelog
 description: Release notes for claude-code-proxy.
 ---
 
+## Unreleased
+
+- Codex standalone searches keep stable per-Agent sessions without colliding
+  with sibling Agents that share a Claude Code session, and align all upstream
+  search identity headers with the request body owner.
+
 ## v0.1.45 (2026-10-10)
 
 - Codex users can request the ultrafast service tier with
