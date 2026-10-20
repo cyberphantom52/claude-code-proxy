@@ -2797,7 +2797,10 @@ mod tests {
         tokio::task::yield_now().await;
         drop(guard);
         rejected.await.unwrap();
-        assert_eq!(gate.spacing_for_tests().await, WEBSOCKET_CONNECT_BACKOFF_STEP);
+        assert_eq!(
+            gate.spacing_for_tests().await,
+            WEBSOCKET_CONNECT_BACKOFF_STEP
+        );
     }
 
     #[tokio::test(start_paused = true)]

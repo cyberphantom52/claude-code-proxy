@@ -189,8 +189,9 @@ impl Registry {
             }
         }
 
-        let base = crate::providers::codex::translate::model_allowlist::split_tier_suffix(&normalized)
-            .map_or(normalized.as_str(), |(base, _)| base);
+        let base =
+            crate::providers::codex::translate::model_allowlist::split_tier_suffix(&normalized)
+                .map_or(normalized.as_str(), |(base, _)| base);
         if crate::providers::codex::translate::model_catalog::catalog_model(base)
             .is_some_and(|model| model.supported_in_api)
         {
@@ -419,7 +420,7 @@ mod tests {
             "claude-opus-5-5",
             "fable",
             "claude-fable-5",
-                ] {
+        ] {
             let p = registry.provider_for_model(model, None);
             assert!(p.is_some(), "{model} should route to a provider");
             assert_eq!(p.expect("provider").name(), "codex");

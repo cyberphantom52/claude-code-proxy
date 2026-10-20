@@ -2,7 +2,9 @@ use claude_code_proxy::{
     config::AliasProvider,
     providers::codex::{
         native::validate_native_request_model,
-        translate::model_allowlist::{assert_allowed_model, split_tier_suffix, uses_responses_lite},
+        translate::model_allowlist::{
+            assert_allowed_model, split_tier_suffix, uses_responses_lite,
+        },
     },
     registry::Registry,
 };
@@ -27,8 +29,14 @@ fn catalog_models_route_with_fast_tiers_and_preserve_builtins() {
     for model in ["gpt-catalog-test", "gpt-hidden-test"] {
         assert_allowed_model(model).unwrap();
         for name in [model.to_string(), format!("{model}-fast")] {
-            assert_eq!(registry.provider_for_model(&name, None).unwrap().name(), "codex");
-            assert_eq!(validate_native_request_model(&json!({"model": name})).unwrap(), model);
+            assert_eq!(
+                registry.provider_for_model(&name, None).unwrap().name(),
+                "codex"
+            );
+            assert_eq!(
+                validate_native_request_model(&json!({"model": name})).unwrap(),
+                model
+            );
         }
         assert!(split_tier_suffix(&format!("{model}-fast")).is_some());
         assert!(split_tier_suffix(&format!("{model}-ultrafast")).is_none());
@@ -37,7 +45,11 @@ fn catalog_models_route_with_fast_tiers_and_preserve_builtins() {
     assert!(uses_responses_lite("gpt-6.1-sol"));
     assert!(split_tier_suffix("gpt-6.1-sol-ultrafast").is_some());
     assert!(assert_allowed_model("gpt-unavailable-test").is_err());
-    assert!(registry.provider_for_model("gpt-unavailable-test", None).is_none());
+    assert!(
+        registry
+            .provider_for_model("gpt-unavailable-test", None)
+            .is_none()
+    );
     let listed = registry.supported_models_for("codex");
     assert!(listed.contains(&"gpt-catalog-test-fast".to_string()));
     assert!(!listed.contains(&"gpt-hidden-test".to_string()));
