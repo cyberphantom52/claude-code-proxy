@@ -507,6 +507,7 @@ fn http_sse_protocol_error(message: &str) -> CodexError {
         message: format!("Codex HTTP tool event protocol error: {message}"),
         detail: Some("http_response_sse_protocol".to_string()),
         retry_after: None,
+        usage_limit: None,
         origin: CodexErrorOrigin::Http,
     }
 }
@@ -2886,6 +2887,7 @@ impl PendingHttpProvisionalTools {
                             message: message.clone(),
                             detail: Some(message),
                             retry_after: None,
+                            usage_limit: None,
                             origin: CodexErrorOrigin::Http,
                         }
                     }
@@ -3018,6 +3020,7 @@ fn ensure_buffered_tool_args_limit(name: &str, len: usize) -> Result<(), CodexEr
             "Buffered {tool} tool arguments exceeded safe limits"
         )),
         retry_after: None,
+        usage_limit: None,
         origin: CodexErrorOrigin::Http,
     })
 }
@@ -3030,6 +3033,7 @@ fn pending_http_event_buffer_error(limit: &str) -> CodexError {
             "Codex pending HTTP event buffer exceeded its {limit} limit"
         )),
         retry_after: None,
+        usage_limit: None,
         origin: CodexErrorOrigin::Http,
     }
 }

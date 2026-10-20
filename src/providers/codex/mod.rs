@@ -2805,6 +2805,7 @@ mod tests {
                 message: format!("status {status}"),
                 detail: Some(format!("detail {status}")),
                 retry_after: None,
+                usage_limit: None,
                 origin: client::CodexErrorOrigin::Http,
             };
             let response = map_codex_error_to_response(&err);
@@ -2834,6 +2835,7 @@ mod tests {
                 message: format!("status {status}"),
                 detail: Some(format!("detail {status}")),
                 retry_after: None,
+                usage_limit: None,
                 origin: client::CodexErrorOrigin::Http,
             };
             assert_eq!(codex_stream_error_type(&err), expected_type);

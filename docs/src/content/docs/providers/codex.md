@@ -54,6 +54,9 @@ Claude Code summary compaction requests are capped at low effort by default beca
 
 ## Tools and multimodal input
 
+- `CCP_CODEX_FULL_LANE=1` or `codex.fullLane: true` routes `gpt-5.6-sol`
+  and `gpt-5.6-terra` through the full Responses lane to allow parallel tool
+  calls. Other models keep their normal lane, including Lite-only Luna models.
 - Claude function tools and tool results map to Responses API function calls and outputs.
 - With Claude Code's tool search on (`ENABLE_TOOL_SEARCH=true`, see [Configure Claude Code](/using/configure-claude-code/#mcp-tool-search)),
   a deferred tool reaches the model once `ToolSearch` loads it. On the Responses
