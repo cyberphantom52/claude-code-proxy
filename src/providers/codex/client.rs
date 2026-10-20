@@ -1519,20 +1519,17 @@ impl CodexHttpClient {
 
                         let event_kind = super::events::classify_stream_event(&payload);
                         let failure = super::events::classify_event_failure(&payload);
-                        if !semantic_output_forwarded {
-                            if let Some(limit) = super::events::usage_limit_from_event_with_headers(
+                        if !semantic_output_forwarded
+                            && let Some(limit) = super::events::usage_limit_from_event_with_headers(
                                 &payload,
                                 &response_headers,
-                            ) {
-                                pending_events.clear();
-                                let _ = tx
-                                    .send(Err(codex_usage_limit_error(
-                                        limit,
-                                        CodexErrorOrigin::Http,
-                                    )))
-                                    .await;
-                                return;
-                            }
+                            )
+                        {
+                            pending_events.clear();
+                            let _ = tx
+                                .send(Err(codex_usage_limit_error(limit, CodexErrorOrigin::Http)))
+                                .await;
+                            return;
                         }
                         let provisional_event = match provisional_tools.observe(&mut payload) {
                             Ok(event) => event,

@@ -3,7 +3,7 @@ use claude_code_proxy::{
     providers::codex::{
         native::validate_native_request_model,
         translate::model_allowlist::{
-            assert_allowed_model, split_tier_suffix, uses_responses_lite,
+            assert_allowed_model, resolve_model_request, split_tier_suffix, uses_responses_lite,
         },
     },
     registry::Registry,
@@ -35,8 +35,9 @@ fn catalog_models_route_with_fast_tiers_and_preserve_builtins() {
             );
             assert_eq!(
                 validate_native_request_model(&json!({"model": name})).unwrap(),
-                model
+                name
             );
+            assert_eq!(resolve_model_request(&name).model, model);
         }
         assert!(split_tier_suffix(&format!("{model}-fast")).is_some());
         assert!(split_tier_suffix(&format!("{model}-ultrafast")).is_none());

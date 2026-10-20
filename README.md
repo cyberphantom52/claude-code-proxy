@@ -34,6 +34,9 @@ throughput.
 
 ## Quick start with Codex
 
+For the local `chatgpt-codex-improvements` branch, see the
+[source build, ChatGPT login, and PR selection guide](docs/src/content/docs/using/chatgpt-integration.md).
+
 Install on macOS or Linux:
 
 ```sh

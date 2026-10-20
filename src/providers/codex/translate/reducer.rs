@@ -57,7 +57,7 @@ pub struct CodexUsage {
     /// Latest `codex.rate_limits` snapshot seen on the stream that produced
     /// this usage. Codex sends it as its own event before any usage exists,
     /// so the translator carries it here for the mapper.
-    pub rate_limits: Option<CodexRateLimits>,
+    pub rate_limits: Option<Box<CodexRateLimits>>,
 }
 
 /// Subscription meter summary from a `codex.rate_limits` stream event.
@@ -85,7 +85,7 @@ pub struct CodexRateLimitWindow {
 
 /// Parse a `codex.rate_limits` event payload. Returns `None` when the event
 /// carries no `rate_limits` object.
-pub fn parse_codex_rate_limits(payload: &serde_json::Value) -> Option<CodexRateLimits> {
+pub fn parse_codex_rate_limits(payload: &serde_json::Value) -> Option<Box<CodexRateLimits>> {
     let limits = payload.get("rate_limits")?.as_object()?;
     let window = |name: &str| -> Option<CodexRateLimitWindow> {
         let w = limits.get(name)?.as_object()?;
@@ -95,7 +95,7 @@ pub fn parse_codex_rate_limits(payload: &serde_json::Value) -> Option<CodexRateL
             reset_at: w.get("reset_at").and_then(|v| v.as_u64()),
         })
     };
-    Some(CodexRateLimits {
+    Some(Box::new(CodexRateLimits {
         plan_type: payload
             .get("plan_type")
             .and_then(|v| v.as_str())
@@ -103,7 +103,7 @@ pub fn parse_codex_rate_limits(payload: &serde_json::Value) -> Option<CodexRateL
         limit_reached: limits.get("limit_reached").and_then(|v| v.as_bool()),
         primary: window("primary"),
         secondary: window("secondary"),
-    })
+    }))
 }
 
 pub type StopReason = &'static str;
@@ -321,7 +321,7 @@ pub(crate) fn reduce_upstream_bytes_with_policy(
     let mut active_thinking: Option<ActiveThinking> = None;
     let mut saw_tool_use = false;
     let mut final_usage: Option<CodexUsage> = None;
-    let mut latest_rate_limits: Option<CodexRateLimits> = None;
+    let mut latest_rate_limits: Option<Box<CodexRateLimits>> = None;
     let mut response_id: Option<String> = None;
     let mut terminal_type: Option<String> = None;
     let mut continuation_eligible = false;
@@ -1131,7 +1131,7 @@ pub struct AnthropicUsage {
     /// event, so a downstream proxy can account per turn. Claude Code ignores
     /// the unknown key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub codex_rate_limits: Option<CodexRateLimits>,
+    pub codex_rate_limits: Option<Box<CodexRateLimits>>,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -1715,7 +1715,7 @@ mod tests {
             output_tokens: Some(50),
             input_tokens_details_cached: None,
             output_tokens_details_reasoning: Some(30),
-            rate_limits: Some(CodexRateLimits {
+            rate_limits: Some(Box::new(CodexRateLimits {
                 plan_type: Some("prolite".into()),
                 limit_reached: Some(false),
                 primary: Some(CodexRateLimitWindow {
@@ -1724,7 +1724,7 @@ mod tests {
                     reset_at: Some(1_789_765_755),
                 }),
                 secondary: None,
-            }),
+            })),
         };
         let mapped = map_codex_usage_to_anthropic(&Some(usage), None);
         let details = mapped

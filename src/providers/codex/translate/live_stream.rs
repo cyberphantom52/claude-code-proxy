@@ -163,7 +163,7 @@ pub struct LiveStreamTranslator {
     finished: bool,
     // Latest `codex.rate_limits` event seen on this stream; handed to the
     // usage mapper at finish so the terminal usage block carries the meter.
-    rate_limits: Option<CodexRateLimits>,
+    rate_limits: Option<Box<CodexRateLimits>>,
 }
 
 impl LiveStreamTranslator {
