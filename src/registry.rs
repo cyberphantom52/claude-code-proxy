@@ -419,7 +419,7 @@ mod tests {
             "claude-opus-5-5",
             "fable",
             "claude-fable-5",
-        ] {
+                ] {
             let p = registry.provider_for_model(model, None);
             assert!(p.is_some(), "{model} should route to a provider");
             assert_eq!(p.expect("provider").name(), "codex");
