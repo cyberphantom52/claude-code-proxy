@@ -262,20 +262,6 @@ async fn discovery_scopes_all_text_ingress_and_cli_without_constructor_io() {
     let models = String::from_utf8(output.stdout).unwrap();
     assert!(models.contains("gpt-discovered"));
     assert!(!models.contains("gpt-5.4"));
-    let output = isolated_command(config.path(), &upstream_url)
-        .args(["launch", "--print-env"])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let env: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(env["ANTHROPIC_MODEL"], "gpt-discovered");
-    assert_eq!(env["ANTHROPIC_SMALL_FAST_MODEL"], "gpt-discovered");
-    assert_eq!(env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "190000");
-    assert_eq!(env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "150000");
-    assert_eq!(state.models.load(Ordering::SeqCst), 3);
+    assert_eq!(state.models.load(Ordering::SeqCst), 2);
     fixture.abort();
 }

@@ -1,4 +1,4 @@
-//! Model metadata used by discovery, request shaping and launch policy.
+//! Model metadata used by discovery and request shaping.
 //!
 //! Each operation pins an immutable catalog: concurrent requests must not see
 //! another account's models. Unscoped callers use built-ins and an explicitly
@@ -86,30 +86,6 @@ impl Default for CatalogModel {
 }
 
 impl CatalogModel {
-    /// The active window, not a larger window the backend might offer separately.
-    pub fn context_window_tokens(&self) -> Option<u64> {
-        self.context_window.filter(|n| *n > 0)
-    }
-
-    pub fn usable_context_tokens(&self) -> Option<u64> {
-        let percent = self.effective_context_window_percent.unwrap_or(95).min(100);
-        self.context_window_tokens()
-            .map(|window| ((u128::from(window) * u128::from(percent)) / 100) as u64)
-            .filter(|n| *n > 0)
-    }
-
-    /// Native Codex's default is 90% of the active window, capped by metadata.
-    pub fn auto_compact_tokens(&self) -> Option<u64> {
-        match self.context_window_tokens() {
-            Some(window) => {
-                let limit = ((u128::from(window) * 90) / 100) as u64;
-                Some(limit.min(self.auto_compact_token_limit.unwrap_or(limit)))
-            }
-            None => self.auto_compact_token_limit,
-        }
-        .filter(|n| *n > 0)
-    }
-
     pub fn supports_effort(&self, effort: &str) -> Option<bool> {
         self.supported_reasoning_levels
             .as_ref()
@@ -317,6 +293,7 @@ mod tests {
     fn parses_real_capability_names_without_inventing_missing_capabilities() {
         let models = parse_catalog(&serde_json::to_vec(&json!({"models": [
             {"slug":"new-model", "context_window":272000,"max_context_window":872000,
+             "effective_context_window_percent":95,"auto_compact_token_limit":240000,
              "default_reasoning_level":"low", "supported_reasoning_levels":[{"effort":"low"},{"effort":"ultra"}],
              "supports_reasoning_summary_parameter":false,"support_verbosity":true,"default_verbosity":"low",
              "service_tiers":[{"id":"priority","name":"Fast"}],"input_modalities":["text"],
@@ -327,9 +304,10 @@ mod tests {
         ]})).unwrap()).unwrap();
         assert_eq!(models.len(), 4);
         let model = &models[0];
-        assert_eq!(model.context_window_tokens(), Some(272_000));
-        assert_eq!(model.usable_context_tokens(), Some(258_400));
-        assert_eq!(model.auto_compact_tokens(), Some(244_800));
+        assert_eq!(model.context_window, Some(272_000));
+        assert_eq!(model.max_context_window, Some(872_000));
+        assert_eq!(model.effective_context_window_percent, Some(95));
+        assert_eq!(model.auto_compact_token_limit, Some(240_000));
         assert_eq!(model.supports_effort("ultra"), Some(true));
         assert_eq!(model.supports_effort("none"), Some(false));
         assert_eq!(model.supports_reasoning_summaries, Some(false));
@@ -355,27 +333,6 @@ mod tests {
         let many = json!({"models": vec![json!({"slug":"a"}); MAX_CATALOG_MODELS + 1]});
         assert!(parse_catalog(&serde_json::to_vec(&many).unwrap()).is_none());
         assert_eq!(parse_catalog(b"{\"models\":[]}").unwrap(), Vec::new());
-    }
-
-    #[test]
-    fn active_context_wins_and_compaction_never_exceeds_its_policy() {
-        let mut model = CatalogModel {
-            context_window: Some(100_000),
-            max_context_window: Some(1_000_000),
-            auto_compact_token_limit: Some(80_000),
-            ..Default::default()
-        };
-        assert_eq!(model.auto_compact_tokens(), Some(80_000));
-        model.auto_compact_token_limit = Some(999_999);
-        assert_eq!(model.auto_compact_tokens(), Some(90_000));
-        model.context_window = None;
-        assert_eq!(model.context_window_tokens(), None);
-        assert_eq!(model.usable_context_tokens(), None);
-        model.context_window = Some(u64::MAX);
-        assert_eq!(model.auto_compact_tokens(), Some(999_999));
-        assert!(model.usable_context_tokens().is_some());
-        model.effective_context_window_percent = Some(0);
-        assert_eq!(model.usable_context_tokens(), None);
     }
 
     #[tokio::test]

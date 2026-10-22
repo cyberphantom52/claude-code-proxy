@@ -48,8 +48,6 @@ enum Commands {
     Demo,
     /// List supported Codex models
     Models,
-    /// Launch Claude Code against an already running proxy with model-aware context limits
-    Launch(claude_code_proxy::launch::LaunchArgs),
     /// Manage Codex authentication
     Codex {
         #[command(subcommand)]
@@ -181,13 +179,6 @@ fn main() -> Result<()> {
                 models::with_model_context(context, async { print_models(&Registry::new()) }).await;
             });
             Ok(())
-        }
-        Commands::Launch(args) => {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()?;
-            let code = runtime.block_on(claude_code_proxy::launch::run(args))?;
-            std::process::exit(code);
         }
         Commands::Codex { command } => run_codex_cli(command),
     }

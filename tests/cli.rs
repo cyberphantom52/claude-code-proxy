@@ -1,6 +1,5 @@
 use assert_cmd::Command;
 use predicates::{prelude::PredicateBooleanExt, str::contains};
-use std::env;
 #[cfg(unix)]
 use std::{
     io::{Read, Write},
@@ -18,7 +17,8 @@ fn version_aliases_print_expected_version() -> Result<(), Box<dyn std::error::Er
 
     for arg in ["--version", "-v", "version"] {
         let mut cmd = Command::cargo_bin("claude-code-proxy")?;
-        cmd.arg(arg)
+        cmd.env_clear()
+            .arg(arg)
             .assert()
             .success()
             .stdout(contains(expected.clone()));
@@ -30,11 +30,12 @@ fn version_aliases_print_expected_version() -> Result<(), Box<dyn std::error::Er
 fn models_prints_only_codex_models() -> Result<(), Box<dyn std::error::Error>> {
     let temp = TempDir::new()?;
     let output = Command::cargo_bin("claude-code-proxy")?
+        .env_clear()
         .arg("models")
         .env("CCP_CONFIG_DIR", temp.path())
         .env("HOME", temp.path())
         .env("XDG_STATE_HOME", temp.path())
-        .env_remove("CCP_ALIAS_PROVIDER")
+        .env("CCP_CODEX_MODEL_DISCOVERY", "0")
         .output()?;
     assert!(output.status.success());
     let out = String::from_utf8(output.stdout)?;
@@ -46,6 +47,7 @@ fn models_prints_only_codex_models() -> Result<(), Box<dyn std::error::Error>> {
     assert!(out.contains("gpt-6-sol"));
     assert!(out.contains("haiku"));
     Command::cargo_bin("claude-code-proxy")?
+        .env_clear()
         .args(["models", "--full"])
         .assert()
         .code(2);
@@ -55,7 +57,7 @@ fn models_prints_only_codex_models() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn help_describes_visible_commands_and_hides_demo() -> Result<(), Box<dyn std::error::Error>> {
     let mut cmd = Command::cargo_bin("claude-code-proxy")?;
-    cmd.arg("--help");
+    cmd.env_clear().arg("--help");
     let output = cmd.output()?;
     assert!(output.status.success());
 
@@ -76,6 +78,7 @@ fn help_describes_visible_commands_and_hides_demo() -> Result<(), Box<dyn std::e
 #[test]
 fn invalid_command_exits_two() -> Result<(), Box<dyn std::error::Error>> {
     Command::cargo_bin("claude-code-proxy")?
+        .env_clear()
         .arg("definitely-not-a-command")
         .assert()
         .failure()
@@ -93,6 +96,7 @@ fn removed_backend_commands_are_rejected_without_deleting_auth()
         std::fs::write(&auth_path, "existing credentials")?;
         for action in ["login", "device", "status", "logout"] {
             Command::cargo_bin("claude-code-proxy")?
+                .env_clear()
                 .args([backend, "auth", action])
                 .env("CCP_CONFIG_DIR", temp.path())
                 .assert()
@@ -102,10 +106,10 @@ fn removed_backend_commands_are_rejected_without_deleting_auth()
         }
     }
     Command::cargo_bin("claude-code-proxy")?
+        .env_clear()
         .args(["codex", "auth", "logout"])
         .env("CCP_CONFIG_DIR", temp.path())
         .env("HOME", temp.path())
-        .env_remove("CCP_ALIAS_PROVIDER")
         .assert()
         .success();
     for backend in ["kimi", "grok", "cursor", "opencode"] {
@@ -121,6 +125,7 @@ fn removed_backend_commands_are_rejected_without_deleting_auth()
 fn stale_alias_selection_fails_with_migration_error() -> Result<(), Box<dyn std::error::Error>> {
     let temp = TempDir::new()?;
     Command::cargo_bin("claude-code-proxy")?
+        .env_clear()
         .arg("models")
         .env("CCP_CONFIG_DIR", temp.path())
         .env("CCP_ALIAS_PROVIDER", "kimi")
@@ -132,9 +137,9 @@ fn stale_alias_selection_fails_with_migration_error() -> Result<(), Box<dyn std:
         r#"{"aliasProvider":"kimi"}"#,
     )?;
     Command::cargo_bin("claude-code-proxy")?
+        .env_clear()
         .args(["serve", "--no-monitor", "--port", "0"])
         .env("CCP_CONFIG_DIR", temp.path())
-        .env_remove("CCP_ALIAS_PROVIDER")
         .assert()
         .failure()
         .stderr(contains("aliasProvider").and(contains("ChatGPT subscription")));
@@ -146,6 +151,7 @@ fn codex_browser_and_device_auth_commands_remain_available()
 -> Result<(), Box<dyn std::error::Error>> {
     for action in ["login", "device"] {
         Command::cargo_bin("claude-code-proxy")?
+            .env_clear()
             .args(["codex", "auth", action, "--help"])
             .assert()
             .success();
@@ -154,168 +160,13 @@ fn codex_browser_and_device_auth_commands_remain_available()
 }
 
 #[test]
-fn launch_print_env_validates_models_and_missing_context() -> Result<(), Box<dyn std::error::Error>>
-{
-    let temp = TempDir::new()?;
-    let import = temp.path().join("models.json");
-    std::fs::write(
-        &import,
-        r#"{"models":[{"slug":"gpt-new","supported_in_api":false,"visibility":"list"}]}"#,
-    )?;
-    let invoke = |args: &[&str]| -> Result<_, Box<dyn std::error::Error>> {
-        Ok(Command::cargo_bin("claude-code-proxy")?
-            .args(args)
-            .env_clear()
-            .env("HOME", temp.path())
-            .env("CCP_CONFIG_DIR", temp.path())
-            .env("CCP_CODEX_MODELS_FILE", &import)
-            .env("CCP_CODEX_MODEL_DISCOVERY", "0")
-            .output()?)
-    };
-    let output = invoke(&["launch", "--", "--model=gpt-new"])?;
-    assert!(!output.status.success());
-    assert!(String::from_utf8(output.stderr)?.contains("before `--`"));
-    let base = [
-        "launch",
-        "--model",
-        "gpt-new",
-        "--small-model",
-        "gpt-new",
-        "--print-env",
-    ];
-    let output = invoke(&base)?;
-    assert!(!output.status.success());
-    assert!(String::from_utf8(output.stderr)?.contains("--context-window"));
-    let mut args = base.to_vec();
-    args.extend(["--context-window", "200000"]);
-    let output = invoke(&args)?;
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let env: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-    assert_eq!(env["ANTHROPIC_MODEL"], "gpt-new");
-    assert_eq!(env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "200000");
-    assert_eq!(env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "180000");
-    let output = invoke(&[
-        "launch",
-        "--model",
-        "unadvertised-model",
-        "--context-window",
-        "200000",
-        "--print-env",
-    ])?;
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let env: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-    assert_eq!(env["ANTHROPIC_MODEL"], "unadvertised-model");
-    Ok(())
-}
-
-#[cfg(unix)]
-#[test]
-fn launch_only_changes_child_environment_and_propagates_args_and_exit()
--> Result<(), Box<dyn std::error::Error>> {
-    use std::os::unix::fs::PermissionsExt;
-    let temp = TempDir::new()?;
-    let bin = temp.path().join("bin");
-    std::fs::create_dir_all(&bin)?;
-    let settings = temp.path().join(".claude/settings.json");
-    std::fs::create_dir_all(settings.parent().unwrap())?;
-    std::fs::write(&settings, "existing user settings")?;
-    let codex = temp.path().join(".codex/models_cache.json");
-    std::fs::create_dir_all(codex.parent().unwrap())?;
-    std::fs::write(
-        &codex,
-        r#"{"models":[{"slug":"ambient-poison","supported_in_api":true,"visibility":"list"}]}"#,
-    )?;
-    let executable = bin.join("claude");
-    std::fs::write(
-        &executable,
-        "#!/bin/sh\n/usr/bin/env > \"$CAPTURE_ENV\"\nprintf '%s\\n' \"$@\" > \"$CAPTURE_ARGS\"\nexit 23\n",
-    )?;
-    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))?;
-    let captured_env = temp.path().join("child.env");
-    let captured_args = temp.path().join("child.args");
+fn removed_launch_command_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
     Command::cargo_bin("claude-code-proxy")?
-        .args([
-            "launch",
-            "--model",
-            "gpt-6-astra[1m]",
-            "--small-model",
-            "gpt-6-luna",
-            "--proxy-url",
-            "http://localhost:19432",
-            "--",
-            "--print",
-            "hello world",
-        ])
         .env_clear()
-        .env("HOME", temp.path())
-        .env("CCP_CONFIG_DIR", temp.path())
-        .env("CCP_CODEX_MODEL_DISCOVERY", "0")
-        .env("PATH", &bin)
-        .env("CAPTURE_ENV", &captured_env)
-        .env("CAPTURE_ARGS", &captured_args)
-        .env(
-            "ANTHROPIC_DEFAULT_OPUS_MODEL",
-            "gpt-stale-inherited-default",
-        )
+        .args(["launch", "--print-env"])
         .assert()
-        .code(23);
-    let captured = std::fs::read_to_string(captured_env)?;
-    for line in [
-        "ANTHROPIC_BASE_URL=http://localhost:19432",
-        "ANTHROPIC_AUTH_TOKEN=unused",
-        "ANTHROPIC_MODEL=gpt-6-astra[1m]",
-        "ANTHROPIC_SMALL_FAST_MODEL=gpt-6-luna",
-        "ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-5-5",
-        "ANTHROPIC_DEFAULT_FABLE_MODEL=claude-fable-5-1",
-        "ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-5-5",
-        "ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-haiku-5-5",
-        "CLAUDE_CODE_MAX_CONTEXT_TOKENS=258400",
-        "CLAUDE_CODE_AUTO_COMPACT_WINDOW=244800",
-        "ENABLE_TOOL_SEARCH=true",
-        "CLAUDE_CODE_SKIP_FAST_MODE_NETWORK_ERRORS=1",
-        "CLAUDE_CODE_SKIP_FAST_MODE_ORG_CHECK=1",
-        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
-        "CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1",
-    ] {
-        assert!(
-            captured.lines().any(|value| value == line),
-            "missing {line} in {captured}"
-        );
-    }
-    assert!(!captured.contains("AUTO_COMPACT_PCT"));
-    assert_eq!(
-        std::fs::read_to_string(captured_args)?,
-        "--print\nhello world\n"
-    );
-    assert_eq!(std::fs::read_to_string(settings)?, "existing user settings");
-    assert!(std::fs::read_to_string(codex)?.contains("ambient-poison"));
-    assert!(!temp.path().join("config.json").exists());
-    assert!(!temp.path().join("codex/auth.json").exists());
-    Command::cargo_bin("claude-code-proxy")?
-        .args([
-            "launch",
-            "--model",
-            "gpt-6-astra",
-            "--small-model",
-            "gpt-6-luna",
-            "--print-env",
-        ])
-        .env_clear()
-        .env("HOME", temp.path())
-        .env("CCP_CONFIG_DIR", temp.path())
-        .env("CCP_CODEX_MODEL_DISCOVERY", "0")
-        .env("CCP_CODEX_MODEL", "gpt-6-astra")
-        .assert()
-        .failure()
-        .stderr(contains("conflicts"));
+        .code(2)
+        .stderr(contains("unrecognized subcommand"));
     Ok(())
 }
 
@@ -405,13 +256,13 @@ fn plain_service_exits_on_second_signal(signal: &str) -> Result<(), Box<dyn std:
     )?;
     let port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
     let child = std::process::Command::new(env!("CARGO_BIN_EXE_claude-code-proxy"))
+        .env_clear()
         .args(["serve", "--no-monitor", "--port", &port.to_string()])
         .env("CCP_CONFIG_DIR", config.path())
         .env("CCP_CODEX_BASE_URL", upstream_url)
         .env("CCP_CODEX_TRANSPORT", "http")
         .env("CCP_CODEX_MODEL_DISCOVERY", "0")
         .env("HOME", config.path())
-        .env_remove("CCP_ALIAS_PROVIDER")
         .env("NO_PROXY", "127.0.0.1,localhost")
         .env("no_proxy", "127.0.0.1,localhost")
         .stdin(Stdio::null())
