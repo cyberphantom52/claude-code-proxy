@@ -552,7 +552,7 @@ pub fn translate_request(
     }
     let instructions = flatten_system_text(req.extra.get("system"));
     let is_compact = is_compact_messages_request(req);
-    let input = build_input(req);
+    let input = build_input(req)?;
     let tools = read_tools(req)?;
     let tool_choice = map_tool_choice(req)?;
     validate_input_modalities(&opts.model, &serde_json::to_value(&req.messages)?)?;
@@ -1083,12 +1083,37 @@ fn map_tool_choice(req: &MessagesRequest) -> Result<Option<ResponsesToolChoice>,
     }
 }
 
-fn build_input(req: &MessagesRequest) -> Vec<ResponsesInputItem> {
+fn build_input(req: &MessagesRequest) -> anyhow::Result<Vec<ResponsesInputItem>> {
     let mut out: Vec<ResponsesInputItem> = Vec::new();
     let mut read_tool_uses_with_offset = HashSet::new();
 
-    for msg in &req.messages {
-        let blocks = normalize_content(&msg.content);
+    for (message_index, msg) in req.messages.iter().enumerate() {
+        anyhow::ensure!(
+            matches!(msg.role.as_str(), "user" | "assistant" | "system"),
+            "messages[{message_index}].role: unsupported role '{}'",
+            msg.role
+        );
+        let blocks = normalize_content(&msg.content)
+            .map_err(|error| anyhow::anyhow!("messages[{message_index}].{error}"))?;
+        for (block_index, block) in blocks.iter().enumerate() {
+            anyhow::ensure!(
+                matches!(
+                    (msg.role.as_str(), block),
+                    (_, ContentBlock::Text { .. })
+                        | (
+                            "user",
+                            ContentBlock::Image { .. } | ContentBlock::ToolResult { .. }
+                        )
+                        | (
+                            "assistant",
+                            ContentBlock::ToolUse { .. } | ContentBlock::Thinking { .. }
+                        )
+                ),
+                "messages[{message_index}].content[{block_index}]: unsupported content block type '{}' for role '{}'",
+                msg.content[block_index]["type"].as_str().unwrap_or("text"),
+                msg.role
+            );
+        }
         match msg.role.as_str() {
             "user" => {
                 let mut parts: Vec<ResponsesContentPart> = Vec::new();
@@ -1214,7 +1239,7 @@ fn build_input(req: &MessagesRequest) -> Vec<ResponsesInputItem> {
         }
     }
 
-    out
+    Ok(out)
 }
 
 fn is_read_tool_use_with_offset(name: &str, input: &Value) -> bool {
@@ -1655,6 +1680,148 @@ mod tests {
             model: "gpt-5.5".to_string(),
             use_responses_lite: false,
         }
+    }
+
+    #[test]
+    fn input_validation_rejects_lossy_blocks_with_message_and_block_paths() {
+        for (role, block, detail) in [
+            (
+                "user",
+                json!({"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"YQ=="}}),
+                "document",
+            ),
+            ("user", json!({"type":"future_block"}), "future_block"),
+            ("user", json!({}), "type"),
+            ("user", json!(null), "type"),
+            ("user", json!({"type":"text"}), "text"),
+            ("user", json!({"type":"text","text":42}), "text"),
+            ("user", json!({"type":"image"}), "source"),
+            ("user", json!({"type":"image","source":{}}), "type"),
+            (
+                "user",
+                json!({"type":"image","source":{"type":"file","data":"a"}}),
+                "file",
+            ),
+            (
+                "user",
+                json!({"type":"image","source":{"type":"url","url":""}}),
+                "empty",
+            ),
+            (
+                "user",
+                json!({"type":"image","source":{"type":"base64","media_type":"image/png"}}),
+                "data",
+            ),
+            ("assistant", json!({"type":"tool_use","name":"Read"}), "id"),
+            (
+                "assistant",
+                json!({"type":"tool_use","id":"tu_1","name":""}),
+                "name",
+            ),
+            ("user", json!({"type":"tool_result"}), "tool_use_id"),
+            (
+                "user",
+                json!({"type":"tool_result","tool_use_id":"tu_1","content":null}),
+                "content",
+            ),
+            (
+                "user",
+                json!({"type":"tool_result","tool_use_id":"tu_1","content":{}}),
+                "content",
+            ),
+            (
+                "user",
+                json!({"type":"tool_result","tool_use_id":"tu_1","is_error":"true"}),
+                "is_error",
+            ),
+            (
+                "assistant",
+                json!({"type":"thinking","thinking":false}),
+                "thinking",
+            ),
+            (
+                "assistant",
+                json!({"type":"thinking","thinking":"summary","signature":42}),
+                "signature",
+            ),
+            (
+                "assistant",
+                json!({"type":"image","source":{"type":"url","url":"https://example.invalid/a.png"}}),
+                "image",
+            ),
+            (
+                "user",
+                json!({"type":"tool_use","id":"tu_1","name":"Read"}),
+                "tool_use",
+            ),
+            (
+                "system",
+                json!({"type":"tool_result","tool_use_id":"tu_1"}),
+                "tool_result",
+            ),
+        ] {
+            let req: MessagesRequest = serde_json::from_value(json!({"messages":[
+                {"role":"user","content":"valid first message"},
+                {"role":role,"content":[{"type":"text","text":"valid first block"},block]}
+            ]}))
+            .unwrap();
+            for use_responses_lite in [false, true] {
+                let error = translate_request(
+                    &req,
+                    TranslateOptions {
+                        use_responses_lite,
+                        ..opts()
+                    },
+                )
+                .unwrap_err()
+                .to_string();
+                assert!(error.contains("messages[1].content[1]"), "{error}");
+                assert!(error.contains(detail), "{error}");
+            }
+        }
+        for content in [json!(null), json!({"type":"text","text":"lost"}), json!(42)] {
+            let req: MessagesRequest =
+                serde_json::from_value(json!({"messages":[{"role":"user","content":content}]}))
+                    .unwrap();
+            let error = translate_request(&req, opts()).unwrap_err().to_string();
+            assert!(
+                error.contains("messages[0].content must be a string or an array"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn input_validation_preserves_tool_defaults_and_explicit_nested_placeholders() {
+        let req: MessagesRequest = serde_json::from_value(json!({"messages":[
+            {"role":"system","content":[{"type":"text","text":"instructions"}]},
+            {"role":"assistant","content":[
+                {"type":"tool_use","id":"tu_1","name":"Read","client_extension":true},
+                {"type":"thinking","thinking":"foreign summary","signature":"anthropic-signature"},
+                {"type":"tool_use","id":"tu_2","name":"Read","input":null}
+            ]},
+            {"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"tu_1","content":[
+                    {"type":"text","text":"before"},
+                    {"type":"tool_reference","tool_name":"Read"},
+                    {"type":"document","source":{"media_type":"application/pdf"}},
+                    {"type":"text"},
+                    {"type":"image","source":{"type":"url","url":"https://example.invalid/a.png"}},
+                    {"type":"text","text":"after"}
+                ]},
+                {"type":"tool_result","tool_use_id":"tu_2"}
+            ]}
+        ]}))
+        .unwrap();
+        let wire = serde_json::to_value(translate_request(&req, opts()).unwrap()).unwrap();
+        assert_eq!(wire["input"][0]["role"], "developer");
+        assert_eq!(wire["input"][1]["arguments"], "null");
+        assert_eq!(wire["input"][2]["arguments"], "null");
+        assert_eq!(
+            wire["input"][3]["output"],
+            "before\nTool loaded: Read\n[unsupported content block omitted: document]\n[unsupported content block omitted: text]\n[image omitted: url]\nafter"
+        );
+        assert_eq!(wire["input"][4]["output"], "");
     }
 
     #[test]

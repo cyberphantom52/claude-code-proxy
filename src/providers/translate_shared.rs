@@ -66,21 +66,18 @@ pub fn parallel_tool_calls(req: &MessagesRequest) -> Option<bool> {
         .map(|disabled| !disabled)
 }
 
-pub fn normalize_content(content: &Value) -> Vec<ContentBlock> {
+pub fn normalize_content(content: &Value) -> anyhow::Result<Vec<ContentBlock>> {
     match content {
-        Value::String(s) => {
-            vec![ContentBlock::Text { text: s.clone() }]
-        }
-        Value::Array(arr) => {
-            let mut blocks = Vec::new();
-            for item in arr {
-                if let Some(block) = parse_content_block(item) {
-                    blocks.push(block);
-                }
-            }
-            blocks
-        }
-        _ => Vec::new(),
+        Value::String(s) => Ok(vec![ContentBlock::Text { text: s.clone() }]),
+        Value::Array(arr) => arr
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                parse_content_block(item)
+                    .map_err(|error| anyhow::anyhow!("content[{index}]: {error}"))
+            })
+            .collect(),
+        _ => anyhow::bail!("content must be a string or an array of content blocks"),
     }
 }
 
@@ -92,91 +89,99 @@ pub fn image_source_to_url(source: &ImageSource) -> String {
     }
 }
 
-fn parse_content_block(value: &Value) -> Option<ContentBlock> {
-    let kind = value.get("type").and_then(|v| v.as_str())?;
-    match kind {
-        "text" => {
-            let text = value
-                .get("text")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            Some(ContentBlock::Text { text })
-        }
-        "image" => {
-            let source = value.get("source")?;
-            let media_type = source
-                .get("media_type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("image/png")
-                .to_string();
-            let source_type = source
-                .get("type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("base64")
-                .to_string();
-            let data = if source_type == "url" {
-                source.get("url").and_then(|v| v.as_str()).unwrap_or("")
-            } else {
-                source.get("data").and_then(|v| v.as_str()).unwrap_or("")
+fn string_field<'a>(value: &'a Value, field: &str) -> anyhow::Result<&'a str> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("{field} must be a string"))
+}
+
+fn parse_content_block(value: &Value) -> anyhow::Result<ContentBlock> {
+    let kind = string_field(value, "type")?;
+    let parsed = || -> anyhow::Result<ContentBlock> {
+        Ok(match kind {
+            "text" => ContentBlock::Text {
+                text: string_field(value, "text")?.to_string(),
+            },
+            "image" => {
+                let source = value
+                    .get("source")
+                    .filter(|source| source.is_object())
+                    .ok_or_else(|| anyhow::anyhow!("source must be an object"))?;
+                let source_type = string_field(source, "type")?;
+                let (media_type, data) = match source_type {
+                    "url" => (String::new(), string_field(source, "url")?),
+                    "base64" => (
+                        string_field(source, "media_type")?.to_string(),
+                        string_field(source, "data")?,
+                    ),
+                    _ => anyhow::bail!("unsupported image source type '{source_type}'"),
+                };
+                anyhow::ensure!(!data.is_empty(), "image source data/url must not be empty");
+                anyhow::ensure!(
+                    source_type != "base64" || !media_type.is_empty(),
+                    "image source media_type must not be empty"
+                );
+                ContentBlock::Image {
+                    source: ImageSource {
+                        media_type,
+                        data: data.to_string(),
+                        source_type: source_type.to_string(),
+                    },
+                }
             }
-            .to_string();
-            Some(ContentBlock::Image {
-                source: ImageSource {
-                    media_type,
-                    data,
-                    source_type,
-                },
-            })
-        }
-        "tool_use" => {
-            let id = value
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let name = value
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let input = value.get("input").cloned().unwrap_or(Value::Null);
-            Some(ContentBlock::ToolUse { id, name, input })
-        }
-        "tool_result" => {
-            let tool_use_id = value
-                .get("tool_use_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let content = value
-                .get("content")
-                .cloned()
-                .unwrap_or(Value::String(String::new()));
-            let is_error = value.get("is_error").and_then(|v| v.as_bool());
-            Some(ContentBlock::ToolResult {
-                tool_use_id,
-                content,
-                is_error,
-            })
-        }
-        "thinking" => {
-            let thinking = value
-                .get("thinking")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let signature = value
-                .get("signature")
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
-            Some(ContentBlock::Thinking {
-                thinking,
-                signature,
-            })
-        }
-        _ => None,
-    }
+            "tool_use" => {
+                let id = string_field(value, "id")?.to_string();
+                let name = string_field(value, "name")?.to_string();
+                anyhow::ensure!(
+                    !id.is_empty() && !name.is_empty(),
+                    "id and name must not be empty"
+                );
+                ContentBlock::ToolUse {
+                    id,
+                    name,
+                    input: value.get("input").cloned().unwrap_or(Value::Null),
+                }
+            }
+            "tool_result" => {
+                let tool_use_id = string_field(value, "tool_use_id")?.to_string();
+                anyhow::ensure!(!tool_use_id.is_empty(), "tool_use_id must not be empty");
+                let content = value
+                    .get("content")
+                    .cloned()
+                    .unwrap_or(Value::String(String::new()));
+                // Nested blocks keep the renderer's explicit placeholders and client
+                // extensions (tool_reference); only an invalid container was silent loss.
+                anyhow::ensure!(
+                    content.is_string() || content.is_array(),
+                    "tool_result.content must be a string or an array of content blocks"
+                );
+                let is_error = match value.get("is_error") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::Bool(is_error)) => Some(*is_error),
+                    Some(_) => anyhow::bail!("is_error must be a boolean"),
+                };
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                }
+            }
+            "thinking" => {
+                let signature = match value.get("signature") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(signature)) => Some(signature.clone()),
+                    Some(_) => anyhow::bail!("signature must be a string"),
+                };
+                ContentBlock::Thinking {
+                    thinking: string_field(value, "thinking")?.to_string(),
+                    signature,
+                }
+            }
+            _ => anyhow::bail!("unsupported content block type '{kind}'"),
+        })
+    };
+    parsed().map_err(|error| anyhow::anyhow!("{kind}: {error}"))
 }
 
 #[cfg(test)]
@@ -187,14 +192,20 @@ mod tests {
     #[test]
     fn tool_inputs_preserve_null_default_and_explicit_values() {
         for (block, expected) in [
-            (json!({"type":"tool_use"}), Value::Null),
-            (json!({"type":"tool_use","input":null}), Value::Null),
             (
-                json!({"type":"tool_use","input":{"path":"a"}}),
+                json!({"type":"tool_use","id":"tu_1","name":"Read"}),
+                Value::Null,
+            ),
+            (
+                json!({"type":"tool_use","id":"tu_1","name":"Read","input":null}),
+                Value::Null,
+            ),
+            (
+                json!({"type":"tool_use","id":"tu_1","name":"Read","input":{"path":"a"}}),
                 json!({"path":"a"}),
             ),
         ] {
-            let blocks = normalize_content(&json!([block]));
+            let blocks = normalize_content(&json!([block])).unwrap();
             let ContentBlock::ToolUse { input, .. } = &blocks[0] else {
                 panic!("expected tool_use");
             };
