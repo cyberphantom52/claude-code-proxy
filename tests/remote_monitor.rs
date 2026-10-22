@@ -270,14 +270,16 @@ async fn production_monitor_client_bypasses_outbound_proxy_environment() {
     .await;
     let proxy_requests = Arc::new(AtomicUsize::new(0));
     let proxy = serve(snapshot_app(proxy_requests.clone())).await;
+    let config = tempfile::tempdir().unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_claude-code-proxy"))
+        .env_clear()
+        .env("HOME", config.path())
+        .env("CCP_CONFIG_DIR", config.path())
         .args(["monitor", "--url", target.url.as_str()])
         .env("HTTP_PROXY", proxy.url.as_str())
         .env("http_proxy", proxy.url.as_str())
         .env("ALL_PROXY", proxy.url.as_str())
         .env("all_proxy", proxy.url.as_str())
-        .env_remove("NO_PROXY")
-        .env_remove("no_proxy")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

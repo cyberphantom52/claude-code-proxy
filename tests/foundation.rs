@@ -13,17 +13,16 @@ use claude_code_proxy::traffic::{
 use serde_json::Map;
 use serde_json::json;
 use std::collections::HashMap;
-use std::env;
 use tempfile::TempDir;
 
 #[test]
 fn messages_fixture_and_sse_parsing() {
-    let raw = std::fs::read_to_string("tests/fixtures/anthropic-message.json").unwrap();
-    let req: MessagesRequest = serde_json::from_str(&raw).unwrap();
+    let raw = include_str!("fixtures/anthropic-message.json");
+    let req: MessagesRequest = serde_json::from_str(raw).unwrap();
     assert_eq!(req.model.as_deref(), Some("gpt-5.4[1m]"));
     assert!(req.extra.contains_key("extra_field"));
 
-    let raw_sse = std::fs::read_to_string("tests/fixtures/sse-basic.txt").unwrap();
+    let raw_sse = include_str!("fixtures/sse-basic.txt");
     let events = parse_sse_events(raw_sse.as_bytes());
     assert_eq!(events.len(), 3);
     assert_eq!(events[0].event, None);
@@ -188,9 +187,28 @@ fn traffic_capture_helpers() {
         assert!(!redacted.contains(secret));
     }
     assert!(redacted.contains("Bearer text is ordinary message content"));
+}
 
-    unsafe {
-        env::set_var("CCP_TRAFFIC_LOG", "1");
+#[test]
+fn traffic_capture_artifacts_are_bounded_and_redacted() {
+    // Exercise the environment-gated factory in a child, never mutating the
+    // environment shared by the other foundation tests.
+    if std::env::var_os("CCP_TEST_TRAFFIC_CAPTURE").is_none() {
+        let temp = TempDir::new().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "traffic_capture_artifacts_are_bounded_and_redacted",
+            ])
+            .env_clear()
+            .env("HOME", temp.path())
+            .env("CCP_CONFIG_DIR", temp.path())
+            .env("CCP_TRAFFIC_LOG", "1")
+            .env("CCP_TEST_TRAFFIC_CAPTURE", "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
     }
     let temp = TempDir::new().unwrap();
     let capture = create_traffic_capture(TrafficCaptureOptions {
@@ -225,9 +243,6 @@ fn traffic_capture_helpers() {
     .unwrap();
     assert!(transcript.len() <= MAX_SSE_CAPTURE_BYTES);
     assert!(!transcript.contains("secret"));
-    unsafe {
-        env::remove_var("CCP_TRAFFIC_LOG");
-    }
 }
 
 #[test]
@@ -243,8 +258,8 @@ fn retry_backoff_decisions() {
     assert!(too_long.exceeds_budget);
 }
 
-#[tokio::test]
-async fn auth_store_read_write_and_logout() {
+#[test]
+fn auth_store_read_write_and_logout() {
     let store: InMemoryAuthStore<serde_json::Value> = InMemoryAuthStore::new();
     assert!(store.load().unwrap().is_none());
     store.save(json!({"token": "abc"})).unwrap();
@@ -252,9 +267,6 @@ async fn auth_store_read_write_and_logout() {
     assert_eq!(loaded["token"], json!("abc"));
     store.clear().unwrap();
     assert!(store.load().unwrap().is_none());
-
-    let path = tempfile::tempdir().unwrap().path().join("auth.json");
-    assert!(!path.exists());
 }
 
 #[test]
@@ -317,8 +329,27 @@ fn obsolete_alias_selection_requires_explicit_migration() {
 }
 
 #[test]
-fn logger_factory_builds() {
+fn logger_writes_to_isolated_state() {
+    if std::env::var_os("CCP_TEST_LOGGER").is_none() {
+        let temp = TempDir::new().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "logger_writes_to_isolated_state"])
+            .env_clear()
+            .env("HOME", temp.path())
+            .env("CCP_CONFIG_DIR", temp.path())
+            .env("XDG_STATE_HOME", temp.path())
+            .env("CCP_TEST_LOGGER", "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
     let logger = create_logger("server");
-    let fields = Map::new();
+    let fields = Map::from_iter([("authorization".to_string(), json!("secret"))]);
     logger.debug("ready", Some(fields));
+    let line = std::fs::read_to_string(paths::log_file()).unwrap();
+    let entry: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+    assert_eq!(entry["service"], "server");
+    assert_eq!(entry["msg"], "ready");
+    assert!(!line.contains("secret"));
 }

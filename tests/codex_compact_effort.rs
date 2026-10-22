@@ -68,6 +68,13 @@ fn isolated_environment(config_dir: &Path) -> Vec<EnvGuard> {
         EnvGuard::unset("CCP_CODEX_EFFORT"),
         EnvGuard::unset("CCP_CODEX_REASONING_SUMMARY"),
         EnvGuard::unset("CCP_COMPACT_EFFORT"),
+        EnvGuard::unset("CCP_CODEX_MODELS_FILE"),
+        EnvGuard::unset("CCP_CODEX_MODEL"),
+        EnvGuard::unset("CCP_CODEX_FULL_LANE"),
+        EnvGuard::unset("CCP_TRAFFIC_LOG"),
+        EnvGuard::set("HOME", config_dir),
+        EnvGuard::set("XDG_STATE_HOME", config_dir),
+        EnvGuard::set("LOCALAPPDATA", config_dir),
     ];
     guards.push(EnvGuard::set("CCP_CONFIG_DIR", config_dir));
     guards

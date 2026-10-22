@@ -87,6 +87,17 @@ fn clear_proxy_environment() -> Vec<EnvGuard> {
 
 fn configure_codex(config_dir: &Path, base_url: &str) -> Vec<EnvGuard> {
     vec![
+        EnvGuard::unset("CCP_CODEX_MODELS_FILE"),
+        EnvGuard::unset("CCP_CODEX_MODEL"),
+        EnvGuard::unset("CCP_CODEX_EFFORT"),
+        EnvGuard::unset("CCP_CODEX_REASONING_SUMMARY"),
+        EnvGuard::unset("CCP_CODEX_SERVICE_TIER"),
+        EnvGuard::unset("CCP_CODEX_FULL_LANE"),
+        EnvGuard::unset("CCP_ALIAS_PROVIDER"),
+        EnvGuard::unset("CCP_TRAFFIC_LOG"),
+        EnvGuard::set("HOME", config_dir),
+        EnvGuard::set("XDG_STATE_HOME", config_dir),
+        EnvGuard::set("LOCALAPPDATA", config_dir),
         EnvGuard::set("CCP_CONFIG_DIR", config_dir),
         EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket"),
         EnvGuard::set("CCP_CODEX_BASE_URL", base_url),

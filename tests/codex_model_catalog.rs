@@ -17,6 +17,10 @@ use std::sync::Arc;
 
 #[test]
 fn models_do_not_depend_on_codex_cli_and_explicit_imports_remain_optional() {
+    if std::env::var_os("CCP_TEST_MODEL_CATALOG").is_some() {
+        check_model_catalog();
+        return;
+    }
     let home = tempfile::TempDir::new().unwrap();
     let codex = home.path().join(".codex");
     std::fs::create_dir_all(&codex).unwrap();
@@ -25,16 +29,6 @@ fn models_do_not_depend_on_codex_cli_and_explicit_imports_remain_optional() {
         json!({"models":[{"slug":"gpt-implicit-must-not-load"}]}).to_string(),
     )
     .unwrap();
-    // This integration test owns its process and only uses synthetic metadata.
-    unsafe {
-        std::env::set_var("HOME", home.path());
-        std::env::set_var("CODEX_HOME", &codex);
-        std::env::set_var("CCP_CONFIG_DIR", home.path());
-        std::env::remove_var("CCP_CODEX_MODELS_FILE");
-    }
-    assert!(catalog_path().is_none());
-    assert!(catalog_model("gpt-implicit-must-not-load").is_none());
-
     let import = home.path().join("explicit-models.json");
     std::fs::write(
         &import,
@@ -46,7 +40,33 @@ fn models_do_not_depend_on_codex_cli_and_explicit_imports_remain_optional() {
         .to_string(),
     )
     .unwrap();
-    unsafe { std::env::set_var("CCP_CODEX_MODELS_FILE", &import) };
+    for explicit_import in [false, true] {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "models_do_not_depend_on_codex_cli_and_explicit_imports_remain_optional",
+            ])
+            .env_clear()
+            .env("HOME", home.path())
+            .env("CODEX_HOME", &codex)
+            .env("CCP_CONFIG_DIR", home.path())
+            .env("CCP_CODEX_MODEL_DISCOVERY", "0")
+            .env("CCP_TEST_MODEL_CATALOG", "1");
+        if explicit_import {
+            command.env("CCP_CODEX_MODELS_FILE", &import);
+        }
+        assert!(command.status().unwrap().success());
+    }
+}
+
+fn check_model_catalog() {
+    assert!(catalog_model("gpt-implicit-must-not-load").is_none());
+    if std::env::var_os("CCP_CODEX_MODELS_FILE").is_none() {
+        assert!(catalog_path().is_none());
+        return;
+    }
+    assert!(catalog_path().is_some());
     let registry = Registry::new();
     for model in [
         "gpt-catalog-test",

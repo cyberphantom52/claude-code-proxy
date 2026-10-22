@@ -8,6 +8,7 @@ fn codex_cmd() -> (Command, TempDir) {
     let temp = TempDir::new().unwrap();
     let mut cmd = Command::cargo_bin("claude-code-proxy").unwrap();
     cmd.args(["codex", "auth", "status"]);
+    cmd.env_clear();
     cmd.env("CCP_CONFIG_DIR", temp.path());
     cmd.env("HOME", temp.path());
     (cmd, temp)
@@ -32,7 +33,11 @@ fn codex_auth_status_reads_stored_auth() -> Result<(), Box<dyn std::error::Error
         "{out}"
     );
     assert!(lines[1].ends_with("s)"), "{out}");
-    assert!(lines[2].starts_with("Storage: "), "{out}");
+    assert_eq!(
+        lines[2],
+        format!("Storage: {}", auth_dir.join("auth.json").display()),
+        "{out}"
+    );
     assert!(!out.contains("Auth path:"));
     assert!(!out.contains("Authenticated: true"));
     Ok(())
@@ -61,22 +66,6 @@ fn codex_auth_status_no_auth() -> Result<(), Box<dyn std::error::Error>> {
     let output = cmd.output()?;
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(String::from_utf8(output.stdout)?, "Not authenticated\n");
-    Ok(())
-}
-
-#[test]
-fn codex_auth_status_shows_storage_path() -> Result<(), Box<dyn std::error::Error>> {
-    let (mut cmd, temp) = codex_cmd();
-    let auth_dir = temp.path().join("codex");
-    std::fs::create_dir_all(&auth_dir)?;
-    std::fs::write(
-        auth_dir.join("auth.json"),
-        r#"{"access":"a","refresh":"r","expires":4102444800000,"accountId":"acct_3"}"#,
-    )?;
-    let output = cmd.assert().success().get_output().stdout.clone();
-    let out = String::from_utf8(output)?;
-    assert!(out.contains("Storage:"), "{out}");
-    assert!(!out.contains("Auth path:"), "{out}");
     Ok(())
 }
 
@@ -117,6 +106,10 @@ fn codex_auth_status_expired_auth_shows_negative_seconds() -> Result<(), Box<dyn
         lines[1].starts_with("Expires: 2000-01-01T00:00:00.000Z (in -"),
         "{out}"
     );
-    assert!(lines[2].starts_with("Storage: "), "{out}");
+    assert_eq!(
+        lines[2],
+        format!("Storage: {}", auth_dir.join("auth.json").display()),
+        "{out}"
+    );
     Ok(())
 }

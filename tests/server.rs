@@ -104,19 +104,16 @@ impl CliHandlers for FakeCli {
 
 static FAKE_CLI: FakeCli = FakeCli;
 
-struct FakeProvider {
-    name: &'static str,
-    models: Vec<String>,
-}
+struct FakeProvider;
 
 #[async_trait]
 impl Provider for FakeProvider {
     fn name(&self) -> &'static str {
-        self.name
+        "codex"
     }
 
     fn supported_models(&self) -> Vec<String> {
-        self.models.clone()
+        vec!["gpt-5.5".to_string()]
     }
 
     fn cli(&self) -> &'static dyn CliHandlers {
@@ -198,10 +195,9 @@ impl Provider for IdentityCaptureProvider {
 }
 
 fn failure_registry() -> Arc<Registry> {
-    Arc::new(Registry::from_providers([Arc::new(FakeProvider {
-        name: "codex",
-        models: vec!["gpt-5.5".to_string()],
-    }) as Arc<dyn Provider>]))
+    Arc::new(Registry::from_providers([
+        Arc::new(FakeProvider) as Arc<dyn Provider>
+    ]))
 }
 
 async fn call_identity_ingress(
@@ -719,11 +715,12 @@ async fn count_tokens_routes_to_provider() {
         .await
         .unwrap();
 
-    // Codex provider is now concrete, so count_tokens should succeed
-    let status = response.status();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = error_body(response).await;
     assert!(
-        status != StatusCode::NOT_IMPLEMENTED,
-        "count_tokens should no longer return 501 for codex models"
+        body["input_tokens"]
+            .as_u64()
+            .is_some_and(|tokens| tokens > 0)
     );
 }
 

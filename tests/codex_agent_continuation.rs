@@ -87,6 +87,9 @@ fn configure_environment(config_dir: &Path, upstream_url: &str) -> Vec<EnvGuard>
         "CCP_CODEX_ORIGINATOR",
         "CCP_CODEX_USER_AGENT",
         "CCP_USER_AGENT",
+        "CCP_CODEX_MODELS_FILE",
+        "CCP_CODEX_FULL_LANE",
+        "CCP_TRAFFIC_LOG",
     ]
     .into_iter()
     .map(EnvGuard::unset)
@@ -95,6 +98,9 @@ fn configure_environment(config_dir: &Path, upstream_url: &str) -> Vec<EnvGuard>
         EnvGuard::set("NO_PROXY", "127.0.0.1,localhost"),
         EnvGuard::set("no_proxy", "127.0.0.1,localhost"),
         EnvGuard::set("CCP_CONFIG_DIR", config_dir),
+        EnvGuard::set("HOME", config_dir),
+        EnvGuard::set("XDG_STATE_HOME", config_dir),
+        EnvGuard::set("LOCALAPPDATA", config_dir),
         EnvGuard::set("CCP_ALIAS_PROVIDER", "codex"),
         EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket"),
         EnvGuard::set("CCP_CODEX_BASE_URL", upstream_url),
