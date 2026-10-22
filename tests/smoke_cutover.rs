@@ -1130,18 +1130,6 @@ async fn smoke_healthz_returns_ok() {
     assert_eq!(body, json!({"ok": true}));
 }
 
-#[tokio::test]
-#[allow(clippy::await_holding_lock)]
-async fn smoke_codex_model_routes_to_real_provider() {
-    let _guard = env_lock();
-    let response = call_messages("gpt-5.5").await;
-    // Should attempt auth (not return 501 placeholder)
-    assert!(
-        response.status() != StatusCode::NOT_IMPLEMENTED,
-        "codex models must resolve to the real provider, not a placeholder"
-    );
-}
-
 // ---------------------------------------------------------------------------
 // Codex HTTP smoke: mock upstream verifies request shape and returns
 // Responses SSE events.

@@ -643,31 +643,6 @@ async fn anthropic_bodies_over_limit_return_request_too_large() {
 }
 
 #[tokio::test]
-async fn known_model_reaches_codex_provider() {
-    let app = app(Arc::new(Registry::new()));
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri("/v1/messages")
-                .header("content-type", "application/json")
-                .body(body_string(
-                    r#"{"model":"gpt-5.4","messages":[{"role":"user","content":"hello"}]}"#,
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    // Codex provider is now concrete, so it should attempt auth before returning 501
-    let status = response.status();
-    assert!(
-        status != StatusCode::NOT_IMPLEMENTED,
-        "codex should no longer be a placeholder provider"
-    );
-}
-
-#[tokio::test]
 async fn count_tokens_routes_to_provider() {
     let app = app(Arc::new(Registry::new()));
     let response = app
