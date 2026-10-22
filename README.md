@@ -2,10 +2,6 @@
 
 Claude Code, powered by **OpenAI Codex through your ChatGPT subscription**.
 
-Docs: <https://claude-code-proxy.raine.dev>
-
-LLM docs: <https://claude-code-proxy.raine.dev/llms.txt>
-
 <a href="https://aventasks.dev/">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://aventasks.dev/readme/aven-banner-dark.webp">
@@ -31,9 +27,6 @@ monitor shows sessions, active and recent requests, errors, token usage, and
 throughput.
 
 ## Quick start with Codex
-
-For the local `chatgpt-codex-improvements` branch, see the
-[source build, ChatGPT login, and PR selection guide](docs/src/content/docs/using/chatgpt-integration.md).
 
 Install on macOS or Linux:
 
@@ -96,9 +89,6 @@ absent from discovery; upstream validates access. Remove conflicting proxy-side
 substitution with a different model. `[1m]` cannot increase the upstream context
 window; Claude Code manages client compaction independently.
 
-See [Getting started](https://claude-code-proxy.raine.dev/getting-started/)
-for the complete first session.
-
 Optional Codex image generation and editing can reuse the same ChatGPT login:
 
 ```sh
@@ -108,7 +98,7 @@ curl http://127.0.0.1:18765/v1/images/generations \
   -d '{"prompt":"A paper-cut fox","model":"gpt-image-2"}'
 ```
 
-The opt-in Images API returns base64 image data and consumes the signed-in account's image quota. Image prompts and payloads are excluded from traffic captures. See the [HTTP API](https://claude-code-proxy.raine.dev/reference/http-api/) for generation and edit schemas.
+The opt-in Images API returns base64 image data and consumes the signed-in account's image quota. Image prompts and payloads are excluded from traffic captures.
 
 ## Codex models and APIs
 
@@ -127,9 +117,7 @@ opaque model IDs are forwarded for upstream validation without substitution.
 merely by an advertised default tier. Stock Claude Code `/fast` is Opus-only
 and may switch to Opus before sending a request; for other families use
 `/model fable-fast`, `/model sonnet-fast`, or `/model haiku-fast` when supported.
-Catalog advertising does not guarantee account entitlement or quota. See
-[Models and routing](https://claude-code-proxy.raine.dev/using/models-and-routing/)
-for account-scoped cache and fallback behavior.
+Catalog advertising does not guarantee account entitlement or quota.
 
 Anthropic Messages is enabled by default. Set `CCP_CODEX_RESPONSES_API=1` on the
 proxy to enable native Codex Responses and Chat Completions compatibility.
@@ -140,20 +128,6 @@ Images have their separate opt-in gate shown above.
 > `127.0.0.1` by default. Protect any non-loopback listener with a firewall or
 > authenticating reverse proxy. Subscription terms, model access, quotas, and
 > account enforcement remain under OpenAI's control.
-
-## Documentation
-
-- [What is claude-code-proxy?](https://claude-code-proxy.raine.dev/)
-- [Codex backend](https://claude-code-proxy.raine.dev/providers/codex/)
-- [Configure Claude Code](https://claude-code-proxy.raine.dev/using/configure-claude-code/)
-- [Models and routing](https://claude-code-proxy.raine.dev/using/models-and-routing/)
-- [Monitor TUI](https://claude-code-proxy.raine.dev/using/monitor-tui/)
-- [Troubleshooting](https://claude-code-proxy.raine.dev/using/troubleshooting/)
-- [Command reference](https://claude-code-proxy.raine.dev/reference/command-reference/)
-- [Configuration](https://claude-code-proxy.raine.dev/reference/configuration/)
-- [HTTP API](https://claude-code-proxy.raine.dev/reference/http-api/)
-- [Compatibility and limitations](https://claude-code-proxy.raine.dev/reference/compatibility-and-limitations/)
-- [For coding agents](https://claude-code-proxy.raine.dev/using/for-coding-agents/)
 
 ## Related projects
 
