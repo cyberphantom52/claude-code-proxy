@@ -109,9 +109,7 @@ impl Logger {
             let _ = writeln!(io::stderr(), "{line}");
         }
 
-        if write_log_line(&line).is_err() && mirror_to_stderr {
-            // swallow logging errors intentionally
-        }
+        let _ = write_log_line(&line); // Logging failures must not affect requests.
     }
 }
 

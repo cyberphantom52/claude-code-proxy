@@ -739,38 +739,19 @@ impl MonitorStore {
                 );
             }
             MonitorEvent::RequestAbandoned { request_id, error } => {
-                self.finish_active(
-                    &request_id,
-                    RequestStatus::Failed,
-                    None,
-                    None,
-                    None,
-                    Some(error),
-                );
+                if self.active.contains_key(&request_id) {
+                    self.finish(
+                        &request_id,
+                        RequestStatus::Failed,
+                        None,
+                        None,
+                        None,
+                        Some(error),
+                    );
+                }
             }
         }
         self.prune_session_history_if_due(SystemTime::now());
-    }
-
-    fn finish_active(
-        &mut self,
-        request_id: &str,
-        status: RequestStatus,
-        http_status: Option<u16>,
-        input_tokens: Option<u64>,
-        output_tokens: Option<u64>,
-        error: Option<String>,
-    ) {
-        if self.active.contains_key(request_id) {
-            self.finish(
-                request_id,
-                status,
-                http_status,
-                input_tokens,
-                output_tokens,
-                error,
-            );
-        }
     }
 
     fn finish(
@@ -972,7 +953,7 @@ fn session_summaries(
         entry.provider = request.provider.clone().or(entry.provider.clone());
         entry.model = request.model.clone().or(entry.model.clone());
         entry.effort = request.effort.clone().or(entry.effort.clone());
-        entry.last_seen = max_system_time(entry.last_seen, request.finished_at);
+        entry.last_seen = entry.last_seen.max(request.finished_at);
         if let (Some(tokens), Some(duration)) = (
             request
                 .output_tokens
@@ -1014,7 +995,7 @@ fn session_summaries(
         entry.provider = request.provider.clone().or(entry.provider.clone());
         entry.model = request.model.clone().or(entry.model.clone());
         entry.effort = request.effort.clone().or(entry.effort.clone());
-        entry.last_seen = max_system_time(entry.last_seen, request.started_at);
+        entry.last_seen = entry.last_seen.max(request.started_at);
         if let (Some(tokens), Some(duration)) = (
             request
                 .output_tokens
@@ -1075,14 +1056,6 @@ fn update_token_count(current: &mut Option<u64>, incoming: Option<u64>) -> u64 {
         *current = Some(incoming);
     }
     incoming.saturating_sub(previous)
-}
-
-fn max_system_time(left: SystemTime, right: SystemTime) -> SystemTime {
-    if right.duration_since(left).is_ok() {
-        right
-    } else {
-        left
-    }
 }
 
 pub fn throughput(

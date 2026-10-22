@@ -25,7 +25,7 @@ struct FileConfig {
     pub codex: Option<CodexConfig>,
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize)]
 struct CodexConfig {
     #[serde(rename = "baseUrl")]
     pub base_url: Option<String>,

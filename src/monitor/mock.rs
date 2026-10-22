@@ -83,17 +83,9 @@ fn mock_state_for_tick(
     );
     streaming.project = Some("claude-code-proxy".to_string());
     streaming.provider = Some("codex".to_string());
-    streaming.model = Some("claude-sonnet-4-6 → gpt-5.6-sol".to_string());
+    streaming.model = Some("claude-sonnet-4-6 → gpt-6-sol".to_string());
     streaming.effort = Some("high".to_string());
-    streaming.generation_started_at = Some(now - Duration::from_secs(10));
-    streaming.generation_started_instant = Some(instant_now - Duration::from_secs(10));
-    streaming.generation_initial_output_tokens = 20;
     streaming.generation_finished_at = Some(now - Duration::from_secs(2));
-    streaming.generation_duration = Some(Duration::from_secs(8));
-    streaming.streamed_bytes = 18_432;
-    streaming.stream_chunks = 96;
-    streaming.input_tokens = Some(12_480);
-    streaming.output_tokens = Some(420);
     streaming.traffic_capture_path = Some(PathBuf::from(
         "/tmp/claude-code-proxy-demo/traffic/req-active-codex",
     ));
@@ -191,7 +183,7 @@ fn mock_state_for_tick(
     );
     success.project = Some("claude-code-proxy".to_string());
     success.provider = Some("codex".to_string());
-    success.model = Some("claude-sonnet-4-6 → gpt-5.6-terra".to_string());
+    success.model = Some("claude-sonnet-4-6 → gpt-6-sol".to_string());
     success.effort = Some("xhigh".to_string());
     success.generation_duration = Some(Duration::from_secs(4));
     success.generation_initial_output_tokens = 32;

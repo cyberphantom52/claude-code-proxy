@@ -2482,7 +2482,7 @@ mod tests {
         assert!(text.contains("mock://tui-demo"), "{text}");
         assert!(text.contains("claude-code-proxy"), "{text}");
         assert!(text.contains("streaming"), "{text}");
-        assert!(text.contains("gpt-5.6-terra"), "{text}");
+        assert!(text.contains("gpt-6-sol"), "{text}");
         assert!(text.contains("upstream connection closed"), "{text}");
     }
 

@@ -145,17 +145,10 @@ pub struct ServerConfig {
 }
 
 pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
-    serve_inner(config, std::future::pending::<()>()).await
+    serve_with_shutdown(config, std::future::pending::<()>()).await
 }
 
 pub async fn serve_with_shutdown(
-    config: ServerConfig,
-    shutdown: impl Future<Output = ()> + Send + 'static,
-) -> anyhow::Result<()> {
-    serve_inner(config, shutdown).await
-}
-
-async fn serve_inner(
     config: ServerConfig,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
@@ -210,15 +203,7 @@ pub async fn serve_listener(
 }
 
 pub fn app(registry: Arc<Registry>) -> Router {
-    app_with_features(
-        registry,
-        None,
-        AppFeatures {
-            responses_api: crate::config::codex_responses_api(),
-            images_api: crate::config::codex_images_api(),
-            transcriptions_api: crate::config::codex_transcriptions_api(),
-        },
-    )
+    app_with_monitor(registry, None)
 }
 
 pub fn app_with_monitor(registry: Arc<Registry>, monitor: Option<MonitorHandle>) -> Router {
@@ -1308,18 +1293,7 @@ fn log_native_request_completed(
     status: StatusCode,
     started_at: Instant,
 ) {
-    log.info(
-        "request_completed",
-        Some(serde_json::Map::from_iter([
-            ("reqId".to_string(), json!(req_id)),
-            ("endpoint".to_string(), json!(endpoint)),
-            ("provider".to_string(), json!("codex")),
-            ("model".to_string(), json!(model)),
-            ("countTokens".to_string(), json!(false)),
-            ("status".to_string(), json!(status.as_u16())),
-            ("ms".to_string(), json!(started_at.elapsed().as_millis())),
-        ])),
-    );
+    log_routed_openai_request_completed(log, req_id, endpoint, "codex", model, status, started_at);
 }
 
 async fn dispatch_request(

@@ -12,10 +12,6 @@ use std::{
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
-fn default_snapshot_at() -> SystemTime {
-    SystemTime::now()
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MonitorResponse {
     pub version: u32,
@@ -70,7 +66,7 @@ impl SnapshotUpdate {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MonitorSnapshot {
     pub started_at: SystemTime,
-    #[serde(default = "default_snapshot_at")]
+    #[serde(default = "SystemTime::now")]
     pub snapshot_at: SystemTime,
     pub uptime: Duration,
     pub sessions: Vec<SessionSnapshot>,

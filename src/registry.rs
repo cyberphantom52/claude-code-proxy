@@ -5,7 +5,7 @@ use crate::{
         model_catalog,
     },
 };
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 pub const ANTHROPIC_STYLE_ALIASES: &[&str] = &[
@@ -26,8 +26,6 @@ pub const ANTHROPIC_STYLE_ALIASES: &[&str] = &[
     "claude-fable-5",
     "claude-fable-5-1",
 ];
-
-pub(crate) const CODEX_MODELS: &[&str] = model_allowlist::FALLBACK_MODELS;
 
 pub struct Registry {
     models: BTreeMap<String, Vec<String>>,
@@ -58,9 +56,7 @@ impl Registry {
     }
 
     pub fn list_provider_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.handlers.keys().cloned().collect();
-        names.sort_unstable();
-        names
+        self.handlers.keys().cloned().collect()
     }
 
     pub fn provider(&self, name: &str) -> Option<Arc<dyn Provider>> {
@@ -127,8 +123,6 @@ impl Registry {
     pub fn unknown_model_message(&self) -> String {
         let mut parts = Vec::new();
         for (provider, models) in self.grouped_models() {
-            let mut models = models;
-            models.sort_unstable();
             parts.push(format!("{}: {}", provider, models.join(", ")));
         }
         format!("Known models: {}.", parts.join("; "))
@@ -148,34 +142,54 @@ pub fn is_anthropic_alias(model: &str) -> bool {
 }
 
 pub(crate) fn expand_codex_models() -> Vec<String> {
-    let mut set = HashSet::new();
-    let mut out = Vec::new();
+    let mut models = BTreeSet::new();
     // A live account catalog is complete, not an extension of compiled IDs.
     let authoritative =
         model_catalog::scoped_catalog().is_some_and(|catalog| catalog.authoritative);
     let catalog = model_allowlist::listed_catalog_models();
-    for model in CODEX_MODELS
+    for model in model_allowlist::FALLBACK_MODELS
         .iter()
         .filter(|_| !authoritative)
         .map(|model| (*model).to_string())
         .chain(catalog)
     {
-        if set.insert(model.clone()) {
-            out.push(model.clone());
-        }
-        for variant in tier_model_variants(&model) {
-            if set.insert(variant.clone()) {
-                out.push(variant);
-            }
-        }
+        models.extend(tier_model_variants(&model));
+        models.insert(model);
     }
-    out.sort_unstable();
-    out
+    models.into_iter().collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catalog_expansion_is_sorted_unique_and_respects_authority() {
+        use model_catalog::{CatalogModel, CatalogSnapshot, with_catalog};
+
+        let catalog = Arc::new(CatalogSnapshot::new(
+            ["z-model", "a-model", "a-model-fast", "a-model"]
+                .into_iter()
+                .map(|slug| CatalogModel {
+                    slug: slug.to_string(),
+                    ..CatalogModel::default()
+                })
+                .collect(),
+            true,
+        ));
+        with_catalog(catalog, || {
+            let models = expand_codex_models();
+            assert!(models.windows(2).all(|pair| pair[0] < pair[1]));
+            for model in ["a-model", "a-model-fast", "z-model"] {
+                assert!(models.iter().any(|value| value == model));
+            }
+            assert!(
+                !models
+                    .iter()
+                    .any(|model| model == model_allowlist::FALLBACK_MODELS[0])
+            );
+        });
+    }
 
     #[test]
     fn registry_rejects_only_malformed_ids_not_new_model_names() {

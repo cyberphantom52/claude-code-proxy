@@ -1,9 +1,8 @@
 use anyhow::Result;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::to_string_pretty;
-use std::fs::{self, File};
-use std::io::{self, Read, Write};
-use std::marker::PhantomData;
+use std::fs;
+use std::io::{self, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
@@ -172,11 +171,6 @@ where
     }
 
     fn save(&self, value: T) -> Result<()> {
-        let path = std::path::Path::new(&self.file);
-        if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir)?;
-            set_mode(dir, 0o700);
-        }
         write_atomically(&self.file, &value)
     }
 
@@ -206,8 +200,6 @@ where
     service: String,
     account: String,
     use_keychain: bool,
-    keychain_path: String,
-    _marker: PhantomData<T>,
 }
 
 impl<T, K> KeychainFileAuthStore<T, K>
@@ -229,8 +221,6 @@ where
             service: service.into(),
             account: account.into(),
             use_keychain,
-            keychain_path: "macOS Keychain".to_string(),
-            _marker: PhantomData,
         }
     }
 }
@@ -264,7 +254,6 @@ where
             {
                 return Ok(());
             }
-            return self.file_store.save(value);
         }
         self.file_store.save(value)
     }
@@ -278,7 +267,7 @@ where
 
     fn path(&self) -> String {
         if self.use_keychain {
-            self.keychain_path.clone()
+            "macOS Keychain".to_string()
         } else {
             self.file_store.path()
         }
@@ -286,16 +275,12 @@ where
 }
 
 pub fn load_auth_file<T: DeserializeOwned>(path: &str) -> Option<T> {
-    let mut file = File::open(path).ok()?;
-    let mut raw = String::new();
-    file.read_to_string(&mut raw).ok()?;
+    let raw = fs::read_to_string(path).ok()?;
     serde_json::from_str::<T>(&raw).ok()
 }
 
 pub fn load_auth_file_value(path: &std::path::Path) -> Option<serde_json::Value> {
-    let mut file = File::open(path).ok()?;
-    let mut raw = String::new();
-    file.read_to_string(&mut raw).ok()?;
+    let raw = fs::read_to_string(path).ok()?;
     serde_json::from_str::<serde_json::Value>(&raw).ok()
 }
 
@@ -533,6 +518,27 @@ mod tests {
             "legacy"
         );
         assert!(std::path::Path::new(&file).exists());
+    }
+
+    #[test]
+    fn legacy_loaders_preserve_their_schema_fallback_behavior() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let primary = temp.path().join("primary.json");
+        let legacy = temp.path().join("legacy.json");
+        write_atomically(primary.to_str().unwrap(), &"wrong schema").unwrap();
+        write_atomically(legacy.to_str().unwrap(), &7_u64).unwrap();
+        let store: FileAuthStore<u64> = FileAuthStore::new(
+            primary.to_str().unwrap().to_string(),
+            legacy.to_str().unwrap().to_string(),
+        );
+
+        assert_eq!(store.load().unwrap(), Some(7));
+        assert_eq!(load_auth_file_with_legacy::<u64>(&primary, &legacy), None);
+        fs::write(&primary, "invalid JSON").unwrap();
+        assert_eq!(
+            load_auth_file_with_legacy::<u64>(&primary, &legacy),
+            Some(7)
+        );
     }
 
     #[test]
