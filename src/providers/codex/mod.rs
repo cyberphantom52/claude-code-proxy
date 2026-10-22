@@ -6,6 +6,7 @@ pub mod continuation;
 pub mod count_tokens;
 pub(crate) mod events;
 pub mod images;
+pub mod models;
 pub mod native;
 pub mod rate_limits;
 mod recovery;
@@ -52,8 +53,8 @@ use self::count_tokens::count_translated_tokens;
 use self::translate::accumulate::accumulate_response_with_traffic;
 use self::translate::live_stream::LiveStreamTranslator;
 use self::translate::model_allowlist::{
-    assert_allowed_model, full_lane_web_search_model, resolve_model_request_with_config_override,
-    tier_model_variants, uses_responses_lite,
+    assert_allowed_model, resolve_model_request_with_config_override, uses_responses_lite,
+    validate_hosted_web_search,
 };
 use self::translate::reducer::finish_metadata_from_upstream;
 use self::translate::request::{
@@ -110,17 +111,26 @@ impl CodexProvider {
         let message_id = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
         let want_stream = body.stream;
         let model = body.model.as_deref().unwrap_or("gpt-6-sol");
+        if body.model.is_some()
+            && let Err(error) = self::translate::model_allowlist::validate_model_configuration(
+                model,
+                !body.bypass_provider_model_override,
+            )
+        {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                error.to_string(),
+            );
+        }
 
-        let mut resolved =
+        let resolved =
             resolve_model_request_with_config_override(model, !body.bypass_provider_model_override);
         if let Err(e) = assert_allowed_model(&resolved.model) {
             return json_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
-                format!(
-                    "Model \"{model}\" resolves to unsupported model \"{}\"",
-                    e.model
-                ),
+                e.to_string(),
             );
         }
         if search::is_standalone_search_request(&body) {
@@ -202,7 +212,16 @@ impl CodexProvider {
                 ctx.traffic.as_deref(),
             );
         }
-        let use_responses_lite = apply_model_lane_for_request(&mut resolved.model, &body);
+        let use_responses_lite = match apply_model_lane_for_request(&resolved.model, &body) {
+            Ok(lite) => lite,
+            Err(error) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    error.to_string(),
+                );
+            }
+        };
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.model_resolved(&ctx.req_id, &resolved.model);
         }
@@ -557,16 +576,7 @@ impl Provider for CodexProvider {
     }
 
     fn supported_models(&self) -> Vec<String> {
-        let mut models: Vec<String> = registry::CODEX_MODELS
-            .iter()
-            .map(|m| m.to_string())
-            .collect();
-        for m in registry::CODEX_MODELS {
-            models.extend(tier_model_variants(m));
-        }
-        models.sort_unstable();
-        models.dedup();
-        models
+        registry::expand_codex_models()
     }
 
     fn cli(&self) -> &'static dyn CliHandlers {
@@ -574,7 +584,8 @@ impl Provider for CodexProvider {
     }
 
     async fn handle_messages(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
-        rate_limits::stamp_response(self.handle_messages_inner(body, ctx, None).await)
+        self.handle_messages_with_conversation_identity(body, ctx, None)
+            .await
     }
 
     async fn handle_messages_with_conversation_identity(
@@ -583,27 +594,59 @@ impl Provider for CodexProvider {
         ctx: RequestContext,
         conversation_identity: Option<ConversationIdentity>,
     ) -> Response {
-        rate_limits::stamp_response(
-            self.handle_messages_inner(body, ctx, conversation_identity)
-                .await,
+        let context = self.client.prepare_model_context().await;
+        let response = models::with_model_context(
+            context,
+            self.handle_messages_inner(body, ctx, conversation_identity),
         )
+        .await;
+        rate_limits::stamp_response(response)
     }
 
     async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
+        let context = self.client.prepare_model_context().await;
+        models::with_model_context(context, self.handle_count_tokens_inner(body, ctx)).await
+    }
+}
+
+impl CodexProvider {
+    async fn handle_count_tokens_inner(
+        &self,
+        body: MessagesRequest,
+        ctx: RequestContext,
+    ) -> Response {
         let model = body.model.as_deref().unwrap_or("gpt-6-sol");
-        let mut resolved =
+        if body.model.is_some()
+            && let Err(error) = self::translate::model_allowlist::validate_model_configuration(
+                model,
+                !body.bypass_provider_model_override,
+            )
+        {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                error.to_string(),
+            );
+        }
+        let resolved =
             resolve_model_request_with_config_override(model, !body.bypass_provider_model_override);
         if let Err(e) = assert_allowed_model(&resolved.model) {
             return json_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
-                format!(
-                    "Model \"{model}\" resolves to unsupported model \"{}\"",
-                    e.model
-                ),
+                e.to_string(),
             );
         }
-        let use_responses_lite = apply_model_lane_for_request(&mut resolved.model, &body);
+        let use_responses_lite = match apply_model_lane_for_request(&resolved.model, &body) {
+            Ok(lite) => lite,
+            Err(error) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    error.to_string(),
+                );
+            }
+        };
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.model_resolved(&ctx.req_id, &resolved.model);
         }
@@ -641,16 +684,13 @@ impl Provider for CodexProvider {
     }
 }
 
-/// Picks the upstream model and lane for a request. Hosted web_search must
-/// run on the full Responses API (the lite lane rejects hosted tools), and
-/// lite-only models like gpt-5.6-luna don't exist there, so such requests
-/// are upgraded to a full-lane model. Returns whether to use the lite lane.
-fn apply_model_lane_for_request(model: &mut String, body: &MessagesRequest) -> bool {
+/// Hosted tools require the full lane; never substitute a different model.
+fn apply_model_lane_for_request(model: &str, body: &MessagesRequest) -> anyhow::Result<bool> {
     if has_hosted_web_search(body) {
-        *model = full_lane_web_search_model(model).to_string();
-        return false;
+        validate_hosted_web_search(model)?;
+        return Ok(false);
     }
-    uses_responses_lite(model)
+    Ok(uses_responses_lite(model))
 }
 
 fn count_sse_events(bytes: &[u8]) -> u64 {
@@ -1343,7 +1383,8 @@ fn remaining_live_stream_response(
     compaction: LiveStreamCompaction,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
-    tokio::spawn(async move {
+    let model_context = models::current_model_context();
+    let worker = async move {
         if tx.send(Ok(Bytes::from(first_chunk))).await.is_err() {
             abort_request_state(
                 ctx.session_id.as_deref(),
@@ -1590,6 +1631,13 @@ fn remaining_live_stream_response(
                     return;
                 }
             }
+        }
+    };
+    tokio::spawn(async move {
+        if let Some(context) = model_context {
+            models::with_model_context(context, worker).await;
+        } else {
+            worker.await;
         }
     });
 
@@ -2341,22 +2389,15 @@ mod tests {
     }
 
     #[test]
-    fn web_search_requests_leave_lite_lane_and_upgrade_luna() {
+    fn web_search_requests_use_full_lane_without_substituting_models() {
         let body = request_with_tools(serde_json::json!([
             {"type":"web_search_20250305", "name":"web_search"}
         ]));
-        for (resolved, expected) in [
-            ("gpt-5.6-luna", "gpt-5.6-sol"),
-            ("gpt-5.6-sol", "gpt-5.6-sol"),
-            ("gpt-5.6-terra", "gpt-5.6-terra"),
-            ("gpt-6-luna", "gpt-6-sol"),
-            ("gpt-6-sol", "gpt-6-sol"),
-            ("gpt-5.4", "gpt-5.4"),
-        ] {
-            let mut model = resolved.to_string();
-            let lite = apply_model_lane_for_request(&mut model, &body);
-            assert!(!lite, "{resolved} with web_search must use the full lane");
-            assert_eq!(model, expected);
+        for resolved in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-sol", "gpt-5.4"] {
+            assert!(!apply_model_lane_for_request(resolved, &body).unwrap());
+        }
+        for resolved in ["gpt-5.6-luna", "gpt-6-luna"] {
+            assert!(apply_model_lane_for_request(resolved, &body).is_err());
         }
     }
 
@@ -2372,9 +2413,7 @@ mod tests {
             ("gpt-6-sol", true),
             ("gpt-5.4", false),
         ] {
-            let mut model = resolved.to_string();
-            let lite = apply_model_lane_for_request(&mut model, &body);
-            assert_eq!(model, resolved, "model must not change without web_search");
+            let lite = apply_model_lane_for_request(resolved, &body).unwrap();
             assert_eq!(lite, lite_expected);
         }
     }

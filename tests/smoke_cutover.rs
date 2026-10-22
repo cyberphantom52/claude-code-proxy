@@ -87,6 +87,7 @@ async fn call_messages(model: &str) -> Response {
 
 async fn call_messages_body(body: Value) -> Response {
     let _no_proxy_env = EnvGuard::set("NO_PROXY", "127.0.0.1,localhost");
+    let _model_discovery_env = EnvGuard::set("CCP_CODEX_MODEL_DISCOVERY", "0");
     app(Arc::new(Registry::new()))
         .oneshot(
             Request::builder()
@@ -103,6 +104,7 @@ async fn call_messages_body(body: Value) -> Response {
 
 async fn call_messages_body_with_headers(body: Value, headers: &[(&str, &str)]) -> Response {
     let _no_proxy_env = EnvGuard::set("NO_PROXY", "127.0.0.1,localhost");
+    let _model_discovery_env = EnvGuard::set("CCP_CODEX_MODEL_DISCOVERY", "0");
     let mut request = Request::builder()
         .method(Method::POST)
         .uri("/v1/messages")
@@ -118,6 +120,7 @@ async fn call_messages_body_with_headers(body: Value, headers: &[(&str, &str)]) 
 
 async fn call_responses_body(body: Value) -> Response {
     let _no_proxy_env = EnvGuard::set("NO_PROXY", "127.0.0.1,localhost");
+    let _model_discovery_env = EnvGuard::set("CCP_CODEX_MODEL_DISCOVERY", "0");
     app_with_options(Arc::new(Registry::new()), None, true)
         .oneshot(
             Request::builder()

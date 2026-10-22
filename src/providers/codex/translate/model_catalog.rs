@@ -1,184 +1,406 @@
-//! Model knowledge from the Codex CLI's own model cache
-//! (`$CODEX_HOME/models_cache.json`, default `~/.codex/models_cache.json`).
+//! Model metadata used by discovery, request shaping and launch policy.
 //!
-//! The Codex CLI refreshes that file from the server (ETag fetch), so a model
-//! that OpenAI ships to Codex shows up there before this proxy can ship a
-//! release that lists it. The static allowlist in `model_allowlist` stays the
-//! baseline; the catalog extends it at runtime.
-//!
-//! Only the fields the proxy needs are read. Each model object is decoded
-//! leniently on its own, so one unexpected entry never discards the file.
-//! The parsed result is cached per (mtime, len) of the file; a missing or
-//! unreadable file keeps the last good parse (or yields nothing).
+//! Each operation pins an immutable catalog: concurrent requests must not see
+//! another account's models. Unscoped callers use built-ins and an explicitly
+//! configured import, never another client's credentials or `~/.codex` files.
 
 use std::{
+    collections::HashSet,
     fs,
+    future::Future,
     path::PathBuf,
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     time::SystemTime,
 };
 
 use serde::Deserialize;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+pub const MAX_CATALOG_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_CATALOG_MODELS: usize = 2048;
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct ReasoningLevel {
+    pub effort: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct CatalogServiceTier {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct CatalogModel {
     pub slug: String,
-    /// `use_responses_lite` — the model exists behind the Responses Lite lane.
-    pub use_responses_lite: bool,
-    /// `supported_in_api` — false for TUI-only models the backend rejects.
+    pub display_name: Option<String>,
+    pub use_responses_lite: Option<bool>,
     pub supported_in_api: bool,
-    /// `visibility == "list"` — shown in the Codex picker (hidden models are
-    /// still accepted when requested explicitly, just not advertised).
+    #[serde(skip)]
     pub listed: bool,
+    pub default_reasoning_level: Option<String>,
+    pub multi_agent_reasoning_effort: Option<String>,
+    pub supported_reasoning_levels: Option<Vec<ReasoningLevel>>,
+    #[serde(rename = "supports_reasoning_summary_parameter")]
+    pub supports_reasoning_summaries: Option<bool>,
+    pub default_reasoning_summary: Option<String>,
+    #[serde(rename = "support_verbosity")]
+    pub supports_verbosity: Option<bool>,
+    pub default_verbosity: Option<String>,
+    pub context_window: Option<u64>,
+    pub max_context_window: Option<u64>,
+    pub effective_context_window_percent: Option<u64>,
+    pub auto_compact_token_limit: Option<u64>,
+    pub service_tiers: Option<Vec<CatalogServiceTier>>,
+    pub default_service_tier: Option<String>,
+    pub input_modalities: Option<Vec<String>>,
+    pub supports_parallel_tool_calls: Option<bool>,
+    pub priority: Option<i64>,
 }
 
-#[derive(Deserialize)]
-struct CacheFile {
-    #[serde(default)]
-    models: Vec<serde_json::Value>,
+impl Default for CatalogModel {
+    fn default() -> Self {
+        Self {
+            slug: String::new(),
+            display_name: None,
+            use_responses_lite: None,
+            supported_in_api: true,
+            listed: true,
+            default_reasoning_level: None,
+            multi_agent_reasoning_effort: None,
+            supported_reasoning_levels: None,
+            supports_reasoning_summaries: None,
+            default_reasoning_summary: None,
+            supports_verbosity: None,
+            default_verbosity: None,
+            context_window: None,
+            max_context_window: None,
+            effective_context_window_percent: None,
+            auto_compact_token_limit: None,
+            service_tiers: None,
+            default_service_tier: None,
+            input_modalities: None,
+            supports_parallel_tool_calls: None,
+            priority: None,
+        }
+    }
 }
 
-#[derive(Deserialize)]
-struct CacheModel {
-    slug: String,
-    #[serde(default)]
-    use_responses_lite: bool,
-    #[serde(default = "default_true")]
-    supported_in_api: bool,
-    #[serde(default = "default_visibility")]
-    visibility: String,
+impl CatalogModel {
+    /// The active window, not a larger window the backend might offer separately.
+    pub fn context_window_tokens(&self) -> Option<u64> {
+        self.context_window.filter(|n| *n > 0)
+    }
+
+    pub fn usable_context_tokens(&self) -> Option<u64> {
+        let percent = self.effective_context_window_percent.unwrap_or(95).min(100);
+        self.context_window_tokens()
+            .map(|window| ((u128::from(window) * u128::from(percent)) / 100) as u64)
+            .filter(|n| *n > 0)
+    }
+
+    /// Native Codex's default is 90% of the active window, capped by metadata.
+    pub fn auto_compact_tokens(&self) -> Option<u64> {
+        match self.context_window_tokens() {
+            Some(window) => {
+                let limit = ((u128::from(window) * 90) / 100) as u64;
+                Some(limit.min(self.auto_compact_token_limit.unwrap_or(limit)))
+            }
+            None => self.auto_compact_token_limit,
+        }
+        .filter(|n| *n > 0)
+    }
+
+    pub fn supports_effort(&self, effort: &str) -> Option<bool> {
+        self.supported_reasoning_levels
+            .as_ref()
+            .map(|levels| levels.iter().any(|level| level.effort == effort))
+    }
+
+    pub fn supports_service_tier(&self, tier: &str) -> Option<bool> {
+        if matches!(tier, "auto" | "default" | "flex") {
+            return Some(true);
+        }
+        self.service_tiers
+            .as_ref()
+            .map(|tiers| tiers.iter().any(|entry| entry.id == tier))
+    }
 }
 
-fn default_true() -> bool {
-    true
+#[derive(Debug, Clone)]
+pub struct CatalogSnapshot {
+    pub models: Vec<CatalogModel>,
+    pub authoritative: bool,
 }
 
-fn default_visibility() -> String {
-    "list".to_string()
+impl CatalogSnapshot {
+    pub fn new(models: Vec<CatalogModel>, authoritative: bool) -> Self {
+        Self {
+            models,
+            authoritative,
+        }
+    }
 }
 
-struct CacheState {
-    key: Option<(SystemTime, u64)>,
-    models: Vec<CatalogModel>,
+tokio::task_local! {
+    static ACTIVE_CATALOG: Arc<CatalogSnapshot>;
 }
 
-static CACHE: OnceLock<Mutex<CacheState>> = OnceLock::new();
+pub async fn scope_catalog<F: Future>(catalog: Arc<CatalogSnapshot>, future: F) -> F::Output {
+    // Workers receive resolved request values; task locals do not cross spawn.
+    ACTIVE_CATALOG.scope(catalog, future).await
+}
+
+pub fn with_catalog<T>(catalog: Arc<CatalogSnapshot>, f: impl FnOnce() -> T) -> T {
+    ACTIVE_CATALOG.sync_scope(catalog, f)
+}
+
+pub fn scoped_catalog() -> Option<Arc<CatalogSnapshot>> {
+    ACTIVE_CATALOG.try_with(Arc::clone).ok()
+}
 
 pub fn catalog_path() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("CODEX_HOME") {
-        return Some(PathBuf::from(dir).join("models_cache.json"));
-    }
-    std::env::var_os("HOME")
-        .map(|home| PathBuf::from(home).join(".codex").join("models_cache.json"))
+    crate::config::codex_models_file()
 }
 
-/// Parses the cache file bytes. Returns `None` only if the top level is not
-/// the expected object; individual malformed models are skipped.
+/// Missing fields mean unknown capabilities, not a denial or an entitlement.
+/// Malformed entries are skipped; malformed/oversized envelopes are rejected.
 pub fn parse_catalog(bytes: &[u8]) -> Option<Vec<CatalogModel>> {
-    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
-    if !value.is_object() {
+    if bytes.len() > MAX_CATALOG_BYTES {
         return None;
     }
-    let file: CacheFile = serde_json::from_value(value).ok()?;
-    let models = file
-        .models
-        .into_iter()
-        .filter_map(|value| serde_json::from_value::<CacheModel>(value).ok())
-        .filter(|model| !model.slug.is_empty())
-        .map(|model| CatalogModel {
-            listed: model.visibility == "list",
-            slug: model.slug,
-            use_responses_lite: model.use_responses_lite,
-            supported_in_api: model.supported_in_api,
-        })
-        .collect();
+    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let entries = value.get("models")?.as_array()?;
+    if entries.len() > MAX_CATALOG_MODELS {
+        return None;
+    }
+    let mut seen = HashSet::new();
+    let mut models = Vec::new();
+    for entry in entries {
+        let Ok(mut model) = serde_json::from_value::<CatalogModel>(entry.clone()) else {
+            continue;
+        };
+        if model.slug.is_empty()
+            || model.slug.len() > 256
+            || model.slug.chars().any(char::is_whitespace)
+            || model.slug.chars().any(char::is_control)
+            || !seen.insert(model.slug.clone())
+        {
+            continue;
+        }
+        model.listed = entry
+            .get("visibility")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|visibility| visibility == "list");
+        models.push(model);
+    }
     Some(models)
 }
 
-/// Current catalog snapshot (cached per file mtime/len).
-pub fn catalog_models() -> Vec<CatalogModel> {
-    let mutex = CACHE.get_or_init(|| {
-        Mutex::new(CacheState {
-            key: None,
-            models: Vec::new(),
-        })
-    });
-    let mut state = mutex
+#[derive(Default)]
+struct ImportCache {
+    key: Option<(PathBuf, SystemTime, u64)>,
+    models: Vec<CatalogModel>,
+}
+
+static IMPORT: OnceLock<Mutex<ImportCache>> = OnceLock::new();
+
+fn imported_models() -> Vec<CatalogModel> {
+    let Some(path) = catalog_path() else {
+        return Vec::new();
+    };
+    let mut cache = IMPORT
+        .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-    let Some(path) = catalog_path() else {
-        return state.models.clone();
-    };
-    let Some(key) = fs::metadata(&path)
+    let Some((modified, len)) = fs::metadata(&path)
         .ok()
         .and_then(|meta| Some((meta.modified().ok()?, meta.len())))
     else {
-        return state.models.clone();
+        return if cache.key.as_ref().is_some_and(|key| key.0 == path) {
+            cache.models.clone()
+        } else {
+            Vec::new()
+        };
     };
-    if state.key == Some(key) {
-        return state.models.clone();
+    if len > MAX_CATALOG_BYTES as u64 {
+        return Vec::new();
     }
-    if let Some(models) = fs::read(&path).ok().and_then(|bytes| parse_catalog(&bytes)) {
-        state.key = Some(key);
-        state.models = models;
+    let key = (path, modified, len);
+    if cache.key.as_ref() != Some(&key) {
+        match fs::read(&key.0)
+            .ok()
+            .and_then(|bytes| parse_catalog(&bytes))
+        {
+            Some(models) => {
+                cache.models = models;
+                cache.key = Some(key);
+            }
+            None if cache.key.as_ref().is_none_or(|old| old.0 != key.0) => return Vec::new(),
+            None => {}
+        }
     }
-    state.models.clone()
+    cache.models.clone()
+}
+
+pub fn fallback_snapshot() -> CatalogSnapshot {
+    use super::model_allowlist::FALLBACK_MODELS;
+
+    let mut models: Vec<_> = FALLBACK_MODELS
+        .iter()
+        .map(|slug| {
+            let lite = matches!(
+                *slug,
+                "gpt-5.6-luna"
+                    | "gpt-5.6-sol"
+                    | "gpt-5.6-terra"
+                    | "gpt-6-astra"
+                    | "gpt-6-luna"
+                    | "gpt-6-sol"
+                    | "gpt-6.1-sol"
+            );
+            // Context-only offline fallback, verified in OpenAI Codex models.json
+            // at 61f34c35af77777db4d77d0ea2aeb8547a6b4523. Other capabilities
+            // remain unknown until discovery; do not guess limits for older IDs.
+            let known_context = lite || *slug == "gpt-5.5";
+            CatalogModel {
+                slug: (*slug).to_string(),
+                use_responses_lite: Some(lite),
+                context_window: known_context.then_some(272_000),
+                max_context_window: known_context.then_some(if lite { 872_000 } else { 272_000 }),
+                ..Default::default()
+            }
+        })
+        .collect();
+    for imported in imported_models() {
+        if let Some(existing) = models.iter_mut().find(|model| model.slug == imported.slug) {
+            let mut imported = imported;
+            imported.use_responses_lite =
+                imported.use_responses_lite.or(existing.use_responses_lite);
+            imported.context_window = imported.context_window.or(existing.context_window);
+            imported.max_context_window =
+                imported.max_context_window.or(existing.max_context_window);
+            *existing = imported;
+        } else {
+            models.push(imported);
+        }
+    }
+    CatalogSnapshot::new(models, false)
+}
+
+pub fn catalog_models() -> Vec<CatalogModel> {
+    scoped_catalog().map_or_else(
+        || fallback_snapshot().models,
+        |catalog| catalog.models.clone(),
+    )
 }
 
 pub fn catalog_model(slug: &str) -> Option<CatalogModel> {
-    catalog_models()
-        .into_iter()
-        .find(|model| model.slug == slug)
+    match scoped_catalog() {
+        Some(catalog) => catalog
+            .models
+            .iter()
+            .find(|model| model.slug == slug)
+            .cloned(),
+        None => fallback_snapshot()
+            .models
+            .into_iter()
+            .find(|model| model.slug == slug),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const FIXTURE: &str = r#"{
-        "fetched_at": "2026-09-04T20:07:48Z",
-        "models": [
-            {"slug": "gpt-6-astra", "use_responses_lite": true, "supported_in_api": true, "visibility": "list"},
-            {"slug": "gpt-reserve", "use_responses_lite": true, "supported_in_api": true, "visibility": "hide"},
-            {"slug": "gpt-5.3-codex-spark", "use_responses_lite": false, "supported_in_api": false, "visibility": "list"},
-            {"slug": "gpt-7-minimal"},
-            {"nonsense": true},
-            {"slug": ""}
-        ]
-    }"#;
+    use serde_json::json;
 
     #[test]
-    fn parses_only_needed_fields_and_skips_broken_entries() {
-        let models = parse_catalog(FIXTURE.as_bytes()).expect("fixture parses");
+    fn parses_real_capability_names_without_inventing_missing_capabilities() {
+        let models = parse_catalog(&serde_json::to_vec(&json!({"models": [
+            {"slug":"new-model", "context_window":272000,"max_context_window":872000,
+             "default_reasoning_level":"low", "supported_reasoning_levels":[{"effort":"low"},{"effort":"ultra"}],
+             "supports_reasoning_summary_parameter":false,"support_verbosity":true,"default_verbosity":"low",
+             "service_tiers":[{"id":"priority","name":"Fast"}],"input_modalities":["text"],
+             "use_responses_lite":false},
+            {"slug":"hidden", "visibility":"hide"},
+            {"slug":"unavailable","supported_in_api":false},
+            {"slug":"minimal"}, {"nonsense":true}, {"slug":""}, {"slug":"bad id"}, {"slug":"new-model"}
+        ]})).unwrap()).unwrap();
         assert_eq!(models.len(), 4);
-        assert_eq!(
-            models[0],
-            CatalogModel {
-                slug: "gpt-6-astra".into(),
-                use_responses_lite: true,
-                supported_in_api: true,
-                listed: true,
-            }
-        );
-        assert!(!models[1].listed, "hidden models are kept but not listed");
+        let model = &models[0];
+        assert_eq!(model.context_window_tokens(), Some(272_000));
+        assert_eq!(model.usable_context_tokens(), Some(258_400));
+        assert_eq!(model.auto_compact_tokens(), Some(244_800));
+        assert_eq!(model.supports_effort("ultra"), Some(true));
+        assert_eq!(model.supports_effort("none"), Some(false));
+        assert_eq!(model.supports_reasoning_summaries, Some(false));
+        assert_eq!(model.supports_verbosity, Some(true));
+        assert_eq!(model.supports_service_tier("priority"), Some(true));
+        assert_eq!(model.supports_service_tier("ultrafast"), Some(false));
+        assert!(!models[1].listed);
         assert!(!models[2].supported_in_api);
-        // Missing fields fall back to: full lane, API-supported, listed.
-        assert_eq!(
-            models[3],
-            CatalogModel {
-                slug: "gpt-7-minimal".into(),
-                use_responses_lite: false,
-                supported_in_api: true,
-                listed: true,
-            }
-        );
+        assert_eq!(models[3].use_responses_lite, None);
+        assert_eq!(models[3].supports_effort("low"), None);
+        assert_eq!(models[3].supports_service_tier("priority"), None);
+        let legacy = parse_catalog(br#"{"models":[{"slug":"legacy","supports_reasoning_summaries":false,"supports_verbosity":false}]}"#).unwrap();
+        assert_eq!(legacy[0].supports_reasoning_summaries, None);
+        assert_eq!(legacy[0].supports_verbosity, None);
     }
 
     #[test]
-    fn garbage_yields_none_and_empty_models_yields_empty() {
-        assert!(parse_catalog(b"not json").is_none());
-        assert!(parse_catalog(b"[]").is_none());
-        assert_eq!(parse_catalog(b"{}").unwrap(), Vec::<CatalogModel>::new());
+    fn bounds_and_envelope_are_validated() {
+        for invalid in [b"not json".as_slice(), b"[]", b"{}", b"{\"models\":{}}"] {
+            assert!(parse_catalog(invalid).is_none());
+        }
+        assert!(parse_catalog(&vec![b' '; MAX_CATALOG_BYTES + 1]).is_none());
+        let many = json!({"models": vec![json!({"slug":"a"}); MAX_CATALOG_MODELS + 1]});
+        assert!(parse_catalog(&serde_json::to_vec(&many).unwrap()).is_none());
+        assert_eq!(parse_catalog(b"{\"models\":[]}").unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn active_context_wins_and_compaction_never_exceeds_its_policy() {
+        let mut model = CatalogModel {
+            context_window: Some(100_000),
+            max_context_window: Some(1_000_000),
+            auto_compact_token_limit: Some(80_000),
+            ..Default::default()
+        };
+        assert_eq!(model.auto_compact_tokens(), Some(80_000));
+        model.auto_compact_token_limit = Some(999_999);
+        assert_eq!(model.auto_compact_tokens(), Some(90_000));
+        model.context_window = None;
+        assert_eq!(model.context_window_tokens(), None);
+        assert_eq!(model.usable_context_tokens(), None);
+        model.context_window = Some(u64::MAX);
+        assert_eq!(model.auto_compact_tokens(), Some(999_999));
+        assert!(model.usable_context_tokens().is_some());
+        model.effective_context_window_percent = Some(0);
+        assert_eq!(model.usable_context_tokens(), None);
+    }
+
+    #[tokio::test]
+    async fn concurrent_operations_keep_their_own_catalogs() {
+        let snapshot = |slug: &str| {
+            Arc::new(CatalogSnapshot::new(
+                vec![CatalogModel {
+                    slug: slug.into(),
+                    ..Default::default()
+                }],
+                true,
+            ))
+        };
+        let (a, b) = tokio::join!(
+            scope_catalog(snapshot("account-a"), async {
+                tokio::task::yield_now().await;
+                catalog_models()[0].slug.clone()
+            }),
+            scope_catalog(snapshot("account-b"), async {
+                tokio::task::yield_now().await;
+                catalog_models()[0].slug.clone()
+            })
+        );
+        assert_eq!(a, "account-a");
+        assert_eq!(b, "account-b");
+        assert!(scoped_catalog().is_none());
     }
 }

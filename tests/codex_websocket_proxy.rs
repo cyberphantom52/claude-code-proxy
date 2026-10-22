@@ -90,6 +90,7 @@ fn configure_codex(config_dir: &Path, base_url: &str) -> Vec<EnvGuard> {
         EnvGuard::set("CCP_CONFIG_DIR", config_dir),
         EnvGuard::set("CCP_CODEX_TRANSPORT", "websocket"),
         EnvGuard::set("CCP_CODEX_BASE_URL", base_url),
+        EnvGuard::set("CCP_CODEX_MODEL_DISCOVERY", "0"),
         EnvGuard::set("CCP_CODEX_PREVIOUS_RESPONSE_ID", "0"),
         EnvGuard::set("CCP_CODEX_SERVER_COMPACTION", "0"),
     ]

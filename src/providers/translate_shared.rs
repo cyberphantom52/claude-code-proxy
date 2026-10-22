@@ -66,30 +66,6 @@ pub fn parallel_tool_calls(req: &MessagesRequest) -> Option<bool> {
         .map(|disabled| !disabled)
 }
 
-pub fn read_effort(req: &MessagesRequest) -> Result<Option<&str>, anyhow::Error> {
-    read_effort_with_allowed(req, &["low", "medium", "high", "xhigh", "max"])
-}
-
-pub fn read_effort_with_allowed<'a>(
-    req: &'a MessagesRequest,
-    allowed: &[&str],
-) -> Result<Option<&'a str>, anyhow::Error> {
-    let output_config = match req.extra.get("output_config") {
-        Some(Value::Object(m)) => m,
-        _ => return Ok(None),
-    };
-    match output_config.get("effort") {
-        Some(Value::String(s)) => {
-            if allowed.contains(&s.as_str()) {
-                Ok(Some(s.as_str()))
-            } else {
-                anyhow::bail!("Invalid output_config.effort: {s}")
-            }
-        }
-        _ => Ok(None),
-    }
-}
-
 pub fn normalize_content(content: &Value, missing_tool_input: Value) -> Vec<ContentBlock> {
     match content {
         Value::String(s) => {

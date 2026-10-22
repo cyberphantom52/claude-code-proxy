@@ -19,10 +19,11 @@ use crate::traffic::{
 
 use super::client::{CodexError, CodexHttpClient};
 use super::translate::model_allowlist::{
-    MODEL_ALIASES, allowed_models_display, assert_allowed_model, full_lane_web_search_model,
-    service_tier_for_model, split_tier_suffix, uses_responses_lite,
+    assert_allowed_model, model_parallel_tool_calls, model_reasoning_summary, model_verbosity,
+    resolve_model_effort, resolve_model_request_with_config_override, resolve_service_tier_value,
+    uses_responses_lite, validate_hosted_web_search, validate_input_modalities,
 };
-use super::translate::request::ServiceTier;
+use super::translate::request::{Effort, ServiceTier, effort_wire_value};
 
 pub struct CodexNativeBackend {
     client: Arc<CodexHttpClient>,
@@ -100,13 +101,9 @@ pub fn validate_native_request_model(body: &Value) -> Result<String, Response> {
         return Err(openai_error(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
-            format!(
-                "Model '{requested}' resolves to unsupported model '{}'. Supported: {}",
-                error.model,
-                allowed_models_display()
-            ),
+            error.to_string(),
             Some("model"),
-            Some("model_not_supported"),
+            Some("invalid_value"),
         ));
     }
     Ok(requested)
@@ -119,24 +116,23 @@ fn shape_native_request(body: &mut Value) -> Result<NativeResolved, Response> {
         .as_object_mut()
         .expect("validated native Responses body must be an object");
 
-    let (mut model, service_tier) = resolve_native_model(&requested);
+    let (model, service_tier) = resolve_native_model(&requested);
 
     let hosted_web_search = has_native_hosted_web_search(object);
     if hosted_web_search {
-        model = full_lane_web_search_model(&model).to_string();
+        validate_hosted_web_search(&model).map_err(|error| invalid_capability("tools", error))?;
     }
+    let use_responses_lite = uses_responses_lite(&model) && !hosted_web_search;
     object.insert("model".to_string(), Value::String(model.clone()));
     if let Some(tier) = service_tier
         && !object.contains_key("service_tier")
     {
-        object.insert(
-            "service_tier".to_string(),
-            json!(service_tier_for_model(&model, tier)),
-        );
+        object.insert("service_tier".to_string(), json!(tier));
     }
+    apply_native_capabilities(object, &model, use_responses_lite)?;
 
     Ok(NativeResolved {
-        use_responses_lite: uses_responses_lite(&model) && !hosted_web_search,
+        use_responses_lite,
         model,
         stream: object
             .get("stream")
@@ -146,16 +142,146 @@ fn shape_native_request(body: &mut Value) -> Result<NativeResolved, Response> {
 }
 
 fn resolve_native_model(requested: &str) -> (String, Option<ServiceTier>) {
-    let (requested, service_tier) = match split_tier_suffix(requested) {
-        Some((base, tier)) => (base, Some(tier)),
-        None => (requested, None),
+    let resolved = resolve_model_request_with_config_override(requested, false);
+    (resolved.model, resolved.service_tier)
+}
+
+fn invalid_capability(param: &str, error: impl std::fmt::Display) -> Response {
+    openai_error(
+        StatusCode::BAD_REQUEST,
+        "invalid_request_error",
+        error.to_string(),
+        Some(param),
+        Some("unsupported_value"),
+    )
+}
+
+#[allow(clippy::result_large_err)]
+fn native_optional_string<'a>(
+    object: &'a Map<String, Value>,
+    key: &str,
+    param: &str,
+) -> Result<Option<&'a str>, Response> {
+    match object.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value)),
+        Some(_) => Err(invalid_capability(
+            param,
+            format!("'{param}' must be a string"),
+        )),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn apply_native_capabilities(
+    object: &mut Map<String, Value>,
+    model: &str,
+    lite: bool,
+) -> Result<(), Response> {
+    let requested_parallel = match object.get("parallel_tool_calls") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(value)) => Some(*value),
+        Some(_) => {
+            return Err(invalid_capability(
+                "parallel_tool_calls",
+                "parallel_tool_calls must be a boolean",
+            ));
+        }
     };
-    let model = MODEL_ALIASES
-        .iter()
-        .find(|(alias, _)| *alias == requested)
-        .map(|(_, target)| *target)
-        .unwrap_or(requested);
-    (model.to_string(), service_tier)
+    let parallel = model_parallel_tool_calls(model, lite, requested_parallel)
+        .map_err(|error| invalid_capability("parallel_tool_calls", error))?;
+    object
+        .entry("parallel_tool_calls")
+        .or_insert(json!(parallel));
+    if let Some(input) = object.get("input") {
+        validate_input_modalities(model, input)
+            .map_err(|error| invalid_capability("input", error))?;
+    }
+    if let Some(tier) = native_optional_string(object, "service_tier", "service_tier")? {
+        let tier = resolve_service_tier_value(model, tier)
+            .map_err(|error| invalid_capability("service_tier", error))?;
+        if String::from(tier.clone()) == "default" {
+            object.remove("service_tier");
+        } else {
+            object.insert("service_tier".to_string(), json!(tier));
+        }
+    }
+
+    let mut reasoning = match object.get("reasoning") {
+        None | Some(Value::Null) => Map::new(),
+        Some(Value::Object(reasoning)) => reasoning.clone(),
+        Some(_) => {
+            return Err(invalid_capability(
+                "reasoning",
+                "reasoning must be an object",
+            ));
+        }
+    };
+    let explicit_effort = match reasoning.get("effort") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            serde_json::from_value::<Effort>(value.clone())
+                .map_err(|error| invalid_capability("reasoning.effort", error))?
+                .to_string(),
+        ),
+    };
+    let effort = if reasoning.get("effort") == Some(&Value::Null) {
+        None
+    } else {
+        resolve_model_effort(model, explicit_effort.as_deref())
+            .map_err(|error| invalid_capability("reasoning.effort", error))?
+    };
+    if let Some(effort) = &effort {
+        reasoning.insert(
+            "effort".to_string(),
+            effort_wire_value(effort)
+                .map_err(|error| invalid_capability("reasoning.effort", error))?,
+        );
+    }
+    let explicit_summary = native_optional_string(&reasoning, "summary", "reasoning.summary")?;
+    let wants_reasoning = effort
+        .as_deref()
+        .is_some_and(|effort| !matches!(effort, "none" | "disabled"));
+    let summary = model_reasoning_summary(model, explicit_summary, None)
+        .map_err(|error| invalid_capability("reasoning.summary", error))?;
+    match summary {
+        Some(summary)
+            if (wants_reasoning || explicit_summary.is_some())
+                && reasoning.get("summary") != Some(&Value::Null) =>
+        {
+            reasoning.insert("summary".to_string(), json!(summary));
+        }
+        None => {
+            reasoning.remove("summary");
+        }
+        _ => {}
+    }
+    if !reasoning.is_empty() && object.get("reasoning") != Some(&Value::Null) {
+        object.insert("reasoning".to_string(), Value::Object(reasoning));
+    }
+    let mut text = match object.get("text") {
+        None | Some(Value::Null) => Map::new(),
+        Some(Value::Object(text)) => text.clone(),
+        Some(_) => return Err(invalid_capability("text", "text must be an object")),
+    };
+    let requested_verbosity = native_optional_string(&text, "verbosity", "text.verbosity")?;
+    let verbosity = if requested_verbosity.is_some()
+        || super::translate::model_catalog::catalog_model(model)
+            .and_then(|model| model.supports_verbosity)
+            == Some(true)
+    {
+        model_verbosity(model, requested_verbosity)
+            .map_err(|error| invalid_capability("text.verbosity", error))?
+    } else {
+        None
+    };
+    if let Some(verbosity) = verbosity {
+        text.entry("verbosity").or_insert(json!(verbosity));
+    }
+    if !text.is_empty() && object.get("text") != Some(&Value::Null) {
+        object.insert("text".to_string(), Value::Object(text));
+    }
+    Ok(())
 }
 
 fn has_native_hosted_web_search(object: &Map<String, Value>) -> bool {
@@ -610,6 +736,128 @@ fn retain_boundary_prefix(bytes: &mut Vec<u8>) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn numeric_efforts_apply_defaults_preserve_unsigned_inputs_and_reject_invalid_numbers() {
+        super::super::translate::model_allowlist::with_test_catalog(
+            json!([{
+                "slug":"numeric", "default_reasoning_level":"4096",
+                "supported_reasoning_levels":[{"effort":"4096"},{"effort":"low"},{"effort":u64::MAX.to_string()}]
+            }]),
+            || {
+                let mut body = json!({"model":"numeric","input":[]});
+                shape_native_request(&mut body).unwrap();
+                assert_eq!(body["reasoning"]["effort"], json!(4096));
+                for (input, expected) in [
+                    (json!(4096), json!(4096)),
+                    (json!("4096"), json!(4096)),
+                    (json!(u64::MAX), json!(u64::MAX)),
+                    (json!("low"), json!("low")),
+                ] {
+                    let mut body =
+                        json!({"model":"numeric","input":[],"reasoning":{"effort":input}});
+                    shape_native_request(&mut body).unwrap();
+                    assert_eq!(body["reasoning"]["effort"], expected);
+                }
+                for invalid in [
+                    json!(-1),
+                    json!(1.5),
+                    json!("-1"),
+                    json!("1.5"),
+                    json!("18446744073709551616"),
+                    json!(18446744073709551616.0),
+                ] {
+                    let mut body =
+                        json!({"model":"numeric","input":[],"reasoning":{"effort":invalid}});
+                    assert_eq!(
+                        shape_native_request(&mut body).err().unwrap().status(),
+                        StatusCode::BAD_REQUEST
+                    );
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn catalog_defaults_preserve_supported_native_parameters() {
+        super::super::translate::model_allowlist::with_test_catalog(
+            json!([{
+                "slug":"future", "use_responses_lite":false, "default_reasoning_level":"low",
+                "supported_reasoning_levels":[{"effort":"none"},{"effort":"low"},{"effort":"max"},{"effort":"future-effort"}],
+                "supports_reasoning_summary_parameter":true, "default_reasoning_summary":"none",
+                "support_verbosity":true, "default_verbosity":"medium", "input_modalities":["text","image"],
+                "supports_parallel_tool_calls":true, "service_tiers":[{"id":"new-speed"}]
+            }]),
+            || {
+                let mut body = json!({"model":"future", "input":[]});
+                shape_native_request(&mut body).unwrap();
+                assert_eq!(body["reasoning"]["effort"], "low");
+                assert_eq!(body["reasoning"]["summary"], "none");
+                assert_eq!(body["text"]["verbosity"], "medium");
+                assert_eq!(body["parallel_tool_calls"], true);
+                assert!(body.get("service_tier").is_none());
+                let mut nulls = json!({"model":"future","input":[],"reasoning":null,"text":null});
+                shape_native_request(&mut nulls).unwrap();
+                assert!(nulls["reasoning"].is_null());
+                assert!(nulls["text"].is_null());
+                let mut explicit = json!({"model":"future", "input":[{"type":"message","role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,YQ=="}]}],
+                "reasoning":{"effort":"future-effort","summary":"detailed","context":"all_turns"},
+                "text":{"verbosity":"high","format":{"type":"json_object"}}, "parallel_tool_calls":false,
+                "service_tier":"new-speed", "instructions":"unchanged", "custom_parameter":{"keep":true}});
+                let original = explicit.clone();
+                shape_native_request(&mut explicit).unwrap();
+                assert_eq!(explicit, original);
+                explicit["reasoning"]["effort"] = json!("ultra");
+                explicit["service_tier"] = json!("default");
+                shape_native_request(&mut explicit).unwrap();
+                assert_eq!(explicit["reasoning"]["effort"], "max");
+                assert!(explicit.get("service_tier").is_none());
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn incompatible_native_controls_return_openai_errors() {
+        use super::super::translate::model_allowlist::with_test_catalog;
+        for (field, value, param) in [
+            ("reasoning", json!({"effort":"none"}), "reasoning.effort"),
+            (
+                "reasoning",
+                json!({"summary":"detailed"}),
+                "reasoning.summary",
+            ),
+            ("text", json!({"verbosity":"high"}), "text.verbosity"),
+            ("parallel_tool_calls", json!(true), "parallel_tool_calls"),
+            ("service_tier", json!("ultrafast"), "service_tier"),
+            (
+                "input",
+                json!([{"type":"message","content":[{"type":"input_image","image_url":"x"}]}]),
+                "input",
+            ),
+        ] {
+            let response = with_test_catalog(
+                json!([{
+                    "slug":"gpt-6.1-sol", "use_responses_lite":true, "supported_reasoning_levels":[{"effort":"low"}],
+                    "supports_reasoning_summary_parameter":false, "support_verbosity":false,
+                    "input_modalities":["text"], "service_tiers":[{"id":"priority"}]
+                }]),
+                || {
+                    let mut body = json!({"model":"gpt-6.1-sol", "input":[]});
+                    body[field] = value;
+                    shape_native_request(&mut body)
+                        .err()
+                        .expect("capability should fail")
+                },
+            );
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let error: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(error["error"]["type"], "invalid_request_error");
+            assert_eq!(error["error"]["param"], param);
+        }
+    }
+
     fn request(body: Value) -> Value {
         body
     }
@@ -700,8 +948,8 @@ mod tests {
     fn native_request_resolves_alias_and_fast_tier() {
         let mut body = request(json!({"model":"claude-opus-5","input":[]}));
         let resolved = shape_native_request(&mut body).unwrap();
-        assert_eq!(resolved.model, "gpt-6-sol");
-        assert_eq!(body["model"], "gpt-6-sol");
+        assert_eq!(resolved.model, "gpt-6.1-sol");
+        assert_eq!(body["model"], "gpt-6.1-sol");
         assert!(resolved.use_responses_lite);
 
         let mut fast = request(json!({"model":"gpt-5.4-fast","input":[]}));
@@ -741,10 +989,11 @@ mod tests {
     }
 
     #[test]
-    fn native_request_rejects_ultrafast_suffix_without_the_tier() {
+    fn native_request_preserves_unknown_raw_model_ids() {
         let mut body = request(json!({"model":"gpt-6-sol-ultrafast","input":[]}));
-        let response = shape_native_request(&mut body).err().unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let resolved = shape_native_request(&mut body).unwrap();
+        assert_eq!(resolved.model, "gpt-6-sol-ultrafast");
+        assert!(body.get("service_tier").is_none());
     }
 
     #[test]
@@ -759,16 +1008,18 @@ mod tests {
     }
 
     #[test]
-    fn hosted_search_uses_full_lane_and_upgrades_luna() {
+    fn hosted_search_rejects_luna_without_substitution() {
         for tool_type in ["web_search", "web_search_preview"] {
             let mut body = request(json!({
                 "model":"gpt-5.6-luna",
                 "tools":[{"type":tool_type}],
                 "input":[]
             }));
-            let resolved = shape_native_request(&mut body).unwrap();
-            assert_eq!(resolved.model, "gpt-5.6-sol");
-            assert!(!resolved.use_responses_lite);
+            assert_eq!(
+                shape_native_request(&mut body).err().unwrap().status(),
+                StatusCode::BAD_REQUEST
+            );
+            assert_eq!(body["model"], "gpt-5.6-luna");
         }
     }
 

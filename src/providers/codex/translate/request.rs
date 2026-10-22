@@ -8,10 +8,13 @@ use crate::anthropic::schema::MessagesRequest;
 use crate::config;
 use crate::providers::translate_shared::{
     ContentBlock, flatten_system_text, image_source_to_url, normalize_content, parallel_tool_calls,
-    read_effort,
 };
 
-use super::model_allowlist::service_tier_for_model;
+use super::model_allowlist::{
+    KNOWN_EFFORTS, model_parallel_tool_calls, model_reasoning_summary, model_verbosity,
+    resolve_model_effort, resolve_service_tier_value, validate_hosted_web_search,
+    validate_input_modalities,
+};
 use super::read_rewrite::{ReadOffsetRewrite, read_offset_rewrite};
 use super::reasoning_signature::decode_reasoning_signature;
 
@@ -19,36 +22,132 @@ use super::reasoning_signature::decode_reasoning_signature;
 // Types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Effort {
     None,
+    Minimal,
     Low,
     Medium,
     High,
     Xhigh,
     Max,
+    Ultra,
+    Other(String),
+}
+
+/// Codex custom numeric efforts use unsigned JSON integers, not numeric strings.
+pub(crate) fn effort_wire_value(effort: &str) -> anyhow::Result<Value> {
+    if !effort.is_empty() && effort.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Ok(Value::from(effort.parse::<u64>().map_err(|_| {
+            anyhow::anyhow!("Numeric reasoning effort must fit an unsigned 64-bit integer")
+        })?));
+    }
+    anyhow::ensure!(
+        effort.parse::<f64>().is_err(),
+        "Numeric reasoning effort must be an unsigned 64-bit integer"
+    );
+    Ok(Value::String(effort.to_string()))
+}
+
+impl Serialize for Effort {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        effort_wire_value(&self.to_string())
+            .map_err(serde::ser::Error::custom)?
+            .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Effort {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        let effort = match value {
+            Value::String(effort) => effort,
+            Value::Number(number) => number
+                .as_u64()
+                .ok_or_else(|| {
+                    serde::de::Error::custom(
+                        "reasoning effort must be a string or unsigned 64-bit integer",
+                    )
+                })?
+                .to_string(),
+            _ => {
+                return Err(serde::de::Error::custom(
+                    "reasoning effort must be a string or unsigned 64-bit integer",
+                ));
+            }
+        };
+        effort_wire_value(&effort).map_err(serde::de::Error::custom)?;
+        Ok(Self::from(effort))
+    }
+}
+
+impl From<String> for Effort {
+    fn from(value: String) -> Self {
+        match value.as_str() {
+            "none" => Self::None,
+            "minimal" => Self::Minimal,
+            "low" => Self::Low,
+            "medium" => Self::Medium,
+            "high" => Self::High,
+            "xhigh" => Self::Xhigh,
+            "max" => Self::Max,
+            "ultra" => Self::Ultra,
+            _ => Self::Other(value),
+        }
+    }
+}
+
+impl From<Effort> for String {
+    fn from(value: Effort) -> Self {
+        value.to_string()
+    }
 }
 
 impl std::fmt::Display for Effort {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Effort::None => write!(f, "none"),
+            Effort::Minimal => write!(f, "minimal"),
             Effort::Low => write!(f, "low"),
             Effort::Medium => write!(f, "medium"),
             Effort::High => write!(f, "high"),
             Effort::Xhigh => write!(f, "xhigh"),
             Effort::Max => write!(f, "max"),
+            Effort::Ultra => write!(f, "ultra"),
+            Effort::Other(value) => f.write_str(value),
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(from = "String", into = "String")]
 pub enum ServiceTier {
     Priority,
     Ultrafast,
     Flex,
+    Other(String),
+}
+
+impl From<String> for ServiceTier {
+    fn from(value: String) -> Self {
+        match value.as_str() {
+            "priority" => Self::Priority,
+            "ultrafast" => Self::Ultrafast,
+            "flex" => Self::Flex,
+            _ => Self::Other(value),
+        }
+    }
+}
+
+impl From<ServiceTier> for String {
+    fn from(value: ServiceTier) -> Self {
+        match value {
+            ServiceTier::Priority => "priority".to_string(),
+            ServiceTier::Ultrafast => "ultrafast".to_string(),
+            ServiceTier::Flex => "flex".to_string(),
+            ServiceTier::Other(value) => value,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -269,14 +368,7 @@ pub struct TranslateOptions {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn to_codex_effort(effort: Option<&str>) -> Option<Effort> {
-    match effort {
-        Some("max") => Some(Effort::Max),
-        Some("xhigh") => Some(Effort::Xhigh),
-        Some("low") => Some(Effort::Low),
-        Some("medium") => Some(Effort::Medium),
-        Some("high") => Some(Effort::High),
-        _ => None,
-    }
+    effort.map(|value| Effort::from(value.to_string()))
 }
 
 fn resolve_effort(effort: Option<Effort>) -> Result<Option<Effort>, anyhow::Error> {
@@ -288,34 +380,21 @@ pub(crate) fn resolve_effort_override(
     override_effort: Option<&str>,
 ) -> Result<Option<Effort>, anyhow::Error> {
     if let Some(val) = override_effort {
-        let valid = ["none", "low", "medium", "high", "xhigh", "max"];
-        if !valid.contains(&val) {
-            anyhow::bail!(
-                "Invalid effort override: \"{val}\". Must be one of: none, low, medium, high, xhigh, max"
-            );
-        }
-        return Ok(Some(match val {
-            "max" => Effort::Max,
-            "xhigh" => Effort::Xhigh,
-            "high" => Effort::High,
-            "medium" => Effort::Medium,
-            "low" => Effort::Low,
-            _ => Effort::None,
-        }));
+        anyhow::ensure!(!val.is_empty(), "Invalid empty effort override");
+        return Ok(to_codex_effort(Some(val)));
     }
     Ok(effort)
-}
-
-fn reasoning_summary_requested(summary: Option<&str>) -> bool {
-    !matches!(summary, Some("off" | "none"))
 }
 
 /// Whether the resolved effort asks the upstream for reasoning output.
 /// `Effort::None` still names the effort so the wire request overrides the
 /// upstream default, but it must not request a summary or encrypted
 /// continuation content, which are reasoning artifacts.
-fn reasoning_requested(effort: Option<&Effort>) -> bool {
-    effort.is_some_and(|effort| *effort != Effort::None)
+pub(crate) fn reasoning_requested(effort: Option<&Effort>) -> bool {
+    effort.is_some_and(|effort| {
+        !matches!(effort, Effort::None)
+            && !matches!(effort, Effort::Other(value) if value == "disabled")
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -389,29 +468,31 @@ fn compact_effort_cap_from(raw: Option<&str>) -> Option<Effort> {
         None | Some("") => Some(Effort::Low),
         Some("off") => None,
         Some("none") => Some(Effort::None),
-        Some(other) => to_codex_effort(Some(other)).or(Some(Effort::Low)),
-    }
-}
-
-const VALID_SERVICE_TIERS: &[&str] = &["fast", "priority", "ultrafast", "flex"];
-
-fn normalize_service_tier(tier: &str) -> Result<ServiceTier, anyhow::Error> {
-    match tier {
-        "fast" | "priority" => Ok(ServiceTier::Priority),
-        "ultrafast" => Ok(ServiceTier::Ultrafast),
-        "flex" => Ok(ServiceTier::Flex),
-        _ => anyhow::bail!(
-            "Invalid service tier override: \"{tier}\". Must be one of: {}",
-            VALID_SERVICE_TIERS.join(", ")
-        ),
+        Some(other) if KNOWN_EFFORTS.contains(&other) => to_codex_effort(Some(other)),
+        Some(_) => Some(Effort::Low),
     }
 }
 
 fn resolve_service_tier(
+    req: &MessagesRequest,
     model_tier: Option<ServiceTier>,
     model: &str,
 ) -> Result<Option<ServiceTier>, anyhow::Error> {
-    pick_service_tier(config::codex_service_tier().as_deref(), model_tier, model)
+    let speed = match req.extra.get("speed") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(speed)) if matches!(speed.as_str(), "fast" | "standard") => {
+            Some(speed.as_str())
+        }
+        Some(_) => anyhow::bail!("Invalid speed: expected 'fast' or 'standard'"),
+    };
+    // An interactive /fast choice is explicit caller intent, not an operator default.
+    let configured = config::codex_service_tier();
+    let tier = match speed {
+        Some("fast") => Some("priority"),
+        Some("standard") => Some("default"),
+        _ => configured.as_deref(),
+    };
+    pick_service_tier(tier, model_tier, model)
 }
 
 /// The configured override wins over the tier implied by the model name. Either
@@ -421,11 +502,14 @@ fn pick_service_tier(
     model_tier: Option<ServiceTier>,
     model: &str,
 ) -> Result<Option<ServiceTier>, anyhow::Error> {
-    let tier = match override_tier {
-        Some(value) => Some(normalize_service_tier(value)?),
-        None => model_tier,
-    };
-    Ok(tier.map(|tier| service_tier_for_model(model, tier)))
+    match override_tier {
+        Some("default") => Ok(None),
+        Some(value) => resolve_service_tier_value(model, value).map(Some),
+        None => match model_tier {
+            Some(tier) => resolve_service_tier_value(model, &String::from(tier)).map(Some),
+            None => Ok(None),
+        },
+    }
 }
 
 pub fn normalize_strict_json_schema(schema: &Value) -> Value {
@@ -492,15 +576,28 @@ fn translate_request_inner(
     opts: TranslateOptions,
     apply_codex_config: bool,
 ) -> Result<ResponsesRequest, anyhow::Error> {
+    if has_hosted_web_search(req) {
+        validate_hosted_web_search(&opts.model)?;
+    }
     let instructions = flatten_system_text(req.extra.get("system"));
     let is_compact = is_compact_messages_request(req);
     let input = build_input(req);
     let tools = read_tools(req)?;
     let tool_choice = map_tool_choice(req)?;
-    let parallel_tool_calls = parallel_tool_calls(req).unwrap_or(true);
+    validate_input_modalities(&opts.model, &serde_json::to_value(&req.messages)?)?;
+    // Claude's disable_parallel_tool_use=false is permission, not an explicit
+    // requirement for parallel execution; preserve omissions on serial models.
+    let requested_parallel = match req.extra.get("parallel_tool_calls") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(parallel)) => Some(*parallel),
+        Some(_) => anyhow::bail!("parallel_tool_calls must be a boolean"),
+    }
+    .or_else(|| (parallel_tool_calls(req) == Some(false)).then_some(false));
+    let parallel_tool_calls =
+        model_parallel_tool_calls(&opts.model, opts.use_responses_lite, requested_parallel)?;
 
     let mut text = ResponsesText {
-        verbosity: Some("low".to_string()),
+        verbosity: model_verbosity(&opts.model, None)?,
         format: None,
     };
 
@@ -598,30 +695,51 @@ fn translate_request_inner(
     }
 
     if apply_codex_config {
-        let service_tier = resolve_service_tier(opts.service_tier, &out.model)?;
+        let service_tier = resolve_service_tier(req, opts.service_tier, &out.model)?;
         if let Some(ref tier) = service_tier {
             out.service_tier = Some(tier.clone());
         }
     }
 
-    let effort = read_effort(req)?;
+    let effort = match req
+        .extra
+        .get("output_config")
+        .and_then(|config| config.get("effort"))
+    {
+        None | Some(Value::Null) => None,
+        Some(Value::String(effort)) => Some(effort.as_str()),
+        Some(_) => anyhow::bail!("output_config.effort must be a string"),
+    };
     let codex_effort = to_codex_effort(effort);
     let mut resolved_effort = if apply_codex_config {
         resolve_effort(codex_effort)?
     } else {
         codex_effort
     };
+    let resolved_string = resolved_effort.as_ref().map(ToString::to_string);
+    resolved_effort =
+        resolve_model_effort(&out.model, resolved_string.as_deref())?.map(Effort::from);
     if apply_codex_config && is_compact {
-        resolved_effort = apply_compact_effort_cap(resolved_effort, compact_effort_cap());
+        let capped = apply_compact_effort_cap(resolved_effort.clone(), compact_effort_cap());
+        // A local compaction optimization must not invent an unadvertised level.
+        if let Ok(effort) = resolve_model_effort(
+            &out.model,
+            capped.as_ref().map(ToString::to_string).as_deref(),
+        ) {
+            resolved_effort = effort.map(Effort::from);
+        }
     }
     let wants_reasoning = reasoning_requested(resolved_effort.as_ref());
     if resolved_effort.is_some() || opts.use_responses_lite {
-        let summary = if wants_reasoning
-            && !req.omit_reasoning_artifacts
-            && (!apply_codex_config
-                || reasoning_summary_requested(config::codex_reasoning_summary().as_deref()))
-        {
-            Some("auto".to_string())
+        let summary = if wants_reasoning && !req.omit_reasoning_artifacts {
+            model_reasoning_summary(
+                &out.model,
+                apply_codex_config
+                    .then(config::codex_reasoning_summary)
+                    .flatten()
+                    .as_deref(),
+                Some("auto"),
+            )?
         } else {
             None
         };
@@ -1357,6 +1475,218 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn numeric_effort_defaults_use_unsigned_wire_values_and_named_efforts_stay_strings() {
+        super::super::model_allowlist::with_test_catalog(
+            json!([{
+                "slug":"numeric", "default_reasoning_level":"4096",
+                "supported_reasoning_levels":[{"effort":"4096"},{"effort":"low"}]
+            }]),
+            || {
+                let mut req: MessagesRequest =
+                    serde_json::from_value(json!({"messages":[{"role":"user","content":"hello"}]}))
+                        .unwrap();
+                let options = || TranslateOptions {
+                    model: "numeric".to_string(),
+                    ..opts()
+                };
+                let wire =
+                    serde_json::to_value(translate_request(&req, options()).unwrap()).unwrap();
+                assert_eq!(wire["reasoning"]["effort"], json!(4096));
+                req.extra
+                    .insert("output_config".to_string(), json!({"effort":"low"}));
+                let wire =
+                    serde_json::to_value(translate_request(&req, options()).unwrap()).unwrap();
+                assert_eq!(wire["reasoning"]["effort"], json!("low"));
+            },
+        );
+        for value in [json!(4096), json!(u64::MAX), json!("low")] {
+            let effort: Effort = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(effort).unwrap(), value);
+        }
+        for value in [
+            json!(-1),
+            json!(1.5),
+            json!("-1"),
+            json!("1.5"),
+            json!("18446744073709551616"),
+        ] {
+            assert!(serde_json::from_value::<Effort>(value).is_err());
+        }
+    }
+
+    #[test]
+    fn interactive_fast_mode_changes_tier_not_the_selected_family_model() {
+        use super::super::model_allowlist::{
+            resolve_model_request_with_config_override, with_test_catalog,
+        };
+        with_test_catalog(
+            json!([
+                {"slug":"gpt-6-astra","service_tiers":[{"id":"priority"}]},
+                {"slug":"gpt-6.1-sol","service_tiers":[{"id":"priority"}]},
+                {"slug":"gpt-6-sol","service_tiers":[{"id":"priority"}]},
+                {"slug":"gpt-6-luna","service_tiers":[{"id":"priority"}]}
+            ]),
+            || {
+                for (alias, model) in [
+                    ("fable", "gpt-6-astra"),
+                    ("opus", "gpt-6.1-sol"),
+                    ("sonnet", "gpt-6-sol"),
+                    ("haiku", "gpt-6-luna"),
+                ] {
+                    let mut req: MessagesRequest = serde_json::from_value(json!({"model":alias,"messages":[{"role":"user","content":"hello"}],"speed":"fast"})).unwrap();
+                    let resolved = resolve_model_request_with_config_override(alias, false);
+                    let options = || TranslateOptions {
+                        model: resolved.model.clone(),
+                        use_responses_lite: true,
+                        ..opts()
+                    };
+                    let out = translate_request(&req, options()).unwrap();
+                    assert_eq!(out.model, model);
+                    assert_eq!(out.service_tier, Some(ServiceTier::Priority));
+                    req.extra.insert("speed".to_string(), json!("standard"));
+                    assert!(
+                        translate_request(&req, options())
+                            .unwrap()
+                            .service_tier
+                            .is_none()
+                    );
+                    req.extra.remove("speed");
+                    assert!(
+                        translate_request(&req, options())
+                            .unwrap()
+                            .service_tier
+                            .is_none()
+                    );
+                    req.extra.insert("speed".to_string(), json!("invalid"));
+                    assert!(
+                        translate_request(&req, options())
+                            .unwrap_err()
+                            .to_string()
+                            .contains("Invalid speed")
+                    );
+                }
+            },
+        );
+        with_test_catalog(json!([{"slug":"no-fast","service_tiers":[]}]), || {
+            let req: MessagesRequest =
+                serde_json::from_value(json!({"model":"no-fast","messages":[],"speed":"fast"}))
+                    .unwrap();
+            assert!(
+                translate_request(
+                    &req,
+                    TranslateOptions {
+                        model: "no-fast".to_string(),
+                        ..opts()
+                    }
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("service_tier 'priority'")
+            );
+        });
+    }
+
+    #[test]
+    fn catalog_defaults_and_capabilities_shape_anthropic_requests() {
+        super::super::model_allowlist::with_test_catalog(
+            json!([{
+                "slug":"future", "default_reasoning_level":"low",
+                "supported_reasoning_levels":[{"effort":"low"},{"effort":"future-effort"}],
+                "supports_reasoning_summary_parameter":true, "default_reasoning_summary":"none",
+                "support_verbosity":true, "default_verbosity":"medium",
+                "supports_parallel_tool_calls":false, "input_modalities":["text"]
+            }]),
+            || {
+                let mut req: MessagesRequest =
+                    serde_json::from_value(json!({"messages":[{"role":"user","content":"hello"}]}))
+                        .unwrap();
+                let options = || TranslateOptions {
+                    model: "future".to_string(),
+                    ..opts()
+                };
+                let out = translate_request(&req, options()).unwrap();
+                assert_eq!(out.reasoning.as_ref().unwrap().effort, Some(Effort::Low));
+                assert_eq!(
+                    out.reasoning.as_ref().unwrap().summary.as_deref(),
+                    Some("none")
+                );
+                assert_eq!(out.text.verbosity.as_deref(), Some("medium"));
+                assert!(!out.parallel_tool_calls);
+                assert!(
+                    out.include.is_some(),
+                    "summary:none must not disable encrypted reasoning replay"
+                );
+                req.extra.insert(
+                    "output_config".to_string(),
+                    json!({"effort":"future-effort"}),
+                );
+                assert_eq!(
+                    translate_request(&req, options())
+                        .unwrap()
+                        .reasoning
+                        .unwrap()
+                        .effort,
+                    Some(Effort::Other("future-effort".to_string()))
+                );
+                req.extra
+                    .insert("output_config".to_string(), json!({"effort":"none"}));
+                assert!(
+                    translate_request(&req, options())
+                        .unwrap_err()
+                        .to_string()
+                        .contains("Allowed: low, future-effort")
+                );
+                req.extra.remove("output_config");
+                req.extra
+                    .insert("parallel_tool_calls".to_string(), json!(true));
+                assert!(
+                    translate_request(&req, options())
+                        .unwrap_err()
+                        .to_string()
+                        .contains("parallel_tool_calls")
+                );
+                req.extra.remove("parallel_tool_calls");
+                req.messages[0].content = json!([{"type":"image","source":{"type":"url","url":"https://example.test/image.png"}}]);
+                assert!(
+                    translate_request(&req, options())
+                        .unwrap_err()
+                        .to_string()
+                        .contains("image inputs")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn unsupported_summary_and_verbosity_are_omitted_without_losing_json_format() {
+        super::super::model_allowlist::with_test_catalog(
+            json!([{
+                "slug":"future", "default_reasoning_level":"low", "supports_reasoning_summary_parameter":false,
+                "support_verbosity":false
+            }]),
+            || {
+                let req: MessagesRequest = serde_json::from_value(json!({"messages":[{"role":"user","content":"hello"}],"output_config":{"format":{"type":"json_object"}}})).unwrap();
+                let out = translate_request(
+                    &req,
+                    TranslateOptions {
+                        model: "future".to_string(),
+                        ..opts()
+                    },
+                )
+                .unwrap();
+                assert!(out.reasoning.unwrap().summary.is_none());
+                assert!(out.text.verbosity.is_none());
+                assert!(matches!(
+                    out.text.format,
+                    Some(ResponsesTextFormat::JsonObject)
+                ));
+                assert!(model_reasoning_summary("future", Some("detailed"), None).is_err());
+                assert!(model_verbosity("future", Some("high")).is_err());
+            },
+        );
+    }
+
     const PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
 
     fn opts() -> TranslateOptions {
@@ -1376,13 +1706,12 @@ mod tests {
             ("ultrafast", ServiceTier::Ultrafast, "ultrafast"),
             ("flex", ServiceTier::Flex, "flex"),
         ] {
-            let normalized = normalize_service_tier(value).unwrap();
+            let normalized = resolve_service_tier_value("unknown-model", value).unwrap();
             assert_eq!(normalized, tier, "{value}");
             assert_eq!(serde_json::to_value(normalized).unwrap(), json!(wire));
         }
-        for value in ["", "default", "Ultrafast", "ultra-fast", "turbo"] {
-            let error = normalize_service_tier(value).unwrap_err().to_string();
-            assert!(error.contains("ultrafast"), "{value}: {error}");
+        for value in ["", "bad tier", "control\n"] {
+            assert!(resolve_service_tier_value("unknown-model", value).is_err());
         }
     }
 
@@ -1400,7 +1729,7 @@ mod tests {
                 None,
                 Some(ServiceTier::Ultrafast),
                 "gpt-6-sol",
-                Some(ServiceTier::Priority),
+                Some(ServiceTier::Ultrafast),
             ),
             (
                 Some("ultrafast"),
@@ -1418,7 +1747,7 @@ mod tests {
                 Some("ultrafast"),
                 None,
                 "gpt-6-luna",
-                Some(ServiceTier::Priority),
+                Some(ServiceTier::Ultrafast),
             ),
             (
                 Some("fast"),
@@ -1437,7 +1766,7 @@ mod tests {
             let picked = pick_service_tier(override_tier, model_tier.clone(), model).unwrap();
             assert_eq!(picked, expected, "{override_tier:?} {model_tier:?} {model}");
         }
-        assert!(pick_service_tier(Some("turbo"), None, "gpt-6-astra").is_err());
+        assert!(pick_service_tier(Some("bad tier"), None, "gpt-6-astra").is_err());
     }
 
     #[test]
@@ -2300,11 +2629,20 @@ mod tests {
 
     #[test]
     fn reasoning_summary_override_values() {
-        assert!(reasoning_summary_requested(None));
-        assert!(reasoning_summary_requested(Some("auto")));
-        assert!(reasoning_summary_requested(Some("detailed")));
-        assert!(!reasoning_summary_requested(Some("off")));
-        assert!(!reasoning_summary_requested(Some("none")));
+        for (requested, expected) in [
+            (None, "auto"),
+            (Some("auto"), "auto"),
+            (Some("detailed"), "detailed"),
+            (Some("off"), "none"),
+            (Some("none"), "none"),
+        ] {
+            assert_eq!(
+                model_reasoning_summary("unknown-model", requested, Some("auto"))
+                    .unwrap()
+                    .as_deref(),
+                Some(expected)
+            );
+        }
     }
 
     #[test]

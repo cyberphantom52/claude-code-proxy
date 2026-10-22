@@ -55,6 +55,10 @@ struct CodexConfig {
     pub effort: Option<String>,
     #[serde(rename = "model")]
     pub model: Option<String>,
+    #[serde(rename = "modelsFile")]
+    pub models_file: Option<PathBuf>,
+    #[serde(rename = "modelDiscovery")]
+    pub model_discovery: Option<bool>,
     pub transport: Option<String>,
     #[serde(rename = "headerTimeoutMs")]
     pub header_timeout_ms: Option<u64>,
@@ -502,6 +506,33 @@ pub fn codex_reasoning_summary() -> Option<String> {
     None
 }
 
+/// Disable live discovery for explicitly offline/fixed-catalog operation.
+pub fn codex_model_discovery() -> bool {
+    if let Ok(raw) = std::env::var("CCP_CODEX_MODEL_DISCOVERY") {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "0" | "false" | "no" | "off" => return false,
+            "1" | "true" | "yes" | "on" => return true,
+            _ => {}
+        }
+    }
+    read_file_config(&paths::config_dir())
+        .and_then(|file| file.codex)
+        .and_then(|codex| codex.model_discovery)
+        .unwrap_or(true)
+}
+
+/// Explicit offline catalog import; never discovers another application's state directory.
+pub fn codex_models_file() -> Option<PathBuf> {
+    std::env::var_os("CCP_CODEX_MODELS_FILE")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            read_file_config(&paths::config_dir())
+                .and_then(|file| file.codex)
+                .and_then(|codex| codex.models_file)
+        })
+}
+
 pub fn codex_model() -> Option<String> {
     let env: HashMap<_, _> = std::env::vars().collect();
     if let Some(raw) = env.get("CCP_CODEX_MODEL") {
@@ -661,6 +692,8 @@ mod tests {
             EnvGuard::unset("CCP_CODEX_TRANSCRIPTIONS_API"),
             EnvGuard::unset("CCP_CODEX_HEADER_TIMEOUT_MS"),
             EnvGuard::unset("CCP_AUTO_REVIEW_MODEL"),
+            EnvGuard::unset("CCP_CODEX_MODELS_FILE"),
+            EnvGuard::unset("CCP_CODEX_MODEL_DISCOVERY"),
         ];
         guards.push(EnvGuard::set("CCP_CONFIG_DIR", config.path()));
         guards
@@ -671,6 +704,32 @@ mod tests {
             "CCP_CONFIG_DIR".to_string(),
             config.path().to_string_lossy().into_owned(),
         )])
+    }
+
+    #[test]
+    fn discovery_defaults_on_and_explicit_import_config_respects_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let _env = isolated_env(&config);
+        assert!(codex_model_discovery());
+        assert_eq!(codex_models_file(), None);
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"modelDiscovery":false,"modelsFile":"/explicit/catalog.json"}}"#,
+        )
+        .unwrap();
+        assert!(!codex_model_discovery());
+        assert_eq!(
+            codex_models_file(),
+            Some(PathBuf::from("/explicit/catalog.json"))
+        );
+        let _discovery = EnvGuard::set("CCP_CODEX_MODEL_DISCOVERY", "true");
+        let _import = EnvGuard::set("CCP_CODEX_MODELS_FILE", "/other/catalog.json");
+        assert!(codex_model_discovery());
+        assert_eq!(
+            codex_models_file(),
+            Some(PathBuf::from("/other/catalog.json"))
+        );
     }
 
     #[test]

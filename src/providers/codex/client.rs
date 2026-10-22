@@ -714,12 +714,13 @@ fn test_websocket_http_client() -> reqwest::Client {
 
 pub struct CodexHttpClient {
     client: reqwest::Client,
-    native_client: reqwest::Client,
+    pub(super) native_client: reqwest::Client,
     websocket_client: reqwest::Client,
     websocket_proxy_config: super::websocket::WebSocketProxyConfig,
     auto_http_fallback_enabled: bool,
-    auth_manager: CodexAuthManager<DefaultCodexAuthStore>,
-    base_url: String,
+    pub(super) auth_manager: CodexAuthManager<DefaultCodexAuthStore>,
+    pub(super) base_url: String,
+    pub(super) model_cache: super::models::ModelCache,
     header_timeout_ms: u64,
     body_idle_timeout_ms: u64,
 }
@@ -743,6 +744,7 @@ impl CodexHttpClient {
             websocket_client: websocket_http_client(&proxy_environment),
             websocket_proxy_config: proxy_environment.websocket_proxy_config(),
             auto_http_fallback_enabled: true,
+            model_cache: Default::default(),
             auth_manager: CodexAuthManager::new(file_store()),
             base_url: config::codex_base_url(CODEX_API_ENDPOINT),
             header_timeout_ms: timeout_ms,
@@ -764,6 +766,7 @@ impl CodexHttpClient {
             websocket_client: websocket_http_client(&proxy_environment),
             websocket_proxy_config,
             auto_http_fallback_enabled,
+            model_cache: Default::default(),
             client,
             auth_manager,
             base_url,
@@ -784,6 +787,7 @@ impl CodexHttpClient {
             websocket_client: test_websocket_http_client(),
             websocket_proxy_config: super::websocket::WebSocketProxyConfig::direct(),
             auto_http_fallback_enabled: true,
+            model_cache: Default::default(),
             client,
             auth_manager: CodexAuthManager::new(file_store()),
             base_url,
@@ -807,18 +811,14 @@ impl CodexHttpClient {
         ctx: &RequestContext,
     ) -> Result<reqwest::Response, CodexError> {
         let url = format!("{}/transcribe", base_url.trim_end_matches('/'));
-        let mut auth = self
-            .auth_manager
-            .get_auth()
-            .await
-            .map_err(|error| CodexError {
-                status: 401,
-                message: "Auth error".to_string(),
-                detail: Some(error.to_string()),
-                retry_after: None,
-                usage_limit: None,
-                origin: CodexErrorOrigin::Auth,
-            })?;
+        let mut auth = self.operation_auth().await.map_err(|error| CodexError {
+            status: 401,
+            message: "Auth error".to_string(),
+            detail: Some(error.to_string()),
+            retry_after: None,
+            usage_limit: None,
+            origin: CodexErrorOrigin::Auth,
+        })?;
         let mut refresh_attempted = false;
 
         loop {
@@ -828,8 +828,7 @@ impl CodexHttpClient {
                 refresh_attempted = true;
                 drop(response);
                 auth = self
-                    .auth_manager
-                    .force_refresh(&auth.access)
+                    .refresh_operation_auth(&auth)
                     .await
                     .map_err(auth_refresh_error)?;
                 continue;
@@ -909,18 +908,14 @@ impl CodexHttpClient {
             base_url.trim_end_matches('/'),
             operation.upstream_path()
         );
-        let mut auth = self
-            .auth_manager
-            .get_auth()
-            .await
-            .map_err(|error| CodexError {
-                status: 401,
-                message: "Auth error".to_string(),
-                detail: Some(error.to_string()),
-                retry_after: None,
-                usage_limit: None,
-                origin: CodexErrorOrigin::Auth,
-            })?;
+        let mut auth = self.operation_auth().await.map_err(|error| CodexError {
+            status: 401,
+            message: "Auth error".to_string(),
+            detail: Some(error.to_string()),
+            retry_after: None,
+            usage_limit: None,
+            origin: CodexErrorOrigin::Auth,
+        })?;
         let mut refresh_attempted = false;
 
         loop {
@@ -932,8 +927,7 @@ impl CodexHttpClient {
                 refresh_attempted = true;
                 drop(response);
                 auth = self
-                    .auth_manager
-                    .force_refresh(&auth.access)
+                    .refresh_operation_auth(&auth)
                     .await
                     .map_err(auth_refresh_error)?;
                 continue;
@@ -993,18 +987,14 @@ impl CodexHttpClient {
             usage_limit: None,
             origin: CodexErrorOrigin::Http,
         })?;
-        let mut auth = self
-            .auth_manager
-            .get_auth()
-            .await
-            .map_err(|err| CodexError {
-                status: 401,
-                message: "Auth error".to_string(),
-                detail: Some(err.to_string()),
-                retry_after: None,
-                usage_limit: None,
-                origin: CodexErrorOrigin::Auth,
-            })?;
+        let mut auth = self.operation_auth().await.map_err(|err| CodexError {
+            status: 401,
+            message: "Auth error".to_string(),
+            detail: Some(err.to_string()),
+            retry_after: None,
+            usage_limit: None,
+            origin: CodexErrorOrigin::Auth,
+        })?;
         let mut refresh_attempted = false;
 
         loop {
@@ -1022,8 +1012,7 @@ impl CodexHttpClient {
                 refresh_attempted = true;
                 drop(response);
                 auth = self
-                    .auth_manager
-                    .force_refresh(&auth.access)
+                    .refresh_operation_auth(&auth)
                     .await
                     .map_err(auth_refresh_error)?;
                 continue;
@@ -1105,7 +1094,7 @@ impl CodexHttpClient {
         body: &SearchRequest,
         ctx: &RequestContext,
     ) -> Result<SearchResponse, CodexError> {
-        let mut auth = self.auth_manager.get_auth().await.map_err(|e| CodexError {
+        let mut auth = self.operation_auth().await.map_err(|e| CodexError {
             status: 401,
             message: "Auth error".to_string(),
             detail: Some(e.to_string()),
@@ -1131,8 +1120,7 @@ impl CodexHttpClient {
             if response.status == 401 && !auth_refresh_attempted {
                 auth_refresh_attempted = true;
                 auth = self
-                    .auth_manager
-                    .force_refresh(&auth.access)
+                    .refresh_operation_auth(&auth)
                     .await
                     .map_err(auth_refresh_error)?;
                 continue;
@@ -1172,7 +1160,7 @@ impl CodexHttpClient {
         body: &ResponsesRequest,
         ctx: &RequestContext,
     ) -> Result<CodexHttpEventReceiver, CodexError> {
-        let mut auth = self.auth_manager.get_auth().await.map_err(|e| CodexError {
+        let mut auth = self.operation_auth().await.map_err(|e| CodexError {
             status: 401,
             message: "Auth error".to_string(),
             detail: Some(e.to_string()),
@@ -1259,8 +1247,7 @@ impl CodexHttpClient {
             if resp.status().as_u16() == 401 && !*auth_refresh_attempted {
                 *auth_refresh_attempted = true;
                 *auth = self
-                    .auth_manager
-                    .force_refresh(&auth.access)
+                    .refresh_operation_auth(auth)
                     .await
                     .map_err(auth_refresh_error)?;
                 continue;
@@ -1737,7 +1724,7 @@ impl CodexHttpClient {
     ) -> Result<OwnerAwareCodexResponse, CodexError> {
         use crate::config::CodexTransport;
 
-        let mut auth = self.auth_manager.get_auth().await.map_err(|e| CodexError {
+        let mut auth = self.operation_auth().await.map_err(|e| CodexError {
             status: 401,
             message: "Auth error".to_string(),
             detail: Some(e.to_string()),
@@ -1866,7 +1853,7 @@ impl CodexHttpClient {
 
             if should_refresh_after_unauthorized(&result, auth_refresh_attempted, transport) {
                 auth_refresh_attempted = true;
-                match self.auth_manager.force_refresh(&auth.access).await {
+                match self.refresh_operation_auth(&auth).await {
                     Ok(new_auth) => {
                         auth = new_auth;
                         invalidate_live_continuation_pool(active_continuation.as_ref());
@@ -2122,7 +2109,7 @@ impl CodexHttpClient {
         ctx: &RequestContext,
         continuation: Option<&super::continuation::ContinuationReservation>,
     ) -> Result<super::websocket::CodexWebSocketEventStream, CodexError> {
-        let auth = self.auth_manager.get_auth().await.map_err(|e| CodexError {
+        let auth = self.operation_auth().await.map_err(|e| CodexError {
             status: 401,
             message: "Auth error".to_string(),
             detail: Some(e.to_string()),
@@ -2224,7 +2211,7 @@ impl CodexHttpClient {
                     Err(err) if err.status == 401 && !auth_refresh_attempted && !forwarded_any => {
                         auth_refresh_attempted = true;
                         invalidate_live_continuation_pool(continuation.as_ref());
-                        let refresh = self.auth_manager.force_refresh(&auth.access);
+                        let refresh = self.refresh_operation_auth(&auth);
                         auth = match refresh.await {
                             Ok(auth) => {
                                 if tx.is_closed() {
@@ -2312,7 +2299,7 @@ impl CodexHttpClient {
                 if unauthorized && !auth_refresh_attempted && !forwarded_any {
                     auth_refresh_attempted = true;
                     invalidate_live_continuation_pool(continuation.as_ref());
-                    let refresh = self.auth_manager.force_refresh(&auth.access);
+                    let refresh = self.refresh_operation_auth(&auth);
                     auth = match refresh.await {
                         Ok(auth) => {
                             if tx.is_closed() {
@@ -3807,7 +3794,7 @@ mod tests {
                     server_client.auth_manager().set_test_auth(StoredAuth {
                         access: "rotated".into(),
                         refresh: "rotated-refresh".into(),
-                        account_id: Some("acct-rotated".into()),
+                        account_id: Some("acct".into()),
                         expires: u64::MAX,
                     });
                     stream
@@ -3818,7 +3805,7 @@ mod tests {
                         .unwrap();
                 } else {
                     assert!(request.contains("authorization: Bearer rotated"));
-                    assert!(request.contains("chatgpt-account-id: acct-rotated"));
+                    assert!(request.contains("chatgpt-account-id: acct"));
                     stream
                         .write_all(
                             b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
@@ -4529,7 +4516,7 @@ mod tests {
                     server_client.auth_manager().set_test_auth(StoredAuth {
                         access: "rotated".into(),
                         refresh: "rotated-refresh".into(),
-                        account_id: Some("acct-rotated".into()),
+                        account_id: Some("acct".into()),
                         expires: u64::MAX,
                     });
                     stream
@@ -4540,7 +4527,7 @@ mod tests {
                         .unwrap();
                 } else {
                     assert!(request.contains("authorization: Bearer rotated"));
-                    assert!(request.contains("chatgpt-account-id: acct-rotated"));
+                    assert!(request.contains("chatgpt-account-id: acct"));
                     stream
                         .write_all(
                             b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",

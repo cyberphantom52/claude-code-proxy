@@ -7,11 +7,13 @@ use crate::{
     provider::RequestContext,
     providers::codex::{
         chat_completions::{ChatCompletionsBackend, request::translate_request},
+        client::CodexHttpClient,
         images::{
             CodexImagesBackend, ImageOperation, ImageRequestError, MAX_EDIT_REQUEST_BYTES,
             MAX_GENERATION_REQUEST_BYTES, MultipartEditInput, UploadedImage, image_error_response,
             prepare_json_request, prepare_multipart_edit,
         },
+        models,
         native::{
             CodexNativeBackend, NativeResponseOutcome, openai_error, validate_native_request_model,
         },
@@ -259,6 +261,21 @@ pub fn app_with_features(
     monitor: Option<MonitorHandle>,
     features: AppFeatures,
 ) -> Router {
+    app_with_discovery_client(
+        registry,
+        monitor,
+        features,
+        Arc::new(CodexHttpClient::new()),
+    )
+}
+
+/// Construct without I/O, with an injectable discovery client for isolated callers.
+pub fn app_with_discovery_client(
+    registry: Arc<Registry>,
+    monitor: Option<MonitorHandle>,
+    features: AppFeatures,
+    discovery: Arc<CodexHttpClient>,
+) -> Router {
     let native_responses = features
         .responses_api
         .then(|| Arc::new(CodexNativeBackend::new()));
@@ -283,6 +300,7 @@ pub fn app_with_features(
         .transcriptions_api
         .then(|| Arc::new(CodexTranscriptionBackend::new()));
     let state = Arc::new(AppState {
+        discovery,
         registry,
         monitor,
         native_responses,
@@ -291,8 +309,6 @@ pub fn app_with_features(
         transcriptions,
     });
     let router = Router::new()
-        .route("/healthz", get(healthz))
-        .route("/monitor", get(handler_monitor))
         .route("/v1/messages", post(handler_messages))
         .route("/v1/messages/count_tokens", post(handler_count_tokens))
         .route("/v1/models", get(handler_models));
@@ -303,6 +319,13 @@ pub fn app_with_features(
     } else {
         router
     };
+    let router = router
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            discover_models,
+        ))
+        .route("/healthz", get(healthz))
+        .route("/monitor", get(handler_monitor));
     let router = if features.images_api {
         router
             .route("/v1/images/generations", post(handler_image_generation))
@@ -327,12 +350,22 @@ pub fn app_with_features(
 
 #[derive(Clone)]
 struct AppState {
+    discovery: Arc<CodexHttpClient>,
     registry: Arc<Registry>,
     monitor: Option<MonitorHandle>,
     native_responses: Option<Arc<CodexNativeBackend>>,
     chat_completions: Option<Arc<ChatCompletionsBackend>>,
     images: Option<Arc<CodexImagesBackend>>,
     transcriptions: Option<Arc<CodexTranscriptionBackend>>,
+}
+
+async fn discover_models(
+    State(state): State<Arc<AppState>>,
+    request: Request<Body>,
+    next: axum::middleware::Next,
+) -> Response {
+    let context = state.discovery.prepare_model_context().await;
+    models::with_model_context(context, next.run(request)).await
 }
 
 async fn handler_monitor(
@@ -962,7 +995,7 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
     let Some(provider) = state.registry.provider_for_model(&normalized_model) else {
         let response = OpenAiError::invalid(
             format!(
-                "Unknown model \"{normalized_model}\". {}",
+                "Invalid model ID \"{normalized_model}\". {}",
                 state.registry.unknown_model_message()
             ),
             Some("model"),
@@ -1122,7 +1155,7 @@ async fn handler_chat_completions(
     let Some(provider) = state.registry.provider_for_model(&normalized_model) else {
         let response = OpenAiError::invalid(
             format!(
-                "Unknown model \"{normalized_model}\". {}",
+                "Invalid model ID \"{normalized_model}\". {}",
                 state.registry.unknown_model_message()
             ),
             Some("model"),
@@ -1510,7 +1543,7 @@ async fn dispatch_request(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
                 format!(
-                    "Unknown model \"{normalized_model}\". {}",
+                    "Invalid model ID \"{normalized_model}\". {}",
                     state.registry.unknown_model_message()
                 ),
             );
@@ -1567,9 +1600,16 @@ async fn dispatch_request(
         );
     }
 
-    let effort = crate::providers::translate_shared::read_effort(&body)
-        .ok()
-        .flatten()
+    let effort = body
+        .extra
+        .get("output_config")
+        .and_then(|config| config.get("effort"))
+        .and_then(Value::as_str)
+        .filter(|effort| {
+            !effort.is_empty()
+                && effort.len() <= 256
+                && !effort.chars().any(|c| c.is_whitespace() || c.is_control())
+        })
         .map(str::to_string);
     let current =
         session::record_session_request(session_id.as_deref(), session_state.as_ref(), now);

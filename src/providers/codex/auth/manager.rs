@@ -27,7 +27,10 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
         Self::new_with_token_endpoint(store, format!("{ISSUER}/oauth/token"))
     }
 
-    fn new_with_token_endpoint(store: CodexTokenStore<S>, token_endpoint: String) -> Self {
+    pub(in crate::providers::codex) fn new_with_token_endpoint(
+        store: CodexTokenStore<S>,
+        token_endpoint: String,
+    ) -> Self {
         Self {
             store,
             #[cfg(test)]

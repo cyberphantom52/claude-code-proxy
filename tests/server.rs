@@ -9,14 +9,74 @@ use claude_code_proxy::{
     provider::{CliHandlers, Provider, RequestContext},
     registry::Registry,
     request_identity::ConversationIdentity,
-    server::{
-        AppFeatures, app, app_with_features, app_with_monitor, app_with_options,
-        bind_proxy_listener,
-    },
+    server::{AppFeatures, app_with_discovery_client, bind_proxy_listener},
 };
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 use tower::util::ServiceExt;
+
+fn app(registry: Arc<Registry>) -> axum::Router {
+    app_with_features(registry, None, AppFeatures::default())
+}
+
+fn app_with_monitor(registry: Arc<Registry>, monitor: Option<MonitorHandle>) -> axum::Router {
+    app_with_features(registry, monitor, AppFeatures::default())
+}
+
+fn app_with_options(
+    registry: Arc<Registry>,
+    monitor: Option<MonitorHandle>,
+    responses_api: bool,
+) -> axum::Router {
+    app_with_features(
+        registry,
+        monitor,
+        AppFeatures {
+            responses_api,
+            ..AppFeatures::default()
+        },
+    )
+}
+
+fn app_with_features(
+    registry: Arc<Registry>,
+    monitor: Option<MonitorHandle>,
+    features: AppFeatures,
+) -> axum::Router {
+    use claude_code_proxy::{
+        auth::{KeychainFileAuthStore, SystemKeychain},
+        providers::codex::{
+            auth::{
+                constants::CODEX_API_ENDPOINT, manager::CodexAuthManager,
+                token_store::CodexTokenStore,
+            },
+            client::CodexHttpClient,
+        },
+    };
+    // No process-global environment changes: even an authenticated developer's
+    // shell cannot supply credentials to these request-time discovery tests.
+    static AUTH_DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    let dir = AUTH_DIR.get_or_init(|| tempfile::tempdir().unwrap());
+    let path = dir
+        .path()
+        .join("missing-auth.json")
+        .to_string_lossy()
+        .into_owned();
+    let store = CodexTokenStore::new(KeychainFileAuthStore::new(
+        path.clone(),
+        path,
+        "isolated-server-tests",
+        "test",
+        false,
+        SystemKeychain,
+    ));
+    let client = CodexHttpClient::new_with_client(
+        reqwest::Client::builder().no_proxy().build().unwrap(),
+        CodexAuthManager::new(store),
+        claude_code_proxy::config::codex_base_url(CODEX_API_ENDPOINT),
+    );
+    app_with_discovery_client(registry, monitor, features, Arc::new(client))
+}
 
 fn body_string(json: &str) -> Body {
     Body::from(json.to_string())
@@ -371,7 +431,7 @@ async fn empty_body_is_invalid_json() {
 }
 
 #[tokio::test]
-async fn unknown_model_returns_400_with_summary() {
+async fn invalid_model_returns_400_with_summary() {
     let app = app(Arc::new(Registry::new()));
     let response = app
         .oneshot(
@@ -380,7 +440,7 @@ async fn unknown_model_returns_400_with_summary() {
                 .uri("/v1/messages")
                 .header("content-type", "application/json")
                 .body(body_string(
-                    r#"{"messages":[{"role":"user","content":"hello"}],"model":"not-a-model"}"#,
+                    r#"{"messages":[{"role":"user","content":"hello"}],"model":"bad model"}"#,
                 ))
                 .unwrap(),
         )
@@ -394,8 +454,8 @@ async fn unknown_model_returns_400_with_summary() {
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap();
     let message = body["error"]["message"].as_str().unwrap_or("");
-    assert!(message.contains("Unknown model \"not-a-model\""));
-    assert!(message.contains("Supported:"));
+    assert!(message.contains("Invalid model ID \"bad model\""));
+    assert!(message.contains("Known models:"));
 }
 
 fn request_id(response: &axum::response::Response) -> &str {
@@ -447,7 +507,7 @@ async fn successful_response_carries_a_request_id() {
 // the record most worth correlating with a proxy log.
 #[tokio::test]
 async fn rejected_request_carries_a_request_id() {
-    let response = messages_response(app(Arc::new(Registry::new())), "not-a-model").await;
+    let response = messages_response(app(Arc::new(Registry::new())), "bad model").await;
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert!(!request_id(&response).is_empty());
@@ -1107,7 +1167,7 @@ async fn chat_completions_route_uses_responses_api_gate() {
 }
 
 #[tokio::test]
-async fn removed_backend_models_are_rejected_on_all_text_surfaces() {
+async fn invalid_model_syntax_is_rejected_on_all_text_surfaces() {
     let app = app_with_options(Arc::new(Registry::new()), None, true);
     for path in [
         "/v1/messages",
@@ -1115,16 +1175,7 @@ async fn removed_backend_models_are_rejected_on_all_text_surfaces() {
         "/v1/responses",
         "/v1/chat/completions",
     ] {
-        for model in [
-            "kimi-k2.6",
-            "kimi-for-coding",
-            "grok-4.6",
-            "cursor",
-            "cursor:gpt-5.5",
-            "opencode-go/kimi-k2.6",
-            "opencode-go/gpt-5.6-luna",
-            "opencode-go/grok-4.5",
-        ] {
+        for model in ["bad model", "bad\nmodel", "bad\tmodel"] {
             let response = app
                 .clone()
                 .oneshot(
@@ -1152,7 +1203,7 @@ async fn removed_backend_models_are_rejected_on_all_text_surfaces() {
                 body["error"]["message"]
                     .as_str()
                     .unwrap()
-                    .contains("Unknown model")
+                    .contains("Invalid model ID")
             );
         }
     }
@@ -1308,6 +1359,50 @@ async fn monitor_records_successful_request_events() {
 }
 
 #[tokio::test]
+async fn monitor_preserves_custom_effort_labels_and_ignores_unsafe_values() {
+    let max_effort = "x".repeat(256);
+    for (effort, expected) in [
+        (json!("ultra"), Some("ultra")),
+        (json!("37"), Some("37")),
+        (json!("future-effort"), Some("future-effort")),
+        (json!(max_effort), Some(max_effort.as_str())),
+        (json!(null), None),
+        (json!(37), None),
+        (json!(""), None),
+        (json!("high low"), None),
+        (json!("high\nlow"), None),
+        (json!("\u{1b}[31mhigh"), None),
+        (json!("x".repeat(257)), None),
+        (json!("é".repeat(129)), None),
+    ] {
+        let monitor = MonitorHandle::new(10);
+        let response = app_with_monitor(failure_registry(), Some(monitor.clone()))
+            .oneshot(
+                Request::post("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "gpt-5.5",
+                            "stream": true,
+                            "messages": [{"role": "user", "content": "hello"}],
+                            "output_config": {"effort": effort}
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(monitor.snapshot().active[0].effort.as_deref(), expected);
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(monitor.snapshot().recent[0].effort.as_deref(), expected);
+    }
+}
+
+#[tokio::test]
 async fn monitor_records_invalid_json_failure() {
     let monitor = MonitorHandle::new(10);
     let app = app_with_monitor(Arc::new(Registry::new()), Some(monitor.clone()));
@@ -1332,7 +1427,7 @@ async fn monitor_records_invalid_json_failure() {
 }
 
 #[tokio::test]
-async fn monitor_records_unknown_model_failure() {
+async fn monitor_records_invalid_model_failure() {
     let monitor = MonitorHandle::new(10);
     let app = app_with_monitor(Arc::new(Registry::new()), Some(monitor.clone()));
     let response = app
@@ -1342,7 +1437,7 @@ async fn monitor_records_unknown_model_failure() {
                 .uri("/v1/messages")
                 .header("content-type", "application/json")
                 .body(body_string(
-                    r#"{"messages":[{"role":"user","content":"hello"}],"model":"not-a-model"}"#,
+                    r#"{"messages":[{"role":"user","content":"hello"}],"model":"bad model"}"#,
                 ))
                 .unwrap(),
         )
@@ -1355,8 +1450,8 @@ async fn monitor_records_unknown_model_failure() {
     assert_eq!(state.recent[0].status, RequestStatus::Failed);
     assert_eq!(state.recent[0].http_status, Some(400));
     let error = state.recent[0].error.as_deref().unwrap_or("");
-    assert!(error.starts_with("Unknown model \"not-a-model\""));
-    assert!(error.contains("Supported:"));
+    assert!(error.starts_with("Invalid model ID \"bad model\""));
+    assert!(error.contains("Known models:"));
 }
 
 async fn get_models(app: axum::Router, uri: &str) -> (StatusCode, Value) {

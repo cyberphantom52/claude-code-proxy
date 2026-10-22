@@ -3,9 +3,11 @@ use serde_json::{Map, Value, json};
 
 use crate::providers::codex::translate::{
     model_allowlist::{
-        allowed_models_display, assert_allowed_model, resolve_model_request, uses_responses_lite,
+        assert_allowed_model, model_parallel_tool_calls, model_reasoning_summary, model_verbosity,
+        resolve_model_effort, resolve_model_request_with_config_override,
+        resolve_service_tier_value, uses_responses_lite, validate_input_modalities,
     },
-    request::{Effort, resolve_effort_override, to_codex_effort},
+    request::{Effort, reasoning_requested, resolve_effort_override, to_codex_effort},
 };
 use crate::{config, registry::normalize_incoming_model};
 
@@ -17,6 +19,9 @@ const SUPPORTED_FIELDS: &[&str] = &[
     "stream",
     "stream_options",
     "reasoning_effort",
+    "verbosity",
+    "service_tier",
+    "parallel_tool_calls",
     "response_format",
     "temperature",
     "top_p",
@@ -49,17 +54,9 @@ fn translate_request_with_override(
 
     let requested_model = required_string(object, "model")?;
     let normalized = normalize_incoming_model(&requested_model);
-    let resolved = resolve_model_request(&normalized);
+    let resolved = resolve_model_request_with_config_override(&normalized, false);
     assert_allowed_model(&resolved.model).map_err(|error| {
-        ChatError::invalid(
-            format!(
-                "Model '{requested_model}' resolves to unsupported model '{}'. Supported: {}",
-                error.model,
-                allowed_models_display()
-            ),
-            Some("model"),
-            Some("model_not_supported"),
-        )
+        ChatError::invalid(error.to_string(), Some("model"), Some("invalid_value"))
     })?;
     let use_responses_lite = uses_responses_lite(&resolved.model);
 
@@ -93,7 +90,7 @@ fn translate_request_with_override(
     }
 
     let request_effort = match object.get("reasoning_effort") {
-        None | Some(Value::Null) => Some(Effort::Medium),
+        None | Some(Value::Null) => None,
         Some(Value::String(value)) => parse_effort(value)?,
         Some(_) => {
             return Err(ChatError::invalid(
@@ -113,7 +110,52 @@ fn translate_request_with_override(
         )
     })?;
 
-    let mut text = Map::from_iter([("verbosity".to_string(), json!("low"))]);
+    let effort_string = effort.as_ref().map(ToString::to_string);
+    let effort = resolve_model_effort(&resolved.model, effort_string.as_deref())
+        .map_err(|error| {
+            ChatError::invalid(
+                error.to_string(),
+                Some("reasoning_effort"),
+                Some("unsupported_value"),
+            )
+        })?
+        .map(Effort::from)
+        .or_else(|| {
+            crate::providers::codex::translate::model_catalog::catalog_model(&resolved.model)
+                .is_none_or(|model| model.supported_reasoning_levels.is_none())
+                .then_some(Effort::Medium)
+        });
+    validate_input_modalities(&resolved.model, &object["messages"]).map_err(|error| {
+        ChatError::invalid(
+            error.to_string(),
+            Some("messages"),
+            Some("unsupported_value"),
+        )
+    })?;
+    let requested_verbosity = optional_string(object, "verbosity")?;
+    let verbosity = model_verbosity(&resolved.model, requested_verbosity).map_err(|error| {
+        ChatError::invalid(
+            error.to_string(),
+            Some("verbosity"),
+            Some("unsupported_value"),
+        )
+    })?;
+    let parallel = model_parallel_tool_calls(
+        &resolved.model,
+        use_responses_lite,
+        optional_bool(object, "parallel_tool_calls")?,
+    )
+    .map_err(|error| {
+        ChatError::invalid(
+            error.to_string(),
+            Some("parallel_tool_calls"),
+            Some("unsupported_value"),
+        )
+    })?;
+    let mut text = Map::new();
+    if let Some(verbosity) = verbosity {
+        text.insert("verbosity".to_string(), json!(verbosity));
+    }
     if let Some(format) = translate_response_format(object.get("response_format"))? {
         text.insert("format".to_string(), format);
     }
@@ -123,19 +165,48 @@ fn translate_request_with_override(
         ("input".to_string(), Value::Array(input)),
         ("store".to_string(), json!(false)),
         ("stream".to_string(), json!(true)),
-        ("parallel_tool_calls".to_string(), json!(false)),
-        ("client_metadata".to_string(), json!({"lite":"true"})),
+        ("parallel_tool_calls".to_string(), json!(parallel)),
         ("text".to_string(), Value::Object(text)),
     ]);
-    if let Some(tier) = resolved.service_tier {
-        upstream.insert(
-            "service_tier".to_string(),
-            serde_json::to_value(tier).unwrap(),
-        );
+    let tier = optional_string(object, "service_tier")?
+        .map(str::to_string)
+        .or_else(|| resolved.service_tier.map(String::from));
+    if let Some(tier) = tier {
+        let tier = resolve_service_tier_value(&resolved.model, &tier).map_err(|error| {
+            ChatError::invalid(
+                error.to_string(),
+                Some("service_tier"),
+                Some("unsupported_value"),
+            )
+        })?;
+        if String::from(tier.clone()) != "default" {
+            upstream.insert("service_tier".to_string(), json!(tier));
+        }
     }
-    let mut reasoning = Map::from_iter([("context".to_string(), json!("all_turns"))]);
-    if let Some(effort) = effort.as_ref().filter(|effort| **effort != Effort::None) {
+    let mut reasoning = Map::new();
+    if use_responses_lite {
+        upstream.insert("client_metadata".to_string(), json!({"lite":"true"}));
+        reasoning.insert("context".to_string(), json!("all_turns"));
+    }
+    if let Some(effort) = effort.as_ref() {
         reasoning.insert("effort".to_string(), json!(effort));
+        if reasoning_requested(Some(effort)) {
+            let summary = model_reasoning_summary(
+                &resolved.model,
+                config::codex_reasoning_summary().as_deref(),
+                None,
+            )
+            .map_err(|error| {
+                ChatError::invalid(
+                    error.to_string(),
+                    Some("reasoning_effort"),
+                    Some("unsupported_value"),
+                )
+            })?;
+            if let Some(summary) = summary {
+                reasoning.insert("summary".to_string(), json!(summary));
+            }
+        }
     }
     upstream.insert("reasoning".to_string(), Value::Object(reasoning));
 
@@ -166,9 +237,7 @@ fn translate_request_with_override(
         upstream: Value::Object(upstream),
         requested_model,
         model: resolved.model,
-        effort: effort
-            .map(|effort| effort.to_string())
-            .filter(|effort| effort != "none"),
+        effort: effort.map(|effort| effort.to_string()),
         stream,
         include_usage,
         use_responses_lite,
@@ -191,6 +260,21 @@ fn required_string(object: &Map<String, Value>, key: &'static str) -> Result<Str
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .ok_or_else(|| ChatError::invalid(format!("Missing or invalid '{key}'"), Some(key), None))
+}
+
+fn optional_string<'a>(
+    object: &'a Map<String, Value>,
+    key: &'static str,
+) -> Result<Option<&'a str>, ChatError> {
+    match object.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value)),
+        Some(_) => Err(ChatError::invalid(
+            format!("'{key}' must be a string"),
+            Some(key),
+            None,
+        )),
+    }
 }
 
 fn optional_bool(
@@ -259,6 +343,30 @@ fn translate_content(content: Option<&Value>, index: usize) -> Result<Vec<Value>
                         None,
                     )
                 })?;
+                if object.get("type").and_then(Value::as_str) == Some("image_url") {
+                    let image = object
+                        .get("image_url")
+                        .and_then(Value::as_object)
+                        .ok_or_else(|| {
+                            ChatError::invalid(
+                                "image_url must be an object",
+                                Some(&part_param),
+                                None,
+                            )
+                        })?;
+                    let url = image
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .filter(|url| !url.is_empty())
+                        .ok_or_else(|| {
+                            ChatError::invalid("image_url.url is required", Some(&part_param), None)
+                        })?;
+                    let mut part = json!({"type":"input_image", "image_url":url});
+                    if let Some(detail) = image.get("detail") {
+                        part["detail"] = detail.clone();
+                    }
+                    return Ok(part);
+                }
                 if object.get("type").and_then(Value::as_str) != Some("text") {
                     return Err(ChatError::invalid(
                         "Only text message content is supported",
@@ -292,18 +400,7 @@ fn translate_content(content: Option<&Value>, index: usize) -> Result<Vec<Value>
 }
 
 fn parse_effort(value: &str) -> Result<Option<Effort>, ChatError> {
-    if value == "none" {
-        return Ok(Some(Effort::None));
-    }
-    to_codex_effort(Some(value)).map(Some).ok_or_else(|| {
-        ChatError::invalid(
-            format!(
-                "Invalid reasoning effort '{value}'. Supported: none, low, medium, high, xhigh, max"
-            ),
-            Some("reasoning_effort"),
-            Some("unsupported_value"),
-        )
-    })
+    Ok(to_codex_effort(Some(value)))
 }
 
 fn translate_response_format(value: Option<&Value>) -> Result<Option<Value>, ChatError> {
@@ -439,6 +536,120 @@ fn validate_sampling_value(param: &'static str, value: &Value) -> Result<(), Cha
 mod tests {
     use super::*;
 
+    #[test]
+    fn numeric_effort_defaults_and_explicit_strings_use_integer_wire_values() {
+        crate::providers::codex::translate::model_allowlist::with_test_catalog(
+            json!([{
+                "slug":"numeric", "default_reasoning_level":"4096",
+                "supported_reasoning_levels":[{"effort":"4096"},{"effort":"low"}]
+            }]),
+            || {
+                let mut body = base();
+                body["model"] = json!("numeric");
+                assert_eq!(
+                    translate_request_with_override(body.clone(), None)
+                        .unwrap()
+                        .upstream["reasoning"]["effort"],
+                    json!(4096)
+                );
+                body["reasoning_effort"] = json!("4096");
+                assert_eq!(
+                    translate_request_with_override(body.clone(), None)
+                        .unwrap()
+                        .upstream["reasoning"]["effort"],
+                    json!(4096)
+                );
+                body["reasoning_effort"] = json!("low");
+                assert_eq!(
+                    translate_request_with_override(body.clone(), None)
+                        .unwrap()
+                        .upstream["reasoning"]["effort"],
+                    json!("low")
+                );
+                for invalid in ["-1", "1.5", "18446744073709551616"] {
+                    body["reasoning_effort"] = json!(invalid);
+                    assert_eq!(
+                        translate_request_with_override(body.clone(), None)
+                            .unwrap_err()
+                            .param
+                            .as_deref(),
+                        Some("reasoning_effort")
+                    );
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn catalog_defaults_effort_validation_and_explicit_none() {
+        crate::providers::codex::translate::model_allowlist::with_test_catalog(
+            json!([{
+                "slug":"future", "use_responses_lite":true, "default_reasoning_level":"low",
+                "supported_reasoning_levels":[{"effort":"none"},{"effort":"low"},{"effort":"future-effort"}],
+                "supports_reasoning_summary_parameter":true, "default_reasoning_summary":"none",
+                "support_verbosity":true, "default_verbosity":"medium", "service_tiers":[{"id":"new-speed"}]
+            }]),
+            || {
+                let mut body = base();
+                body["model"] = json!("future");
+                let out = translate_request_with_override(body.clone(), None).unwrap();
+                assert_eq!(out.upstream["reasoning"]["effort"], "low");
+                assert_eq!(out.upstream["reasoning"]["summary"], "none");
+                assert_eq!(out.upstream["text"]["verbosity"], "medium");
+                body["reasoning_effort"] = json!("none");
+                assert_eq!(
+                    translate_request_with_override(body.clone(), None)
+                        .unwrap()
+                        .upstream["reasoning"]["effort"],
+                    "none"
+                );
+                body["reasoning_effort"] = json!("future-effort");
+                body["service_tier"] = json!("new-speed");
+                assert_eq!(
+                    translate_request_with_override(body.clone(), None)
+                        .unwrap()
+                        .upstream["service_tier"],
+                    "new-speed"
+                );
+                body["reasoning_effort"] = json!("max");
+                let error = translate_request_with_override(body, None).unwrap_err();
+                assert_eq!(error.param.as_deref(), Some("reasoning_effort"));
+                assert!(error.message.contains("Allowed: none, low, future-effort"));
+            },
+        );
+    }
+
+    #[test]
+    fn images_and_explicit_parallel_intent_validate_known_capabilities() {
+        crate::providers::codex::translate::model_allowlist::with_test_catalog(
+            json!([{
+                "slug":"future", "use_responses_lite":false, "input_modalities":["text"], "supports_parallel_tool_calls":false
+            }]),
+            || {
+                let mut body = base();
+                body["model"] = json!("future");
+                body["parallel_tool_calls"] = json!(true);
+                assert_eq!(
+                    translate_request_with_override(body.clone(), None)
+                        .unwrap_err()
+                        .param
+                        .as_deref(),
+                    Some("parallel_tool_calls")
+                );
+                body["parallel_tool_calls"] = json!(false);
+                body["messages"][1]["content"] =
+                    json!([{"type":"image_url","image_url":{"url":"https://example.test/a.png"}}]);
+                assert_eq!(
+                    translate_request_with_override(body, None)
+                        .unwrap_err()
+                        .param
+                        .as_deref(),
+                    Some("messages")
+                );
+            },
+        );
+    }
+
     fn base() -> Value {
         json!({"model":"gpt-5.6-sol","messages":[{"role":"system","content":"rules"},{"role":"user","content":[{"type":"text","text":"hello"}]}]})
     }
@@ -485,7 +696,10 @@ mod tests {
 
         let mut body = base();
         body["model"] = json!("gpt-6-sol-ultrafast");
-        assert!(translate_request(body).is_err());
+        assert_eq!(
+            translate_request(body).unwrap().model,
+            "gpt-6-sol-ultrafast"
+        );
     }
 
     #[test]
@@ -493,7 +707,7 @@ mod tests {
         let mut body = base();
         body["reasoning_effort"] = json!("none");
         let translated = translate_request(body).unwrap();
-        assert!(translated.upstream["reasoning"].get("effort").is_none());
+        assert_eq!(translated.upstream["reasoning"]["effort"], "none");
         assert_eq!(translated.upstream["reasoning"]["context"], "all_turns");
     }
 

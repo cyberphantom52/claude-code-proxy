@@ -1,14 +1,11 @@
-use std::collections::HashSet;
-
 use crate::config;
 
 use super::model_catalog::{catalog_model, catalog_models};
-use super::request::ServiceTier;
+use super::request::{ServiceTier, effort_wire_value};
 
-/// Baseline allowlist compiled into the binary. At runtime the Codex CLI's
-/// model cache (`model_catalog`) extends it, so models OpenAI ships to Codex
-/// work before a proxy release lists them.
-pub const ALLOWED_MODELS: &[&str] = &[
+/// Offline bootstrap metadata IDs only, never an availability gate.
+/// Authenticated discovery drives listings; any well-formed ID can reach Codex.
+pub const FALLBACK_MODELS: &[&str] = &[
     "gpt-5.2",
     "gpt-5.3-codex",
     "gpt-5.3-codex-spark",
@@ -28,16 +25,16 @@ pub const MODEL_ALIASES: &[(&str, &str)] = &[
     ("haiku", "gpt-6-luna"),
     ("claude-haiku-4-5", "gpt-6-luna"),
     ("claude-haiku-4-5-20251001", "gpt-6-luna"),
-    ("sonnet", "gpt-5.6-terra"),
-    ("claude-sonnet-4-6", "gpt-5.6-terra"),
-    ("claude-sonnet-5", "gpt-5.6-terra"),
-    ("opus", "gpt-6-sol"),
-    ("claude-opus-4-7", "gpt-6-sol"),
-    ("claude-opus-4-8", "gpt-6-sol"),
-    ("claude-opus-5", "gpt-6-sol"),
-    ("claude-opus-5-5", "gpt-6-sol"),
-    ("fable", "gpt-6-sol"),
-    ("claude-fable-5", "gpt-6-sol"),
+    ("sonnet", "gpt-6-sol"),
+    ("claude-sonnet-4-6", "gpt-6-sol"),
+    ("claude-sonnet-5", "gpt-6-sol"),
+    ("opus", "gpt-6.1-sol"),
+    ("claude-opus-4-7", "gpt-6.1-sol"),
+    ("claude-opus-4-8", "gpt-6.1-sol"),
+    ("claude-opus-5", "gpt-6.1-sol"),
+    ("claude-opus-5-5", "gpt-6.1-sol"),
+    ("fable", "gpt-6-astra"),
+    ("claude-fable-5", "gpt-6-astra"),
 ];
 
 #[derive(Debug, Clone)]
@@ -46,53 +43,60 @@ pub struct ResolvedModel {
     pub service_tier: Option<ServiceTier>,
 }
 
-/// Models whose Codex catalog entry offers the `ultrafast` service tier.
-/// Every other model offers `priority` at most, so it gets no `-ultrafast` form.
-pub const ULTRAFAST_MODELS: &[&str] = &["gpt-6-astra", "gpt-6.1-sol"];
-
 const FAST_SUFFIX: &str = "-fast";
 const ULTRAFAST_SUFFIX: &str = "-ultrafast";
+/// Legacy offline aliases only; live service_tiers always take precedence.
+pub const ULTRAFAST_MODELS: &[&str] = &["gpt-6-astra", "gpt-6.1-sol"];
 
-/// Splits a local service-tier suffix off a registered model: `-fast` on any
-/// registered model, `-ultrafast` only on [`ULTRAFAST_MODELS`].
+fn offers_ultrafast(model: &str) -> bool {
+    advertised_service_tier(model, "ultrafast").unwrap_or_else(|| ULTRAFAST_MODELS.contains(&model))
+}
+
+/// Local suffixes apply to known base models; exact discovered IDs always win.
+/// Unknown opaque IDs are forwarded unchanged, not guessed to be aliases.
 pub fn split_tier_suffix(model: &str) -> Option<(&str, ServiceTier)> {
+    if catalog_model(model).is_some() {
+        return None;
+    }
     if let Some(base) = model.strip_suffix(ULTRAFAST_SUFFIX) {
-        return ULTRAFAST_MODELS
-            .contains(&base)
+        let metadata = catalog_model(base)?;
+        return (metadata.service_tiers.is_some() || offers_ultrafast(base))
             .then_some((base, ServiceTier::Ultrafast));
     }
     let base = model.strip_suffix(FAST_SUFFIX)?;
-    is_allowed_model(base).then_some((base, ServiceTier::Priority))
-}
-
-/// True for baseline models and for API-supported models from the Codex
-/// model cache.
-pub fn is_allowed_model(model: &str) -> bool {
-    ALLOWED_MODELS.contains(&model)
-        || catalog_model(model).is_some_and(|entry| entry.supported_in_api)
-}
-
-/// Baseline ∪ API-supported catalog models, sorted and de-duplicated —
-/// for listings and error messages.
-pub fn allowed_models() -> Vec<String> {
-    let mut set: HashSet<String> = ALLOWED_MODELS.iter().map(|m| (*m).to_string()).collect();
-    for entry in catalog_models() {
-        if entry.supported_in_api {
-            set.insert(entry.slug);
-        }
+    if base.ends_with(FAST_SUFFIX) || base.ends_with(ULTRAFAST_SUFFIX) {
+        return None;
     }
-    let mut out: Vec<String> = set.into_iter().collect();
+    catalog_model(base).map(|_| (base, ServiceTier::Priority))
+}
+
+/// Compatibility name: validate syntax, never gate IDs against a local catalog.
+/// Codex is authoritative for model availability and subscription access.
+pub fn is_allowed_model(model: &str) -> bool {
+    !model.is_empty()
+        && model.len() <= 256
+        && !model
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+}
+
+/// Catalog IDs for listings/error hints, with bootstrap IDs only when offline.
+/// This list is not used to authorize requests.
+pub fn allowed_models() -> Vec<String> {
+    let mut out: Vec<String> = catalog_models()
+        .into_iter()
+        .map(|model| model.slug)
+        .collect();
     out.sort_unstable();
+    out.dedup();
     out
 }
 
-/// Catalog models advertised by the Codex picker (`visibility == "list"`)
-/// and usable through the API — what `models` and the unknown-model hint
-/// should show in addition to the baseline.
+/// Models visible in the subscription picker. Hidden entries remain requestable.
 pub fn listed_catalog_models() -> Vec<String> {
     catalog_models()
         .into_iter()
-        .filter(|entry| entry.listed && entry.supported_in_api)
+        .filter(|entry| entry.listed)
         .map(|entry| entry.slug)
         .collect()
 }
@@ -103,21 +107,230 @@ pub fn allowed_models_display() -> String {
 
 /// Local tier-suffixed names advertised next to a registered model.
 pub fn tier_model_variants(model: &str) -> Vec<String> {
-    let mut variants = vec![format!("{model}{FAST_SUFFIX}")];
-    if ULTRAFAST_MODELS.contains(&model) {
+    if !is_allowed_model(model) || catalog_model(model).is_none() {
+        return Vec::new();
+    }
+    let mut variants = Vec::new();
+    if advertised_service_tier(model, "priority") != Some(false) {
+        variants.push(format!("{model}{FAST_SUFFIX}"));
+    }
+    if offers_ultrafast(model) {
         variants.push(format!("{model}{ULTRAFAST_SUFFIX}"));
     }
     variants
 }
 
-/// Narrows a requested tier to one `model` offers. The backend serves an
-/// unlisted tier at standard speed without an error, so ultrafast on a model
-/// outside [`ULTRAFAST_MODELS`] falls back to priority, the fastest tier there.
-pub fn service_tier_for_model(model: &str, tier: ServiceTier) -> ServiceTier {
-    match tier {
-        ServiceTier::Ultrafast if !ULTRAFAST_MODELS.contains(&model) => ServiceTier::Priority,
-        tier => tier,
+fn advertised_service_tier(model: &str, tier: &str) -> Option<bool> {
+    catalog_model(model)?.supports_service_tier(tier)
+}
+
+/// Validate an explicit tier without downgrading it to a different speed.
+pub fn resolve_service_tier_value(model: &str, tier: &str) -> anyhow::Result<ServiceTier> {
+    let tier = if tier == "fast" { "priority" } else { tier };
+    let standard = matches!(tier, "auto" | "default" | "flex");
+    let advertised = advertised_service_tier(model, tier);
+    if tier.is_empty()
+        || tier.len() > 256
+        || tier.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        anyhow::bail!("Invalid service_tier '{tier}'");
     }
+    if !standard && advertised == Some(false) {
+        let allowed = catalog_model(model)
+            .and_then(|entry| entry.service_tiers)
+            .map(|tiers| {
+                tiers
+                    .into_iter()
+                    .map(|entry| entry.id)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_else(|| "priority, ultrafast, flex".to_string());
+        anyhow::bail!(
+            "Model '{model}' does not support service_tier '{tier}'. Allowed: auto, default, flex{separator}{allowed}",
+            separator = if allowed.is_empty() { "" } else { ", " }
+        );
+    }
+    Ok(ServiceTier::from(tier.to_string()))
+}
+
+pub const KNOWN_EFFORTS: &[&str] = &[
+    "none",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+    "ultra",
+    "persistent",
+    "disabled",
+];
+
+pub fn resolve_model_effort(
+    model: &str,
+    requested: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    let metadata = catalog_model(model);
+    let effort = requested
+        .map(str::to_string)
+        .or_else(|| metadata.as_ref()?.default_reasoning_level.clone());
+    // Codex harness aliases are not wire effort names.
+    let effort = effort.map(|effort| match effort.as_str() {
+        "ultra" => metadata
+            .as_ref()
+            .and_then(|entry| entry.multi_agent_reasoning_effort.clone())
+            .filter(|value| {
+                metadata
+                    .as_ref()
+                    .and_then(|entry| entry.supported_reasoning_levels.as_ref())
+                    .is_some_and(|levels| levels.iter().any(|level| level.effort == *value))
+            })
+            .or_else(|| {
+                metadata
+                    .as_ref()?
+                    .supported_reasoning_levels
+                    .as_ref()?
+                    .iter()
+                    .find(|level| level.effort == "max")
+                    .map(|level| level.effort.clone())
+            })
+            .or_else(|| {
+                metadata
+                    .as_ref()?
+                    .supported_reasoning_levels
+                    .as_ref()?
+                    .iter()
+                    .rev()
+                    .find(|level| level.effort != "ultra")
+                    .map(|level| level.effort.clone())
+            })
+            .unwrap_or_else(|| "medium".to_string()),
+        "persistent" => "disabled".to_string(),
+        _ => effort,
+    });
+    if let Some(effort) = &effort {
+        let levels = metadata
+            .as_ref()
+            .and_then(|entry| entry.supported_reasoning_levels.as_ref());
+        anyhow::ensure!(
+            !effort.is_empty()
+                && effort.len() <= 256
+                && !effort.chars().any(|c| c.is_whitespace() || c.is_control()),
+            "Invalid reasoning effort '{effort}'"
+        );
+        effort_wire_value(effort)?;
+        let supported =
+            levels.is_none_or(|levels| levels.iter().any(|level| level.effort == *effort));
+        if !supported {
+            let allowed = levels
+                .map(|levels| {
+                    levels
+                        .iter()
+                        .map(|level| level.effort.as_str())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_else(|| KNOWN_EFFORTS.to_vec())
+                .join(", ");
+            anyhow::bail!(
+                "Model '{model}' does not advertise reasoning effort '{effort}'. Allowed: {allowed}"
+            );
+        }
+    }
+    Ok(effort)
+}
+
+pub fn model_reasoning_summary(
+    model: &str,
+    requested: Option<&str>,
+    fallback: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    let metadata = catalog_model(model);
+    if metadata
+        .as_ref()
+        .and_then(|entry| entry.supports_reasoning_summaries)
+        == Some(false)
+    {
+        if requested.is_some_and(|summary| !matches!(summary, "off" | "none")) {
+            anyhow::bail!("Model '{model}' does not support reasoning summaries");
+        }
+        return Ok(None);
+    }
+    let summary = requested
+        .map(str::to_string)
+        .or_else(|| metadata.as_ref()?.default_reasoning_summary.clone())
+        .or_else(|| fallback.map(str::to_string));
+    Ok(summary.map(|summary| {
+        if summary == "off" {
+            "none".to_string()
+        } else {
+            summary
+        }
+    }))
+}
+
+pub fn model_verbosity(model: &str, requested: Option<&str>) -> anyhow::Result<Option<String>> {
+    let metadata = catalog_model(model);
+    if metadata.as_ref().and_then(|entry| entry.supports_verbosity) == Some(false) {
+        if requested.is_some() {
+            anyhow::bail!("Model '{model}' does not support text verbosity");
+        }
+        return Ok(None);
+    }
+    Ok(requested
+        .map(str::to_string)
+        .or_else(|| metadata.as_ref()?.default_verbosity.clone())
+        .or_else(|| {
+            (metadata
+                .as_ref()
+                .and_then(|entry| entry.supports_verbosity)
+                .is_none())
+            .then(|| "low".to_string())
+        }))
+}
+
+pub fn model_parallel_tool_calls(
+    model: &str,
+    lite: bool,
+    requested: Option<bool>,
+) -> anyhow::Result<bool> {
+    let supported = !lite
+        && catalog_model(model).and_then(|entry| entry.supports_parallel_tool_calls) != Some(false);
+    if requested == Some(true) && !supported {
+        anyhow::bail!(
+            "Model '{model}' does not support parallel_tool_calls=true on the selected {} lane",
+            if lite { "Responses Lite" } else { "Responses" }
+        );
+    }
+    Ok(requested.unwrap_or(supported))
+}
+
+/// Inspect only content containers, never schemas or arbitrary function arguments.
+pub fn validate_input_modalities(model: &str, input: &serde_json::Value) -> anyhow::Result<()> {
+    fn has_images(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Array(values) => values.iter().any(has_images),
+            serde_json::Value::Object(object) => {
+                matches!(
+                    object.get("type").and_then(serde_json::Value::as_str),
+                    Some("image" | "image_url" | "input_image")
+                ) || ["content", "output"]
+                    .iter()
+                    .any(|key| object.get(*key).is_some_and(has_images))
+            }
+            _ => false,
+        }
+    }
+    if has_images(input)
+        && let Some(modalities) = catalog_model(model).and_then(|entry| entry.input_modalities)
+        && !modalities.iter().any(|modality| modality == "image")
+    {
+        anyhow::bail!(
+            "Model '{model}' does not support image inputs. Allowed input modalities: {}",
+            modalities.join(", ")
+        );
+    }
+    Ok(())
 }
 
 fn resolve_tier_model_alias(model: &str) -> ResolvedModel {
@@ -139,37 +352,82 @@ pub fn resolve_model_request(model: &str) -> ResolvedModel {
 
 pub fn resolve_model_request_with_config_override(
     model: &str,
-    apply_config_override: bool,
+    _apply_config_override: bool,
 ) -> ResolvedModel {
-    let override_model = apply_config_override.then(config::codex_model).flatten();
-    resolve_with_model_override(model, override_model.as_deref())
+    resolve_requested_model(model)
 }
 
-fn resolve_with_model_override(model: &str, override_model: Option<&str>) -> ResolvedModel {
-    let alias = MODEL_ALIASES
-        .iter()
-        .find(|(alias, _)| *alias == model)
-        .map(|(_, target)| *target)
-        .unwrap_or(model);
+/// An operator pin may agree with a request, but must never silently redirect it.
+pub fn validate_model_configuration(model: &str, apply_override: bool) -> anyhow::Result<()> {
+    let configured = apply_override.then(config::codex_model).flatten();
+    validate_model_override(model, configured.as_deref())
+}
 
-    let requested = resolve_tier_model_alias(alias);
-
-    let resolved = match override_model {
-        Some(val) if !val.is_empty() => resolve_tier_model_alias(val),
-        _ => requested.clone(),
-    };
-
-    // A tier suffix on the override wins; otherwise the requested suffix
-    // carries over to the override model, which may not offer that tier.
-    let service_tier = resolved
-        .service_tier
-        .or(requested.service_tier)
-        .map(|tier| service_tier_for_model(&resolved.model, tier));
-
-    ResolvedModel {
-        model: resolved.model,
-        service_tier,
+fn validate_model_override(model: &str, configured: Option<&str>) -> anyhow::Result<()> {
+    if let Some(configured) = configured.filter(|value| !value.is_empty()) {
+        let requested = resolve_requested_model(model);
+        let forced = resolve_requested_model(configured);
+        if requested.model != forced.model
+            || (forced.service_tier.is_some() && requested.service_tier != forced.service_tier)
+        {
+            anyhow::bail!(
+                "Requested model '{model}' resolves to '{}', conflicting with configured Codex model '{configured}'. The proxy will not substitute models; remove the model pin or request the configured model explicitly.",
+                requested.model
+            );
+        }
     }
+    Ok(())
+}
+
+/// Shared family resolution; never substitutes an explicit native model ID.
+pub fn anthropic_alias_target(model: &str) -> Option<&'static str> {
+    if !is_allowed_model(model) {
+        return None;
+    }
+    let model = model.strip_suffix("[1m]").unwrap_or(model);
+    let model = model
+        .strip_suffix(ULTRAFAST_SUFFIX)
+        .or_else(|| model.strip_suffix(FAST_SUFFIX))
+        .unwrap_or(model);
+    let family = model.strip_prefix("claude-").unwrap_or(model);
+    if family == "fable" || family.starts_with("fable-") {
+        Some("gpt-6-astra")
+    } else if family == "opus" || family.starts_with("opus-") {
+        Some("gpt-6.1-sol")
+    } else if family == "sonnet" || family.starts_with("sonnet-") {
+        Some("gpt-6-sol")
+    } else if family == "haiku" || family.starts_with("haiku-") {
+        Some("gpt-6-luna")
+    } else {
+        None
+    }
+}
+
+pub fn is_anthropic_alias(model: &str) -> bool {
+    anthropic_alias_target(model).is_some()
+}
+
+fn resolve_requested_model(model: &str) -> ResolvedModel {
+    if !is_allowed_model(model) {
+        return ResolvedModel {
+            model: model.to_string(),
+            service_tier: None,
+        };
+    }
+    let model = model.strip_suffix("[1m]").unwrap_or(model);
+    if let Some(target) = anthropic_alias_target(model) {
+        return ResolvedModel {
+            model: target.to_string(),
+            service_tier: if model.ends_with(ULTRAFAST_SUFFIX) {
+                Some(ServiceTier::Ultrafast)
+            } else if model.ends_with(FAST_SUFFIX) {
+                Some(ServiceTier::Priority)
+            } else {
+                None
+            },
+        };
+    }
+    resolve_tier_model_alias(model)
 }
 
 pub fn resolve_model(model: &str) -> String {
@@ -183,7 +441,11 @@ pub struct ModelNotAllowedError {
 
 impl std::fmt::Display for ModelNotAllowedError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Model not allowed: {}", self.model)
+        write!(
+            f,
+            "Invalid model ID: '{}'. Use 1-256 bytes without whitespace or control characters",
+            self.model
+        )
     }
 }
 
@@ -203,7 +465,7 @@ pub fn assert_allowed_model(model: &str) -> Result<(), ModelNotAllowedError> {
 /// into its own assistant turn there. `gpt-5.6-sol` and `gpt-5.6-terra` also
 /// exist on the full Responses lane, where parallel tool calls work;
 /// `codex.fullLane` / `CCP_CODEX_FULL_LANE` opts them into it. `gpt-5.6-luna`
-/// stays on the lite lane unconditionally — see [`full_lane_web_search_model`].
+/// stays on the lite lane unless discovery explicitly advertises otherwise.
 pub fn uses_responses_lite(model: &str) -> bool {
     uses_responses_lite_with_full_lane(model, config::codex_full_lane())
 }
@@ -212,43 +474,163 @@ fn uses_responses_lite_with_full_lane(model: &str, full_lane: bool) -> bool {
     if full_lane && matches!(model, "gpt-5.6-sol" | "gpt-5.6-terra") {
         return false;
     }
-    matches!(
-        model,
-        "gpt-5.6-luna"
-            | "gpt-5.6-sol"
-            | "gpt-5.6-terra"
-            | "gpt-6-astra"
-            | "gpt-6-luna"
-            | "gpt-6-sol"
-            | "gpt-6.1-sol"
-    ) || catalog_model(model).is_some_and(|entry| entry.use_responses_lite)
+    catalog_model(model)
+        .and_then(|entry| entry.use_responses_lite)
+        .unwrap_or(false)
 }
 
-/// Luna models exist only behind the Responses Lite lane; the full
-/// Responses API resolves them to a `-free` variant and returns 404 (Model not
-/// found gpt-5.6-luna-free-...). Hosted web_search requests must run on the
-/// full lane, so luna is upgraded to its nearest full-lane sibling.
-pub fn full_lane_web_search_model(model: &str) -> &str {
-    match model {
-        "gpt-5.6-luna" => "gpt-5.6-sol",
-        "gpt-6-luna" => "gpt-6-sol",
-        _ => model,
+/// Known Lite-only Luna IDs cannot run hosted tools on the full lane.
+/// The standalone alpha/search endpoint does not use this restriction.
+pub fn validate_hosted_web_search(model: &str) -> anyhow::Result<()> {
+    if matches!(model, "gpt-5.6-luna" | "gpt-6-luna")
+        && catalog_model(model).and_then(|entry| entry.use_responses_lite) != Some(false)
+    {
+        anyhow::bail!(
+            "Model '{model}' does not support hosted web_search on the full Responses lane. Use standalone search or explicitly choose a model supporting the full lane; the proxy will not substitute another model."
+        );
     }
+    Ok(())
 }
 
 pub fn is_valid_model_for_codex(model: &str) -> bool {
-    if is_allowed_model(model) {
-        return true;
-    }
-    if split_tier_suffix(model).is_some() {
-        return true;
-    }
-    MODEL_ALIASES.iter().any(|(alias, _)| *alias == model)
+    is_allowed_model(model)
+}
+
+#[cfg(test)]
+pub(crate) fn with_test_catalog<T>(models: serde_json::Value, f: impl FnOnce() -> T) -> T {
+    use super::model_catalog::{CatalogSnapshot, parse_catalog, with_catalog};
+    let models =
+        parse_catalog(&serde_json::to_vec(&serde_json::json!({"models": models})).unwrap())
+            .unwrap();
+    with_catalog(std::sync::Arc::new(CatalogSnapshot::new(models, true)), f)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn live_metadata_is_authoritative_for_subscription_models_and_tiers() {
+        with_test_catalog(
+            json!([
+                {"slug":"gpt-6.1-sol", "supported_in_api":false, "use_responses_lite":false, "service_tiers":[{"id":"priority"},{"id":"future-speed"}]},
+                {"slug":"gpt-hidden", "visibility":"hide", "service_tiers":[]}
+            ]),
+            || {
+                assert!(is_allowed_model("gpt-6.1-sol"));
+                assert!(is_allowed_model("gpt-6-sol"));
+                assert!(!uses_responses_lite("gpt-6.1-sol"));
+                assert_eq!(allowed_models(), ["gpt-6.1-sol", "gpt-hidden"]);
+                assert_eq!(listed_catalog_models(), ["gpt-6.1-sol"]);
+                assert_eq!(tier_model_variants("gpt-6.1-sol"), ["gpt-6.1-sol-fast"]);
+                assert!(tier_model_variants("gpt-hidden").is_empty());
+                assert!(resolve_service_tier_value("gpt-6.1-sol", "ultrafast").is_err());
+                assert_eq!(
+                    String::from(
+                        resolve_service_tier_value("gpt-6.1-sol", "future-speed").unwrap()
+                    ),
+                    "future-speed"
+                );
+                assert!(resolve_service_tier_value("gpt-hidden", "flex").is_ok());
+                assert!(is_valid_model_for_codex("fable"));
+                assert_eq!(resolve_model_request("fable").model, "gpt-6-astra");
+                assert!(is_valid_model_for_codex("opus"));
+            },
+        );
+    }
+
+    #[test]
+    fn exact_discovered_slugs_win_over_local_tier_suffixes() {
+        with_test_catalog(
+            json!([{"slug":"future-fast","service_tiers":[]},{"slug":"serial","service_tiers":[]}]),
+            || {
+                let resolved = resolve_model_request("future-fast");
+                assert_eq!(resolved.model, "future-fast");
+                assert_eq!(resolved.service_tier, None);
+                assert!(is_valid_model_for_codex("not-discovered"));
+                assert_eq!(
+                    resolve_model_request("not-discovered-fast").model,
+                    "not-discovered-fast"
+                );
+                let requested = resolve_model_request("serial-fast");
+                assert_eq!(requested.model, "serial");
+                assert_eq!(requested.service_tier, Some(ServiceTier::Priority));
+                assert!(resolve_service_tier_value(&requested.model, "priority").is_err());
+            },
+        );
+    }
+
+    #[test]
+    fn model_efforts_defaults_and_harness_aliases_follow_metadata() {
+        with_test_catalog(
+            json!([{"slug":"future", "default_reasoning_level":"low",
+                "multi_agent_reasoning_effort":"future-effort",
+                "supported_reasoning_levels":[{"effort":"low"},{"effort":"max"},{"effort":"future-effort"}]
+            }]),
+            || {
+                assert_eq!(
+                    resolve_model_effort("future", None).unwrap().as_deref(),
+                    Some("low")
+                );
+                assert_eq!(
+                    resolve_model_effort("future", Some("ultra"))
+                        .unwrap()
+                        .as_deref(),
+                    Some("future-effort")
+                );
+                assert_eq!(
+                    resolve_model_effort("future", Some("future-effort"))
+                        .unwrap()
+                        .as_deref(),
+                    Some("future-effort")
+                );
+                let error = resolve_model_effort("future", Some("none"))
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("Allowed: low, max, future-effort"));
+            },
+        );
+    }
+
+    #[test]
+    fn absent_capability_metadata_leaves_values_for_upstream_validation() {
+        with_test_catalog(json!([]), || {
+            assert_eq!(
+                resolve_model_effort("opaque", Some("future-effort"))
+                    .unwrap()
+                    .as_deref(),
+                Some("future-effort")
+            );
+            assert_eq!(
+                resolve_model_effort("opaque", Some("12345"))
+                    .unwrap()
+                    .as_deref(),
+                Some("12345")
+            );
+            assert_eq!(
+                String::from(resolve_service_tier_value("opaque", "future-speed").unwrap()),
+                "future-speed"
+            );
+        });
+    }
+
+    #[test]
+    fn family_wildcards_preserve_tier_and_never_rewrite_native_ids() {
+        for (model, expected) in [
+            ("claude-fable-99-fast[1m]", "gpt-6-astra"),
+            ("opus-fast", "gpt-6.1-sol"),
+            ("claude-sonnet-99-fast", "gpt-6-sol"),
+        ] {
+            let resolved = resolve_model_request_with_config_override(model, false);
+            assert_eq!(resolved.model, expected);
+            assert_eq!(resolved.service_tier, Some(ServiceTier::Priority));
+        }
+        assert_eq!(
+            resolve_model_request_with_config_override("gpt-native-future", false).model,
+            "gpt-native-future"
+        );
+    }
 
     #[test]
     fn haiku_resolves_to_luna() {
@@ -283,38 +665,41 @@ mod tests {
     }
 
     #[test]
-    fn web_search_upgrades_luna_to_full_lane_sibling() {
-        assert_eq!(full_lane_web_search_model("gpt-5.6-luna"), "gpt-5.6-sol");
-        assert_eq!(full_lane_web_search_model("gpt-5.6-sol"), "gpt-5.6-sol");
-        assert_eq!(full_lane_web_search_model("gpt-5.6-terra"), "gpt-5.6-terra");
-        assert_eq!(full_lane_web_search_model("gpt-5.4"), "gpt-5.4");
-        assert_eq!(full_lane_web_search_model("gpt-6-luna"), "gpt-6-sol");
-        assert_eq!(full_lane_web_search_model("gpt-6-sol"), "gpt-6-sol");
+    fn web_search_never_substitutes_luna() {
+        for model in ["gpt-5.6-luna", "gpt-6-luna"] {
+            assert!(
+                validate_hosted_web_search(model)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("will not substitute")
+            );
+        }
+        assert!(validate_hosted_web_search("gpt-6-sol").is_ok());
     }
 
     #[test]
-    fn sonnet_resolves_to_terra() {
+    fn sonnet_resolves_to_sol() {
         let r = resolve_model_request("sonnet");
-        assert_eq!(r.model, "gpt-5.6-terra");
+        assert_eq!(r.model, "gpt-6-sol");
     }
 
     #[test]
-    fn sonnet_5_resolves_to_terra() {
+    fn sonnet_5_resolves_to_sol() {
         let r = resolve_model_request("claude-sonnet-5");
-        assert_eq!(r.model, "gpt-5.6-terra");
+        assert_eq!(r.model, "gpt-6-sol");
     }
 
     #[test]
     fn opus_resolves_to_sol() {
         let r = resolve_model_request("opus");
-        assert_eq!(r.model, "gpt-6-sol");
+        assert_eq!(r.model, "gpt-6.1-sol");
     }
 
     #[test]
     fn opus_aliases_resolve_to_sol() {
         for model in ["claude-opus-4-8", "claude-opus-5", "claude-opus-5-5"] {
             let r = resolve_model_request(model);
-            assert_eq!(r.model, "gpt-6-sol");
+            assert_eq!(r.model, "gpt-6.1-sol");
         }
     }
 
@@ -322,7 +707,7 @@ mod tests {
     fn fable_5_resolves_to_sol() {
         for model in ["fable", "claude-fable-5"] {
             let r = resolve_model_request(model);
-            assert_eq!(r.model, "gpt-6-sol");
+            assert_eq!(r.model, "gpt-6-astra");
         }
     }
 
@@ -354,7 +739,7 @@ mod tests {
         for model in ULTRAFAST_MODELS {
             let name = format!("{model}-ultrafast");
             assert!(is_valid_model_for_codex(&name), "{name}");
-            let r = resolve_with_model_override(&name, None);
+            let r = resolve_requested_model(&name);
             assert_eq!(r.model, *model);
             assert_eq!(r.service_tier, Some(ServiceTier::Ultrafast));
             assert!(assert_allowed_model(&r.model).is_ok());
@@ -362,51 +747,34 @@ mod tests {
     }
 
     #[test]
-    fn ultrafast_suffix_is_rejected_for_models_without_the_tier() {
-        for model in ALLOWED_MODELS {
+    fn unrecognized_ultrafast_model_ids_pass_through_without_inventing_a_tier() {
+        for model in FALLBACK_MODELS {
             if ULTRAFAST_MODELS.contains(model) {
                 continue;
             }
             let name = format!("{model}-ultrafast");
-            assert!(!is_valid_model_for_codex(&name), "{name}");
+            assert!(is_valid_model_for_codex(&name), "{name}");
             assert_eq!(split_tier_suffix(&name), None, "{name}");
-            let r = resolve_with_model_override(&name, None);
+            let r = resolve_requested_model(&name);
             assert_eq!(r.service_tier, None, "{name}");
-            assert!(assert_allowed_model(&r.model).is_err(), "{name}");
+            assert_eq!(r.model, name);
+            assert!(assert_allowed_model(&r.model).is_ok(), "{name}");
         }
     }
 
     #[test]
     fn ultrafast_models_are_registered() {
         for model in ULTRAFAST_MODELS {
-            assert!(ALLOWED_MODELS.contains(model), "{model}");
+            assert!(FALLBACK_MODELS.contains(model), "{model}");
         }
     }
 
     #[test]
-    fn service_tier_narrows_to_what_the_model_offers() {
-        for (model, tier, expected) in [
-            (
-                "gpt-6-astra",
-                ServiceTier::Ultrafast,
-                ServiceTier::Ultrafast,
-            ),
-            ("gpt-6-astra", ServiceTier::Priority, ServiceTier::Priority),
-            ("gpt-6-astra", ServiceTier::Flex, ServiceTier::Flex),
-            (
-                "gpt-6.1-sol",
-                ServiceTier::Ultrafast,
-                ServiceTier::Ultrafast,
-            ),
-            ("gpt-6-sol", ServiceTier::Ultrafast, ServiceTier::Priority),
-            ("gpt-6-luna", ServiceTier::Ultrafast, ServiceTier::Priority),
-            ("gpt-6-sol", ServiceTier::Priority, ServiceTier::Priority),
-            ("gpt-6-sol", ServiceTier::Flex, ServiceTier::Flex),
-        ] {
+    fn service_tier_never_downgrades_unknown_metadata() {
+        for model in ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"] {
             assert_eq!(
-                service_tier_for_model(model, tier.clone()),
-                expected,
-                "{model} {tier:?}"
+                resolve_service_tier_value(model, "ultrafast").unwrap(),
+                ServiceTier::Ultrafast
             );
         }
     }
@@ -433,65 +801,24 @@ mod tests {
     }
 
     #[test]
-    fn model_override_merges_tier_suffixes() {
-        let cases: &[(&str, Option<&str>, &str, Option<ServiceTier>)] = &[
-            ("gpt-6-sol", None, "gpt-6-sol", None),
-            ("gpt-6-sol", Some(""), "gpt-6-sol", None),
-            (
-                "gpt-6-sol-fast",
-                None,
-                "gpt-6-sol",
-                Some(ServiceTier::Priority),
-            ),
-            (
-                "gpt-6-sol",
-                Some("gpt-6-astra-fast"),
-                "gpt-6-astra",
-                Some(ServiceTier::Priority),
-            ),
-            (
-                "gpt-6-sol-fast",
-                Some("gpt-6-astra"),
-                "gpt-6-astra",
-                Some(ServiceTier::Priority),
-            ),
-            (
-                "gpt-6-sol",
-                Some("gpt-6-astra-ultrafast"),
-                "gpt-6-astra",
-                Some(ServiceTier::Ultrafast),
-            ),
-            (
-                "gpt-6-sol-fast",
-                Some("gpt-6-astra-ultrafast"),
-                "gpt-6-astra",
-                Some(ServiceTier::Ultrafast),
-            ),
-            (
-                "gpt-6-astra-ultrafast",
-                Some("gpt-6-astra-fast"),
-                "gpt-6-astra",
-                Some(ServiceTier::Priority),
-            ),
-            (
-                "gpt-6-astra-ultrafast",
-                Some("gpt-6-astra"),
-                "gpt-6-astra",
-                Some(ServiceTier::Ultrafast),
-            ),
-            (
-                "gpt-6-astra-ultrafast",
-                Some("gpt-6-sol"),
-                "gpt-6-sol",
-                Some(ServiceTier::Priority),
-            ),
-            ("opus", Some("gpt-6-astra"), "gpt-6-astra", None),
-        ];
-        for (requested, override_model, model, tier) in cases {
-            let r = resolve_with_model_override(requested, *override_model);
-            assert_eq!(r.model, *model, "{requested} + {override_model:?}");
-            assert_eq!(&r.service_tier, tier, "{requested} + {override_model:?}");
+    fn configured_models_may_agree_but_never_redirect_requests() {
+        for (requested, configured) in [
+            ("opus", "gpt-6.1-sol"),
+            ("claude-fable-99-fast", "gpt-6-astra-fast"),
+            ("sonnet", "gpt-6-sol"),
+        ] {
+            assert!(validate_model_override(requested, Some(configured)).is_ok());
         }
+        assert!(
+            validate_model_override("opus", Some("gpt-6-astra"))
+                .unwrap_err()
+                .to_string()
+                .contains("conflicting")
+        );
+        assert!(
+            validate_model_override("gpt-6-astra-fast", Some("gpt-6-astra-ultrafast")).is_err()
+        );
+        assert!(validate_model_override("gpt-6-astra", None).is_ok());
     }
 
     #[test]
@@ -505,15 +832,19 @@ mod tests {
     }
 
     #[test]
-    fn not_allowed_rejected() {
-        assert!(assert_allowed_model("gpt-7").is_err());
-        assert!(assert_allowed_model("gpt-7-fast").is_err());
+    fn invalid_model_syntax_rejected_but_unknown_ids_forward() {
+        for model in ["", "has space", "line\nbreak", "control\0character"] {
+            assert!(assert_allowed_model(model).is_err());
+        }
+        assert!(assert_allowed_model(&"a".repeat(257)).is_err());
+        assert!(assert_allowed_model("gpt-7").is_ok());
+        assert!(assert_allowed_model("future-opaque-provider-id").is_ok());
     }
 
     #[test]
     fn allowed_models_listing_contains_baseline() {
         let listing = allowed_models();
-        for baseline in ALLOWED_MODELS {
+        for baseline in FALLBACK_MODELS {
             assert!(listing.iter().any(|m| m == baseline), "{baseline} missing");
         }
         assert!(allowed_models_display().contains("gpt-6-astra"));

@@ -1,5 +1,9 @@
 use crate::{
-    provider::Provider, providers::codex::translate::model_allowlist::tier_model_variants,
+    provider::Provider,
+    providers::codex::translate::{
+        model_allowlist::{self, tier_model_variants},
+        model_catalog,
+    },
 };
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -8,9 +12,11 @@ pub const ANTHROPIC_STYLE_ALIASES: &[&str] = &[
     "haiku",
     "claude-haiku-4-5",
     "claude-haiku-4-5-20251001",
+    "claude-haiku-5-5",
     "sonnet",
     "claude-sonnet-4-6",
     "claude-sonnet-5",
+    "claude-sonnet-5-5",
     "opus",
     "claude-opus-4-7",
     "claude-opus-4-8",
@@ -18,23 +24,10 @@ pub const ANTHROPIC_STYLE_ALIASES: &[&str] = &[
     "claude-opus-5-5",
     "fable",
     "claude-fable-5",
+    "claude-fable-5-1",
 ];
 
-pub(crate) const CODEX_MODELS: &[&str] = &[
-    "gpt-5.2",
-    "gpt-5.3-codex",
-    "gpt-5.3-codex-spark",
-    "gpt-5.4",
-    "gpt-5.4-mini",
-    "gpt-5.5",
-    "gpt-5.6-luna",
-    "gpt-5.6-sol",
-    "gpt-5.6-terra",
-    "gpt-6-astra",
-    "gpt-6-luna",
-    "gpt-6-sol",
-    "gpt-6.1-sol",
-];
+pub(crate) const CODEX_MODELS: &[&str] = model_allowlist::FALLBACK_MODELS;
 
 pub struct Registry {
     models: BTreeMap<String, Vec<String>>,
@@ -50,11 +43,7 @@ impl Default for Registry {
 impl Registry {
     pub fn new() -> Self {
         let provider: Arc<dyn Provider> = Arc::new(crate::providers::codex::CodexProvider::new());
-        let mut registry = Self::from_providers([provider]);
-        registry
-            .models
-            .insert("codex".into(), expand_codex_models());
-        registry
+        Self::from_providers([provider])
     }
 
     pub fn from_providers(providers: impl IntoIterator<Item = Arc<dyn Provider>>) -> Self {
@@ -81,8 +70,20 @@ impl Registry {
     pub fn supported_models_for(&self, provider: &str) -> Vec<String> {
         let mut models = self.models.get(provider).cloned().unwrap_or_default();
         if provider == "codex" {
+            if let Some(catalog) = model_catalog::scoped_catalog() {
+                if catalog.authoritative {
+                    models.clear();
+                }
+                models.extend(expand_codex_models());
+                models.sort_unstable();
+                models.dedup();
+            }
             for alias in ANTHROPIC_STYLE_ALIASES {
-                if !models.iter().any(|value| value == alias) {
+                let target =
+                    model_allowlist::resolve_model_request_with_config_override(alias, false);
+                if model_catalog::catalog_model(&target.model).is_some()
+                    && !models.iter().any(|value| value == alias)
+                {
                     models.push((*alias).to_string());
                 }
             }
@@ -111,26 +112,16 @@ impl Registry {
 
     pub fn provider_for_model(&self, raw_model: &str) -> Option<Arc<dyn Provider>> {
         let normalized = normalize_incoming_model(raw_model);
-        if is_anthropic_alias(&normalized) {
-            return self.handlers.get("codex").cloned();
+        if !model_allowlist::is_valid_model_for_codex(&normalized) {
+            return None;
         }
-
         for (name, models) in &self.models {
             if models.iter().any(|candidate| candidate == &normalized) {
                 return self.handlers.get(name).cloned();
             }
         }
 
-        let base =
-            crate::providers::codex::translate::model_allowlist::split_tier_suffix(&normalized)
-                .map_or(normalized.as_str(), |(base, _)| base);
-        if crate::providers::codex::translate::model_catalog::catalog_model(base)
-            .is_some_and(|model| model.supported_in_api)
-        {
-            return self.handlers.get("codex").cloned();
-        }
-
-        None
+        self.handlers.get("codex").cloned()
     }
 
     pub fn unknown_model_message(&self) -> String {
@@ -140,7 +131,7 @@ impl Registry {
             models.sort_unstable();
             parts.push(format!("{}: {}", provider, models.join(", ")));
         }
-        format!("Supported: {}.", parts.join("; "))
+        format!("Known models: {}.", parts.join("; "))
     }
 }
 
@@ -153,17 +144,19 @@ pub fn normalize_incoming_model(model: &str) -> String {
 }
 
 pub fn is_anthropic_alias(model: &str) -> bool {
-    ANTHROPIC_STYLE_ALIASES.contains(&model)
+    model_allowlist::is_anthropic_alias(model)
 }
 
-fn expand_codex_models() -> Vec<String> {
+pub(crate) fn expand_codex_models() -> Vec<String> {
     let mut set = HashSet::new();
     let mut out = Vec::new();
-    // Baseline ∪ models the Codex CLI advertises in its own model cache, so a
-    // model OpenAI ships to Codex routes here before a proxy release lists it.
-    let catalog = crate::providers::codex::translate::model_allowlist::listed_catalog_models();
+    // A live account catalog is complete, not an extension of compiled IDs.
+    let authoritative =
+        model_catalog::scoped_catalog().is_some_and(|catalog| catalog.authoritative);
+    let catalog = model_allowlist::listed_catalog_models();
     for model in CODEX_MODELS
         .iter()
+        .filter(|_| !authoritative)
         .map(|model| (*model).to_string())
         .chain(catalog)
     {
@@ -185,6 +178,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn registry_rejects_only_malformed_ids_not_new_model_names() {
+        let registry = Registry::new();
+        for model in ["", "bad model", "bad\nmodel", "bad\tmodel"] {
+            assert!(registry.provider_for_model(model).is_none());
+        }
+        assert!(registry.provider_for_model(&"x".repeat(257)).is_none());
+        assert_eq!(
+            registry
+                .provider_for_model("unadvertised-model")
+                .unwrap()
+                .name(),
+            "codex"
+        );
+    }
+
+    #[test]
     fn normalize_model_trims_hint() {
         assert_eq!(normalize_incoming_model("gpt-5.4-fast[1m]"), "gpt-5.4-fast");
         assert_eq!(normalize_incoming_model("gpt-5.4-fast"), "gpt-5.4-fast");
@@ -195,7 +204,7 @@ mod tests {
     }
 
     #[test]
-    fn ultrafast_variant_routes_to_codex_only_where_offered() {
+    fn syntactically_valid_tier_ids_route_without_catalog_admission() {
         let registry = Registry::new();
         for model in [
             "gpt-6-astra-ultrafast",
@@ -205,7 +214,7 @@ mod tests {
             assert_eq!(registry.provider_for_model(model).unwrap().name(), "codex");
         }
         for model in ["gpt-6-sol-ultrafast", "gpt-6-luna-ultrafast"] {
-            assert!(registry.provider_for_model(model).is_none(), "{model}");
+            assert_eq!(registry.provider_for_model(model).unwrap().name(), "codex");
         }
     }
 
@@ -256,7 +265,7 @@ mod tests {
     }
 
     #[test]
-    fn removed_backends_and_model_ids_are_not_registered_or_routed() {
+    fn removed_backends_are_not_registered_and_ids_only_route_to_codex() {
         let registry = Registry::new();
         assert_eq!(registry.list_provider_names(), ["codex"]);
         for backend in ["kimi", "grok", "cursor", "opencode"] {
@@ -289,11 +298,11 @@ mod tests {
             "opencode-go/gpt-5.6-luna",
             "opencode-go/grok-4.5",
         ] {
-            assert!(registry.provider_for_model(model).is_none(), "{model}");
+            assert_eq!(registry.provider_for_model(model).unwrap().name(), "codex");
             assert!(
                 registry
                     .provider_for_model(&format!("{model}[1m]"))
-                    .is_none(),
+                    .is_some(),
                 "{model}"
             );
             assert!(
