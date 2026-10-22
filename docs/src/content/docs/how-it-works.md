@@ -8,9 +8,9 @@ claude-code-proxy has one upstream backend: the ChatGPT subscription Codex servi
 ## Anthropic requests
 
 1. Claude Code sends `/v1/messages` to the local proxy.
-2. The registry strips a trailing `[1m]` and resolves the requested Codex model or Claude-style alias.
-3. The proxy loads its own ChatGPT OAuth credential and refreshes expiring tokens when needed.
-4. The translator maps messages, images, tools, tool results, thinking controls, and supported output settings into Codex Responses input.
+2. The proxy pins its own ChatGPT OAuth identity and prepares a model snapshot from authenticated discovery or bounded same-owner cache/fallback. No installed Codex CLI or automatic native config/cache reads are involved.
+3. The shared resolver strips a trailing `[1m]` and resolves family aliases: Fable → Astra, Opus → GPT-6.1 Sol, Sonnet → GPT-6 Sol, Haiku → Luna. Well-formed opaque model IDs pass through unchanged even when absent from discovery; known capabilities are validated without substituting another model, while upstream decides model availability and access.
+4. The translator maps messages, images, tools, tool results, thinking controls, and supported output settings into Codex Responses input, using model metadata for safe defaults.
 5. Codex text, reasoning-summary, tool, usage, and completion events become Anthropic SSE events or an accumulated non-streaming response.
 6. The monitor, JSONL logger, and optional traffic capture record diagnostics.
 
@@ -18,7 +18,7 @@ Claude Code executes its client tools. Using Codex upstream does not turn the pr
 
 ## Optional routes
 
-`CCP_CODEX_RESPONSES_API=1` enables native Codex `/v1/responses` passthrough and text-only `/v1/chat/completions` compatibility. `CCP_CODEX_IMAGES_API=1` separately enables image generation and editing. All use the proxy's ChatGPT login, not incoming API keys. See [HTTP API](/reference/http-api/) for accepted fields and limits.
+`CCP_CODEX_RESPONSES_API=1` enables native Codex `/v1/responses` passthrough and `/v1/chat/completions` compatibility. `CCP_CODEX_IMAGES_API=1` separately enables image generation and editing. All use the proxy's ChatGPT login, not incoming API keys. See [HTTP API](/reference/http-api/) for accepted fields and limits.
 
 ## Authentication boundary
 

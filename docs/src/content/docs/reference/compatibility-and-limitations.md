@@ -24,8 +24,8 @@ Codex through a ChatGPT subscription is the only upstream backend. Claude Code i
 
 ## Optional OpenAI-compatible routes
 
-- `CCP_CODEX_RESPONSES_API=1` enables native Codex `/v1/responses` passthrough and text-only `/v1/chat/completions` compatibility.
-- Chat Completions supports text, reasoning effort, and supported output formats. It does not support function calls, images, output token limits, audio, log probabilities, or multiple choices.
+- `CCP_CODEX_RESPONSES_API=1` enables native Codex `/v1/responses` passthrough and `/v1/chat/completions` compatibility.
+- Chat Completions supports text and model-supported `image_url` input parts, reasoning effort, verbosity, service tier, and output formats. Explicit parallel-call intent is validated, but function tools/calls are not supported. Output token limits, audio, log probabilities, and multiple choices remain unsupported.
 - Responses forwards native Codex input and JSON or SSE output. It does not add stored response retrieval/deletion or WebSocket ingress.
 - Unsupported non-null compatibility fields return errors rather than being silently ignored. These routes do not promise full public OpenAI API equivalence.
 
@@ -35,8 +35,12 @@ Codex through a ChatGPT subscription is the only upstream backend. Claude Code i
 
 ## Models, context, and session state
 
-- Registration does not guarantee account access. Unknown IDs have no implicit fallback; Claude-style aliases always resolve to Codex.
-- `[1m]` is a Claude Code hint, not an upstream context increase. Use a safe local compaction threshold.
+- Catalog advertising does not guarantee account entitlement or quota. Live subscription metadata guides menus, defaults, and capabilities—not admission. Well-formed opaque model IDs pass through for upstream validation even when absent from discovery. Hidden entries remain explicitly requestable; `supported_in_api: false` does not block subscription use.
+- Discovery defaults on, using proxy-owned OAuth directly; no Codex CLI installation or automatic `~/.codex` / `CODEX_HOME` reads. Offline discovery opt-out and explicit metadata imports are documented in [Models and routing](/using/models-and-routing/).
+- Family aliases map Fable to Astra, Opus to GPT-6.1 Sol, Sonnet to GPT-6 Sol, and Haiku to Luna. There is no hardcoded/catalog admission allowlist or silent model substitution; unknown IDs are validated upstream, while malformed IDs and incompatible known controls fail. `/model` switching does not require exit or global settings rewrites.
+- Stock Claude Code `/fast` is Opus-only and may change the model before the proxy sees it. Messages `speed: "fast"` requests priority for the received model; other families can use supported `-fast` aliases without relying on that UI. Client fast-mode check bypasses do not grant upstream entitlement.
+- Missing capability metadata is unknown, not `false`. Actual advertised service-tier IDs determine acceleration; default-tier metadata does not opt into paid service automatically.
+- `[1m]` is a client hint, not a context increase. The launcher uses active context and metadata safety headroom; a 272,000-token active window has at most a 244,800 compaction window ceiling (actual compaction may occur earlier).
 - Optional WebSocket continuation and server compaction state live in memory and are invalidated when their model or history assumptions change. Restarts clear them; portable Claude Code history remains the fallback.
 - Automatic transport fallback happens only before a request is sent, avoiding replay of possible side effects.
 

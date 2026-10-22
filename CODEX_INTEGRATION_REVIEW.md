@@ -151,7 +151,7 @@ The backend-removal request was implemented separately from the native-quality f
 - `d3a948c`: subscription-only documentation and installer guidance, obsolete page/screenshot removal and redirects for renamed guide URLs. Historical PR provenance remains intact.
 - `6c0bedc`: delete disconnected backend implementations and backend-only dependencies; remove OpenCode-only response policies while retaining strict Codex error behavior.
 
-Only Codex remains as a built-in upstream. Claude Code's Anthropic API and the optional OpenAI-compatible ingress APIs remain. Browser/device OAuth still uses the proxy's own ChatGPT subscription credentials; no Platform API-key authentication was added. Existing user credential files were not removed. Retired model IDs and backend commands are tested as rejected, not silently rerouted.
+Only Codex remains as a built-in upstream. Claude Code's Anthropic API and the optional OpenAI-compatible ingress APIs remain. Browser/device OAuth still uses the proxy's own ChatGPT subscription credentials; no Platform API-key authentication was added. Existing user credential files were not removed. At this consolidation snapshot, retired model IDs and backend commands were tested as rejected. The model-aware follow-up below removes model admission gates; retired backend commands remain unavailable.
 
 The native-quality correctness findings are **follow-up work**, not fixes included in this consolidation. The lower test count reflects removal of retired-provider suites and seven alternate-provider policy tests, not a claim that native conformance is complete. Relevant Codex transport, continuation, compaction, tool, auth and cancellation coverage remains.
 
@@ -174,3 +174,31 @@ cargo build --release --locked
 ```
 
 The release CLI was also checked with isolated `CCP_CONFIG_DIR`, `CODEX_HOME` and `HOME`: model discovery lists only Codex, and all four retired backend commands return exit code 2. No subscription credentials are needed for those checks.
+
+## Model-aware integration follow-up
+
+Implemented after the review above, using OpenAI Codex source `61f34c35af77777db4d77d0ea2aeb8547a6b4523` and discovery compatibility version `0.163.0` (stable source `83086188ae0614bd882818ff1aa23f3194962012`):
+
+- Authenticated subscription `/models` discovery uses proxy-owned OAuth. There is no automatic `~/.codex`, `CODEX_HOME`, or native CLI credential/configuration dependency. Optional metadata imports must be explicitly configured.
+- Discovery uses bounded account/endpoint/version caches and immutable operation snapshots, including pinned authentication. Model metadata controls defaults, capabilities and menus, **not admission**: well-formed opaque model IDs still reach Codex for validation. Built-in model data is an offline hint, not an allowlist. `supported_in_api` does not exclude subscription models.
+- Final family mappings: **Fable → GPT-6 Astra; Opus → GPT-6.1 Sol; Sonnet → GPT-6 Sol; Haiku → GPT-6 Luna**. Versioned family aliases use the same resolver. Explicit Codex IDs are preserved; configuration conflicts fail rather than silently replacing a requested model.
+- Requests consume advertised effort, summary, verbosity, lane, service-tier and input capabilities, preserving unknown metadata. Native effort aliases are normalized; paid acceleration is not enabled merely because a catalog advertises a default tier.
+- The explicit `launch` command modifies only the child environment. It enables tool search, model-family defaults and conservative context/compaction settings. For the known 272,000 active window, the default usable cap is 258,400 and the compaction-window ceiling is 244,800. Launcher policy deliberately requires an explicit safe cap when only a larger maximum, not active capacity, is known.
+- Anthropic `speed: "fast"` requests priority on the same received model; `speed: "standard"` clears acceleration. Response `usage.speed` is based only on a confirmed upstream tier. Stock Claude Code `/fast` remains Opus-only and can switch other families before sending; the proxy does not guess and undo that client-side action. Other families have explicit `-fast` aliases. The user explicitly approved child-only Anthropic fast-availability check skips; Codex OAuth and upstream validation remain enforced.
+- Legacy passes fixed real Rust platform-name handling, removed unused private test helpers and a direct dependency, and corrected obsolete build/tooling descriptions. Credential migration behavior was retained. An initial server test exposed ambient discovery credentials; server fixtures now inject explicit missing-auth storage instead of relying on developer shell settings.
+
+These changes do **not** claim to fix the separate original tool-stream validation, pooled-WebSocket account binding, or cross-process refresh/logout race findings. Live generation quality, subscription quota consumption and real CLI fast-mode UI behavior are not established by local mock tests.
+
+### Follow-up commits and validation
+
+- `8e02150`: replace legacy path handling and remove unused private test helpers.
+- `c876b48`: remove obsolete tooling assumptions and an unused direct dependency.
+- `e72ac46`: independent authenticated discovery, account-scoped model/auth snapshots, family routing and model-aware request capabilities. Regressions cover OAuth refreshes longer than the metadata timeout, persisted rotation, and numeric effort budgets serialized as unsigned JSON integers.
+- `4de849a`: confirmed upstream service-tier reporting with live/buffered/accumulated usage parity and reconnect isolation.
+- `c7f481f`: model-aware launcher, asynchronous CLI discovery and isolated subprocess/HTTP regressions.
+
+On this final source/test state, `cargo fmt --all -- --check`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo test --all --locked`, and `cargo build --release --locked` all passed. The full suite passed **852 tests, zero failures** with normal test parallelism.
+
+The release binary reports `0.1.45`. An additional isolated CLI check used a fresh synthetic `HOME`, `CCP_CONFIG_DIR`, `CODEX_HOME`, authentication file and explicit metadata import, with discovery disabled. It verified model listing, all four family launch environments, the 258,400/244,800 context defaults, an unknown explicit model with a safe override, rejection of all four retired backend commands, and unchanged synthetic Claude settings, auth and native cache files. This check started neither Claude Code nor an upstream network request.
+
+Documentation syntax, examples and local navigation passed static checks. The full Astro build remains skipped because Bun/documentation dependencies are absent. No controlled live generation, quota/latency benchmark, or actual Claude Code `/fast` UI verification was performed. The child-only availability skips do not establish upstream fast-tier entitlement.

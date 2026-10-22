@@ -30,6 +30,12 @@ When `CCP_CONFIG_DIR` is set, credentials use `<CCP_CONFIG_DIR>/codex/auth.json`
 
 The proxy owns these tokens independently of native Codex CLI credentials. No OpenAI Platform API key is used.
 
+## Model metadata
+
+Default-on discovery fetches subscription model metadata directly using the proxy's OAuth login. Its immutable cache is bounded and in memory, scoped to account/owner, endpoint, and protocol version; it is not a native Codex disk cache. Freshness is 300 seconds, failure cooldown 30 seconds, and same-scope stale reuse is bounded to 900 seconds after validation.
+
+The proxy does not automatically read `~/.codex`, `CODEX_HOME`, native configuration, or `models_cache.json`. Only `CCP_CODEX_MODELS_FILE` / `codex.modelsFile` explicitly imports an optional metadata file for the built-in fallback. `CCP_CODEX_MODEL_DISCOVERY=0` / `codex.modelDiscovery: false` disables discovery network requests. See [Models and routing](/using/models-and-routing/).
+
 ## Structured log
 
 `proxy.log` lives under the state root. It uses JSON Lines and rotates at 20 MiB. Known credential keys, including authorization, access tokens, refresh tokens, ID tokens, and account headers, are redacted before writing.

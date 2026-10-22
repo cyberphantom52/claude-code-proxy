@@ -26,25 +26,50 @@ The proxy owns its tokens and does not read native Codex CLI credentials. It ref
 
 ## Models and fast mode
 
-Use `claude-code-proxy models` as the current catalog. Model access depends on your ChatGPT account. A model rejected by the subscription produces the upstream error verbatim.
+Use `claude-code-proxy models` as the current catalog. The proxy fetches
+`GET /backend-api/codex/models?client_version=0.163.0` directly with its own
+ChatGPT OAuth credentials; no installed Codex CLI is needed. Discovery defaults
+on, with immutable account/endpoint/version-scoped in-memory snapshots (300s
+freshness, 30s failure cooldown, same-owner stale reuse bounded to 900s).
+`CCP_CODEX_MODEL_DISCOVERY=0` / `codex.modelDiscovery: false` disables network
+discovery and uses built-in/explicit-import fallback metadata.
 
-The proxy also reads the native Codex CLI's model catalog from
-`$CODEX_HOME/models_cache.json`, or `~/.codex/models_cache.json` by default.
-API-supported models extend the built-in list, including their `-fast` forms;
-hidden catalog models can be requested explicitly. This reads model metadata
-only. Proxy authentication still uses `claude-code-proxy codex auth login`.
+There are no automatic `~/.codex` / `CODEX_HOME` configuration or model-cache
+reads. Only `CCP_CODEX_MODELS_FILE` / `codex.modelsFile` explicitly imports a
+metadata file. A current live catalog is authoritative for discovered metadata,
+menus, and default choices—not model admission. Well-formed opaque IDs pass
+through for upstream validation even when absent from discovery; built-ins are
+fallback metadata hints, not an allowlist. Hidden models remain explicitly
+requestable. `supported_in_api: false`
+is a Platform API-key filter, not a ChatGPT subscription block. Advertising a
+model does not guarantee entitlement, availability, or quota; upstream generation
+can still reject it.
 
-Claude-style aliases map to Codex models: `haiku` to `gpt-6-luna`, `sonnet` to `gpt-5.6-terra`, and `opus` or `fable` to `gpt-6-sol`. Registered versioned Claude aliases use the same family mapping, including `claude-opus-5-5`. Run `claude-code-proxy models` for the exact supported names; arbitrary `claude-*` IDs are not accepted automatically.
+Claude-style family aliases map Fable to `gpt-6-astra`, Opus to `gpt-6.1-sol`,
+Sonnet to `gpt-6-sol`, and Haiku to `gpt-6-luna`, including versioned
+`claude-<family>-*` names. Recognized tier/context suffixes survive mapping;
+explicit opaque IDs do not change merely because they are absent from discovery.
+Upstream rejects unavailable models; incompatible known parameters can fail
+locally. Neither substitutes a different model. Use `/model fable`, `/model opus`, or `/model sonnet` inside
+Claude Code without exiting or rewriting global settings.
 
-Append `-fast` to any registered Codex model to request `service_tier: "priority"`. For example, `gpt-6-sol-fast` selects `gpt-6-sol` with fast service.
-
-Append `-ultrafast` to a model that offers the ultrafast tier to request `service_tier: "ultrafast"`. `gpt-6-astra` and `gpt-6.1-sol` offer it today, so `gpt-6-astra-ultrafast` and `gpt-6.1-sol-ultrafast` are the ultrafast IDs.
-
-On `/v1/messages`, `CCP_CODEX_SERVICE_TIER` or `codex.serviceTier` takes precedence over either suffix. A forced `ultrafast` applies to models that offer it, and the proxy requests `priority` for the others. The OpenAI-compatible routes use only the suffix or, on `/v1/responses`, the request's own `service_tier`.
+`-fast` requests `service_tier: "priority"`; `-ultrafast` requests `ultrafast`.
+Live `service_tiers` IDs determine whether the model supports these accelerated
+tiers; not every model does. An advertised default tier does not silently opt
+into paid acceleration. On `/v1/messages`, explicit `speed: "fast"` requests
+priority for the received model and `speed: "standard"` clears acceleration;
+otherwise `CCP_CODEX_SERVICE_TIER` / `codex.serviceTier` overrides suffixes.
+Stock Claude Code `/fast` is Opus-only and can switch other families to Opus
+before the proxy sees them. Use supported `/model fable-fast`,
+`/model sonnet-fast`, or `/model haiku-fast` aliases for other families.
+OpenAI-compatible routes use suffixes or the request's `service_tier`.
+Unsupported known accelerated tiers fail, not downgrade. See
+[Models and routing](/using/models-and-routing/) for full discovery, alias,
+fast-mode UI limits, and context rules.
 
 ## Reasoning
 
-Claude Code's `/effort` value maps to Codex `reasoning.effort`: `low`, `medium`, `high`, `xhigh`, or `max`. A proxy override can also force `none`.
+Claude Code's `/effort` control maps to Codex `reasoning.effort`. The proxy uses the model's advertised supported efforts and default instead of assuming every model accepts the same values. `CCP_CODEX_EFFORT` can force an effort, but incompatible explicit controls fail. Metadata also guides reasoning summaries, verbosity, Responses lane, and context; absent metadata means unknown, not `false`. Native `ultra` is a Codex harness alias normalized to a supported effort, not a literal wire effort.
 
 When reasoning is enabled, the proxy requests an automatic reasoning summary and translates summary deltas into Claude Code thinking blocks. Codex may omit a summary for a simple prompt. `CCP_CODEX_REASONING_SUMMARY=off` suppresses summaries while preserving effort and encrypted continuation content.
 
@@ -54,9 +79,10 @@ Claude Code summary compaction requests are capped at low effort by default beca
 
 ## Tools and multimodal input
 
-- `CCP_CODEX_FULL_LANE=1` or `codex.fullLane: true` routes `gpt-5.6-sol`
-  and `gpt-5.6-terra` through the full Responses lane to allow parallel tool
-  calls. Other models keep their normal lane, including Lite-only Luna models.
+- Model metadata selects the normal Responses lane. `CCP_CODEX_FULL_LANE=1`
+  or `codex.fullLane: true` still opts legacy `gpt-5.6-sol` and
+  `gpt-5.6-terra` into the full lane for parallel tool calls; it does not
+  force every other model off Lite. Explicit unsupported parallel calls fail.
 - Claude function tools and tool results map to Responses API function calls and outputs.
 - With Claude Code's tool search on (`ENABLE_TOOL_SEARCH=true`, see [Configure Claude Code](/using/configure-claude-code/#mcp-tool-search)),
   a deferred tool reaches the model once `ToolSearch` loads it. On the Responses
@@ -70,8 +96,10 @@ Claude Code summary compaction requests are capped at low effort by default beca
 - Claude Code's forced `web_search_20250305` subrequest uses Codex's standalone
   `/alpha/search` endpoint. It keeps the resolved model, omits search reasoning,
   and preserves non-empty domain filters, so Luna searches do not require a Sol
-  Responses turn. Automatic hosted-search requests remain on the full Responses
+  Responses turn. Automatic hosted-search requests require the full Responses
   API because the standalone endpoint cannot decide whether to invoke a tool.
+  A Lite-only Luna model rejects hosted search rather than silently selecting
+  another model; standalone search remains available.
   Structured result DTOs map back to Anthropic `server_tool_use` and
   `web_search_tool_result` blocks, while standalone text output remains text.
   The proxy locally estimates input and output tokens and reports search usage.
@@ -161,7 +189,7 @@ While the native request is active, the monitor shows `compacting`. Structured l
 
 `CCP_CODEX_RESPONSES_API=1` enables both `POST /v1/responses` and `POST /v1/chat/completions`, backed only by Codex with the proxy's stored ChatGPT OAuth credential.
 
-The Responses route preserves native JSON or SSE response bodies for registered Codex models. The Chat Completions route translates standard text messages, reasoning effort, JSON object or JSON Schema output, and buffered or streaming responses. Its omitted reasoning effort defaults to `medium`; the proxy-wide Codex effort override still takes precedence.
+The Responses route preserves native JSON or SSE response bodies after ID-syntax/capability validation; well-formed model IDs do not need catalog membership. The Chat Completions route translates text, supported `image_url` input parts, reasoning effort, verbosity, service tier, JSON object/Schema output, and buffered or streaming responses; it does not add function-tool support. Omitted effort uses the model's advertised default with a compatibility fallback when metadata is absent; the proxy-wide Codex effort override takes precedence.
 
 The proxy replaces incoming credentials with stored Codex auth for both routes. Response retrieval or deletion, function calling through Chat Completions, and WebSocket ingress are outside their scope. See [HTTP API](/reference/http-api/) for supported Chat Completions fields and error behavior.
 

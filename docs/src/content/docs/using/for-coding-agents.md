@@ -21,19 +21,18 @@ claude-code-proxy models
 curl -s http://127.0.0.1:18765/v1/models
 ```
 
-Use the live Codex catalog rather than maintaining an exhaustive model list in agent memory. Model metadata and ChatGPT account access can change. Claude-style aliases still target Codex, not Anthropic; OpenAI-compatible schemas do not imply Platform API access.
+Use the proxy's authenticated live Codex catalog rather than maintaining an exhaustive model list in agent memory. It is fetched directly with proxy-owned ChatGPT OAuth, no Codex CLI installation or automatic native config/cache reads. Built-in/explicit-import fallback is available; `CCP_CODEX_MODEL_DISCOVERY=0` opts out of discovery network requests. Model metadata and ChatGPT access can change; listing does not guarantee entitlement or quota. Claude-style aliases target Codex, not Anthropic: Fable → Astra, Opus → GPT-6.1 Sol, Sonnet → GPT-6 Sol, Haiku → Luna. Discovery is not an admission allowlist: well-formed opaque IDs pass through for upstream validation even when absent from the catalog. Built-ins are fallback metadata hints. Explicit selection never silently falls back to another model; unknown context metadata requires an explicit safe launch cap.
 
 ## Minimal environment contract
 
-To launch Claude Code through a running local proxy, set:
+Prefer the child-only launcher against a running proxy:
 
 ```sh
-ANTHROPIC_BASE_URL=http://127.0.0.1:18765
-ANTHROPIC_AUTH_TOKEN=unused
-ANTHROPIC_MODEL=<routable-model-id>
-ANTHROPIC_SMALL_FAST_MODEL=<routable-model-id>
-CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1
+claude-code-proxy launch --model fable --small-model haiku
+claude-code-proxy launch --print-env
 ```
+
+It sets client connection/model variables, `ENABLE_TOOL_SEARCH=true`, best-effort gateway discovery, model-derived context/compaction budgets, and nonessential/non-streaming-fallback guards. It does not edit global settings or take over tools. For manual setup use [Configure Claude Code](/using/configure-claude-code/). In the session, `/model fable`, `/model opus`, and `/model sonnet` switch models without exit; remove conflicting proxy-side `CCP_CODEX_MODEL` / `codex.model` forced overrides first.
 
 `ANTHROPIC_*` and `CLAUDE_CODE_*` configure the Claude Code client. `CCP_*`, `PORT`, and `config.json` configure the proxy process. Keep those layers separate when editing settings or debugging a launch.
 

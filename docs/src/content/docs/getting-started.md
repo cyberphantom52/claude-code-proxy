@@ -46,18 +46,25 @@ It listens on `127.0.0.1:18765`. In an interactive terminal it opens the monitor
 Open another terminal and run:
 
 ```sh
-ANTHROPIC_BASE_URL=http://127.0.0.1:18765 \
-ANTHROPIC_AUTH_TOKEN=unused \
-ANTHROPIC_MODEL=gpt-6-sol[1m] \
-ANTHROPIC_SMALL_FAST_MODEL=gpt-6-luna[1m] \
-CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000 \
-CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
-CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
-  claude
+claude-code-proxy launch
 ```
 
 Send a prompt. The request appears in the monitor and the response streams into Claude Code.
 
-The `[1m]` suffix is a Claude Code compaction hint. The proxy removes it before the upstream request. The explicit 272,000 token auto-compact window keeps the local threshold within the ChatGPT context limit used by these models.
+The launcher targets the already-running proxy, sets tool search and model-aware context limits for the child only, and leaves global settings untouched. It prefers Astra for main work and Luna for small requests when listed in the authenticated catalog. Use `launch --model fable --small-model haiku` for explicit family selection, or `launch --print-env` to inspect the environment without starting Claude Code.
 
-For persistent settings and model discovery, continue to [Configure Claude Code](/using/configure-claude-code/) and [Models and routing](/using/models-and-routing/).
+Discovery is default-on and uses the proxy's ChatGPT OAuth directly; no installed Codex CLI, `~/.codex`, or `CODEX_HOME` configuration is needed. For offline catalog selection use `CCP_CODEX_MODEL_DISCOVERY=0` on the proxy/launcher (generation still needs network access). See [Models and routing](/using/models-and-routing/) for the built-in fallback and explicit optional metadata imports.
+
+Switch inside Claude Code without exiting:
+
+```text
+/model fable
+/model opus
+/model sonnet
+```
+
+Fable targets Astra, Opus GPT-6.1 Sol, Sonnet GPT-6 Sol, and Haiku Luna. Well-formed explicit IDs work even when absent from discovery; upstream validates availability and access. Remove conflicting `CCP_CODEX_MODEL` / `codex.model` forced overrides before launching. Model or capability errors never cause substitution with another model.
+
+A 272,000-token active context gives a compaction ceiling of 244,800, reduced further by model metadata when necessary. `[1m]` is not needed and cannot increase upstream capacity. If context metadata is missing, pass a verified safe `--context-window <tokens>`.
+
+Continue to [Configure Claude Code](/using/configure-claude-code/) for launch options and conservative context budgets.

@@ -72,15 +72,30 @@ dashboard leaves the proxy running.
 Start Claude Code in another:
 
 ```sh
-ANTHROPIC_BASE_URL=http://127.0.0.1:18765 \
-ANTHROPIC_AUTH_TOKEN=unused \
-ANTHROPIC_MODEL=gpt-6-sol[1m] \
-ANTHROPIC_SMALL_FAST_MODEL=gpt-6-luna[1m] \
-CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000 \
-CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
-CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
-  claude
+claude-code-proxy launch --model fable --small-model haiku
 ```
+
+`launch` targets the already-running proxy and sets child-only client variables,
+including tool search and model-derived context/compaction limits. It does not
+rewrite global Claude settings. For a 272,000-token active context, the compaction
+window ceiling is 244,800 tokens (or lower model metadata), not the raw limit;
+Claude Code can compact earlier.
+Use `launch --print-env` to inspect the environment without starting Claude.
+
+Switch models inside Claude Code without exiting:
+
+```text
+/model fable
+/model opus
+/model sonnet
+```
+
+Fable maps to `gpt-6-astra`, Opus to `gpt-6.1-sol`, Sonnet to `gpt-6-sol`,
+and Haiku to `gpt-6-luna`. Well-formed explicit IDs pass through even when
+absent from discovery; upstream validates access. Remove conflicting proxy-side
+`CCP_CODEX_MODEL` / `codex.model` overrides before launch. Errors never cause
+substitution with a different model. For an unknown context window, launch
+requires an explicit safe `--context-window`, such as `200000`.
 
 See [Getting started](https://claude-code-proxy.raine.dev/getting-started/)
 for the complete first session.
@@ -98,12 +113,27 @@ The opt-in Images API returns base64 image data and consumes the signed-in accou
 
 ## Codex models and APIs
 
-Run `claude-code-proxy models` for the current Codex catalog. Registered models
-support `-fast`; models offering the ultrafast tier also support `-ultrafast`.
-Account access and quota come from your ChatGPT subscription.
+Run `claude-code-proxy models` for the current catalog, fetched directly with
+proxy-owned ChatGPT OAuth from
+`GET /backend-api/codex/models?client_version=0.163.0`. No installed Codex CLI
+or automatic `~/.codex` / `CODEX_HOME` reads are needed. Built-in models provide
+a fallback; `CCP_CODEX_MODELS_FILE` / `codex.modelsFile` explicitly imports optional
+metadata. Discovery defaults on; `CCP_CODEX_MODEL_DISCOVERY=0` or
+`codex.modelDiscovery=false` opts out of discovery network requests.
+
+The catalog supplies menus, default choices, and known effort, verbosity, lane,
+context, and service-tier metadata—not an admission allowlist. Well-formed
+opaque model IDs are forwarded for upstream validation without substitution.
+`-fast` / `-ultrafast` select supported tiers; paid acceleration is not enabled
+merely by an advertised default tier. Stock Claude Code `/fast` is Opus-only
+and may switch to Opus before sending a request; for other families use
+`/model fable-fast`, `/model sonnet-fast`, or `/model haiku-fast` when supported.
+Catalog advertising does not guarantee account entitlement or quota. See
+[Models and routing](https://claude-code-proxy.raine.dev/using/models-and-routing/)
+for account-scoped cache and fallback behavior.
 
 Anthropic Messages is enabled by default. Set `CCP_CODEX_RESPONSES_API=1` on the
-proxy to enable native Codex Responses and text-only Chat Completions compatibility.
+proxy to enable native Codex Responses and Chat Completions compatibility.
 Images have their separate opt-in gate shown above.
 
 > [!WARNING]

@@ -19,7 +19,7 @@ claude-code-proxy connects Claude Code to OpenAI Codex using your ChatGPT subscr
 
 - Claude Code's tools, skills, hooks, subagents, editor integrations, and terminal interface stay on the client side.
 - The proxy translates Anthropic Messages, tools, images, reasoning summaries, and streaming to Codex.
-- Optional native Codex Responses, text-only Chat Completions compatibility, and image generation/editing reuse the same proxy-owned ChatGPT login.
+- Optional native Codex Responses, Chat Completions compatibility, and image generation/editing reuse the same proxy-owned ChatGPT login.
 - The monitor shows sessions, requests, errors, token use, and throughput.
 
 OpenAI-compatible schemas do not mean OpenAI Platform access. The proxy uses ChatGPT OAuth, not Platform API keys, and does not reuse native Codex CLI credentials.

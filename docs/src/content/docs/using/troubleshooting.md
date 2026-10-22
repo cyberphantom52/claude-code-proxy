@@ -32,7 +32,19 @@ Run:
 claude-code-proxy models
 ```
 
-An unknown local ID returns a catalog in the error. A known Codex ID can still be rejected upstream when the ChatGPT account, subscription, or region lacks access.
+Malformed IDs and incompatible known effort/tier/capability parameters fail locally. Well-formed opaque IDs are forwarded even when absent from discovery; upstream decides availability, entitlement, region, and quota. The catalog supplies menus/defaults/metadata, not an admission allowlist. Fable maps to Astra, Opus to GPT-6.1 Sol, Sonnet to GPT-6 Sol, and Haiku to Luna. Errors never cause substitution with another model. When launching an ID with no context metadata, provide a verified safe `--context-window`, for example `200000`.
+
+If `/model` appears not to change the upstream model, remove conflicting `CCP_CODEX_MODEL` / `codex.model` forced overrides from the proxy before launch, and restart the proxy after changing its configuration. No global Claude settings rewrite is needed.
+
+## `/fast` switches to Opus or fails client checks
+
+Stock Claude Code currently restricts `/fast` to Opus and can change the selected family before making a request. The proxy does not guess the previous family or reverse that client choice. Use supported `/model fable-fast`, `/model sonnet-fast`, or `/model haiku-fast` aliases for other families. Messages `speed: "fast"` requests priority for the actual received model, not a model substitution.
+
+The launcher sets child-only `CLAUDE_CODE_SKIP_FAST_MODE_NETWORK_ERRORS=1` and `CLAUDE_CODE_SKIP_FAST_MODE_ORG_CHECK=1`. These bypass Anthropic client availability checks only; Codex OAuth, tier support, entitlement, and quota still apply, and `/fast` remains Opus-only. There is no documented all-family gateway fast-mode flag. See [fast-mode limits](/using/models-and-routing/#claude-code-fast-is-opus-only).
+
+## Model discovery is unavailable
+
+The proxy fetches the catalog directly using its own OAuth login; native Codex CLI login or installation will not repair it. Check `codex auth status`, endpoint reachability, and whether `CCP_CODEX_MODEL_DISCOVERY=0` / `codex.modelDiscovery: false` explicitly disabled discovery. Failures use a bounded same-account cache, then built-in/explicit-import fallback. Use `CCP_CODEX_MODELS_FILE` / `codex.modelsFile` only for an intentional metadata import; `~/.codex` and `CODEX_HOME` are not automatically read.
 
 ## Background requests fail
 
@@ -44,7 +56,9 @@ Set `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1` for Claude Code. Retrying a pa
 
 ## Session reaches context limits
 
-`[1m]` changes Claude Code's local compaction threshold and does not enlarge upstream context. Use a safe `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, remove `[1m]`, or compact earlier. For ChatGPT GPT-5.6 subscription models, `272000` is the documented setup value.
+Prefer `claude-code-proxy launch` for model-derived context and compaction limits. `[1m]` cannot enlarge upstream context. A 272,000-token active window gives at most a 244,800-token compaction window ceiling, not a raw 272,000 threshold; actual compaction can occur earlier. With default 95% metadata headroom the client context cap is 258,400. Lower limits on either the main or small model reduce these values; a larger `max_context_window` is not the active window.
+
+If metadata lacks an active context window—even if `max_context_window` is present—provide a verified safe `--context-window <tokens>`. The launcher rejects unsafe/ignored compaction windows below 100,000. Use `/compact` early when switching to a smaller model; `/model` does not recompute launch-time environment caps.
 
 ## Codex WebSocket fails
 

@@ -31,13 +31,15 @@ The `monitor` CLI polls this endpoint. There is no corresponding mutation or shu
 
 Accepts an Anthropic Messages request in streaming or non-streaming mode. `POST /v1/messages?beta=true` reaches the same route.
 
-The request `model` selects a registered Codex model or Claude-style alias. The proxy translates supported message content, system prompts, thinking settings, tool definitions, tool choice, tool calls, tool results, images, output configuration, metadata, and streaming behavior to Codex.
+The request `model` selects a well-formed opaque model ID or Claude-style family alias; it need not appear in discovery. The proxy translates supported message content, system prompts, thinking settings, tool definitions, tool choice, tool calls, tool results, images, output configuration, metadata, and streaming behavior to Codex.
+
+`speed: "fast"` explicitly requests Codex priority service for the model received; `speed: "standard"` clears acceleration. This request choice overrides configured service tiers and suffixes, and an unsupported known priority tier errors. Stock Claude Code's `/fast` is currently Opus-only and may switch the model before sending the request; the proxy does not undo that client choice. See [fast-mode limits](/using/models-and-routing/#claude-code-fast-is-opus-only).
 
 Streaming responses use Anthropic SSE events such as `message_start`, `content_block_start`, `content_block_delta`, `content_block_stop`, `message_delta`, and `message_stop`. Non-streaming requests are accumulated from the provider's stream.
 
 Codex responses carry the quota headers Codex reports for the subscription: `x-codex-plan-type`, `x-codex-active-limit`, `x-codex-credits-*`, and, for every limit family, `-used-percent`, `-window-minutes`, `-reset-at`, `-reset-after-seconds`, `-limit-name`, and `-over-secondary-limit-percent`. Which family a window belongs to and how long that window runs come from the headers themselves: a plan may meter a weekly window as `primary` and no secondary window at all. The values are the ones Codex sent for the request being answered. A response that arrives before any telemetry does carries the previous values, or none.
 
-Unknown models return HTTP 400 with the supported catalog. Missing provider auth returns HTTP 401.
+Malformed model IDs and incompatible known controls return local validation errors. Well-formed IDs, including ones absent from discovery, reach upstream for model/access validation without silent substitution. Missing provider auth returns HTTP 401.
 
 ## `POST /v1/messages/count_tokens`
 
@@ -70,7 +72,9 @@ Returns Anthropic-shaped model discovery:
 
 An optional `limit` query truncates `data` and sets `has_more`. The route does not expose a pagination cursor.
 
-Claude Code gateway discovery filters IDs according to its own model rules. See [Models and routing](/using/models-and-routing/).
+The proxy prepares the account-scoped authenticated subscription catalog, using default-on direct upstream discovery with bounded cache/fallback behavior. No native Codex CLI installation or automatic `~/.codex` / `CODEX_HOME` reads are required. The live catalog governs discovered metadata, menus, and default choices, not model admission. Well-formed opaque IDs absent from discovery are still forwarded; hidden returned entries remain explicitly requestable. `supported_in_api: false` is not a subscription access block. Model listing does not guarantee entitlement or quota; see [Models and routing](/using/models-and-routing/).
+
+Claude Code gateway discovery is best-effort and filters IDs according to its own model rules; typed `/model` selection does not depend on picker enumeration.
 
 ## `POST /v1/chat/completions`
 
@@ -82,7 +86,7 @@ curl http://127.0.0.1:18765/v1/chat/completions \
   -d '{"model":"gpt-6-sol","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
-Supports text messages, `reasoning_effort`, `response_format`, `stream_options.include_usage`, `temperature`, `top_p`, and `user`. Reasoning effort defaults to `medium`, and the proxy-wide Codex effort setting takes precedence. Function calls, images, audio, log probabilities, multiple choices, storage, and output token limits are not supported on this compatibility path.
+Supports text messages and `image_url` content parts when the selected model accepts images, plus `reasoning_effort`, `verbosity`, `service_tier`, `parallel_tool_calls`, `response_format`, `stream_options.include_usage`, `temperature`, `top_p`, and `user`. Omitted effort uses the model's advertised default, with a compatibility fallback when metadata is absent; the proxy-wide Codex effort override takes precedence. Explicit incompatible controls fail; sampling controls are rejected on Responses Lite. Accepting `parallel_tool_calls` does not add function-tool support. Function tools/calls, audio, log probabilities, multiple choices, storage, and output token limits remain unsupported.
 
 Non-streaming requests return a `chat.completion` object. Streaming requests return `chat.completion.chunk` events followed by `data: [DONE]`. Unsupported non-null fields return `invalid_request_error` with the field named in `error.param`.
 
@@ -123,13 +127,13 @@ curl http://127.0.0.1:18765/v1/responses \
   -d '{"model":"gpt-6-sol","input":"Hello"}'
 ```
 
-`parallel_tool_calls` is forwarded unchanged. Chat Completions rejects this field because that path does not support function tools. Anthropic Messages can express the corresponding restriction through `tool_choice.disable_parallel_tool_use`.
+`parallel_tool_calls` is validated against the selected model's lane/capabilities on Responses and Chat Completions. Chat Completions still does not accept function tools or calls. Anthropic Messages can express the corresponding restriction through `tool_choice.disable_parallel_tool_use`. Explicit unsupported image, effort, verbosity, reasoning-summary, or service-tier controls fail instead of changing the model or silently downgrading the control.
 
 Stored response retrieval, deletion, and WebSocket client connections are not supported. This is a ChatGPT Codex endpoint adapter, not a full implementation of the public OpenAI Responses service.
 
 ## Model selection and errors
 
-Both OpenAI-compatible routes strip a trailing `[1m]` and resolve Claude-style aliases to Codex. Unknown models return HTTP 400 with the supported catalog. Incoming authorization is not an upstream credential.
+Both OpenAI-compatible routes strip a trailing `[1m]` and resolve Claude-style aliases to Codex. Well-formed opaque IDs otherwise pass through unchanged, even when absent from discovery; upstream validates model availability and entitlement. Malformed IDs and incompatible known parameters fail locally. There is no hardcoded or catalog-membership admission gate and no model substitution. Incoming authorization is not an upstream credential.
 
 Authentication, permission, rate-limit, invalid-request, and upstream failures use the OpenAI error format. Rate-limit responses retain `Retry-After` when supplied.
 
