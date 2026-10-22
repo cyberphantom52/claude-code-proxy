@@ -293,7 +293,7 @@ pub(crate) fn usage_limit_from_event(payload: &Value) -> Option<CodexUsageLimit>
     ) {
         return None;
     }
-    usage_limit_from_payload(payload)
+    usage_limit_from_payload_with_headers(payload, &[])
 }
 
 /// Read a quota exhaustion event while consulting the current HTTP response
@@ -337,10 +337,6 @@ fn is_usage_limit_payload(payload: &Value) -> bool {
         .and_then(|error| error.get("type"))
         .and_then(Value::as_str)
         == Some("usage_limit_reached")
-}
-
-fn usage_limit_from_payload(payload: &Value) -> Option<CodexUsageLimit> {
-    usage_limit_from_payload_with_headers(payload, &[])
 }
 
 fn usage_limit_from_payload_with_headers(

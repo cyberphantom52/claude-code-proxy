@@ -23,7 +23,6 @@ use tokio_tungstenite::{
 };
 
 use crate::logging::create_logger;
-use crate::provider::RequestContext;
 use crate::request_identity::ConversationIdentity;
 use crate::retry::sleep as retry_sleep;
 use crate::traffic::TrafficCapture;
@@ -32,6 +31,7 @@ use super::client::{
     ActualTransport, CodexError, CodexErrorOrigin, CodexResponse, OwnerAwareCodexResponse,
 };
 use super::continuation::ContinuationReservation;
+use super::events::event_is_terminal;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -497,10 +497,6 @@ fn pool_insert_for_turn(reservation: &ContinuationReservation, entry: Arc<PoolEn
     .unwrap_or(false)
 }
 
-fn pool_remove_entry(owner: &ConversationIdentity, entry: &Arc<PoolEntry>) {
-    invalidate_pool_entry(owner, entry);
-}
-
 pub(super) fn invalidate_codex_websocket_pool_socket(
     reservation: &ContinuationReservation,
     socket_id: Option<u64>,
@@ -517,7 +513,7 @@ pub(super) fn invalidate_codex_websocket_pool_socket(
             .cloned()
     });
     if let Some(entry) = entry {
-        pool_remove_entry(owner, &entry);
+        invalidate_pool_entry(owner, &entry);
     }
 }
 
@@ -542,7 +538,6 @@ fn pool_insert_if_vacant_or_same(owner: ConversationIdentity, entry: Arc<PoolEnt
 fn pool_insert(owner: ConversationIdentity, entry: Arc<PoolEntry>) {
     entry.touch();
     let mut guard = WS_POOL.lock().unwrap();
-    // Evict oldest if at capacity
     if guard.len() >= MAX_POOL_ENTRIES
         && let Some(oldest_owner) = guard.keys().next().cloned()
     {
@@ -750,10 +745,6 @@ fn encode_sse(text: &str) -> Vec<u8> {
 // Terminal event detection
 // ---------------------------------------------------------------------------
 
-pub(super) fn is_terminal_event(payload: &serde_json::Value) -> bool {
-    super::events::event_is_terminal(payload)
-}
-
 fn is_response_event(payload: &serde_json::Value) -> bool {
     match payload.get("type").and_then(|v| v.as_str()) {
         Some("error") => true,
@@ -788,15 +779,6 @@ pub(super) fn event_error_status(payload: &serde_json::Value) -> Option<u16> {
     super::events::classify_event_failure(payload).and_then(|failure| failure.explicit_status)
 }
 
-#[allow(dead_code)]
-fn extract_retry_after(payload: &serde_json::Value) -> Option<String> {
-    payload
-        .get("error")
-        .and_then(|e| e.get("retry_after"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-}
-
 // ---------------------------------------------------------------------------
 // Main request function
 // ---------------------------------------------------------------------------
@@ -808,7 +790,6 @@ pub(super) async fn codex_websocket_request(
     url: &str,
     headers: &HeaderMap,
     body_value: &serde_json::Value,
-    _ctx: &RequestContext,
     traffic: Option<&TrafficCapture>,
     connect_timeout_ms: u64,
     idle_timeout_ms: u64,
@@ -878,7 +859,7 @@ pub(super) async fn codex_websocket_request(
     {
         drop(guard);
         if let Some(owner) = pool_owner {
-            pool_remove_entry(owner, &entry);
+            invalidate_pool_entry(owner, &entry);
         }
         if requires_origin {
             return Err(continuation_socket_missing_error());
@@ -902,7 +883,7 @@ pub(super) async fn codex_websocket_request(
         .await
         .map_err(|error| {
             if let Some(owner) = pool_owner {
-                pool_remove_entry(owner, &entry);
+                invalidate_pool_entry(owner, &entry);
             }
             CodexError {
                 status: 0,
@@ -927,21 +908,21 @@ pub(super) async fn codex_websocket_request(
         Ok(result) => result,
         Err(error) => {
             if let Some(owner) = pool_owner {
-                pool_remove_entry(owner, &entry);
+                invalidate_pool_entry(owner, &entry);
             }
             return Err(error);
         }
     };
     let Some(terminal_event) = terminal_event else {
         if let Some(owner) = pool_owner {
-            pool_remove_entry(owner, &entry);
+            invalidate_pool_entry(owner, &entry);
         }
         return Err(missing_terminal_error());
     };
 
     if is_previous_response_missing(&terminal_event.payload) {
         if let Some(owner) = pool_owner {
-            pool_remove_entry(owner, &entry);
+            invalidate_pool_entry(owner, &entry);
         }
         return Err(CodexError {
             status: 0,
@@ -958,7 +939,7 @@ pub(super) async fn codex_websocket_request(
         reservation.is_some_and(|reservation| pool_insert_for_turn(reservation, entry.clone()))
     } else {
         if let Some(owner) = pool_owner {
-            pool_remove_entry(owner, &entry);
+            invalidate_pool_entry(owner, &entry);
         }
         false
     };
@@ -1076,7 +1057,7 @@ pub(super) async fn prepare_codex_websocket(
     {
         drop(guard);
         if let Some(owner) = pool_owner {
-            pool_remove_entry(owner, &entry);
+            invalidate_pool_entry(owner, &entry);
         }
         return Err(if requires_origin {
             continuation_socket_missing_error()
@@ -1142,7 +1123,7 @@ pub(super) fn start_codex_websocket_events(
         if let Err(error) = guard.send(Message::Text(body_json)).await {
             drop(guard);
             if let Some(owner) = pool_owner {
-                pool_remove_entry(owner, &entry);
+                invalidate_pool_entry(owner, &entry);
             }
             socket_id_publisher.publish(None);
             let _ = tx
@@ -1167,7 +1148,7 @@ pub(super) fn start_codex_websocket_events(
                 .is_some_and(|reservation| pool_insert_for_turn(reservation, entry.clone()))
         } else {
             if let Some(owner) = pool_owner {
-                pool_remove_entry(owner, &entry);
+                invalidate_pool_entry(owner, &entry);
             }
             false
         };
@@ -1177,7 +1158,7 @@ pub(super) fn start_codex_websocket_events(
             && origin_reinserted
             && let Some(owner) = pool_owner
         {
-            pool_remove_entry(owner, &entry);
+            invalidate_pool_entry(owner, &entry);
         }
     });
     receiver
@@ -1190,7 +1171,6 @@ pub(super) async fn codex_websocket_event_stream(
     url: &str,
     headers: &HeaderMap,
     body_value: &serde_json::Value,
-    _ctx: &RequestContext,
     traffic: Option<Arc<TrafficCapture>>,
     connect_timeout_ms: u64,
     idle_timeout_ms: u64,
@@ -2224,7 +2204,7 @@ where
                 }
 
                 // Check for terminal events
-                if is_terminal_event(&parsed) {
+                if event_is_terminal(&parsed) {
                     terminal_event = Some(WsEvent {
                         event_type: parsed
                             .get("type")
@@ -2257,7 +2237,6 @@ where
                 continue;
             }
             Some(Ok(Message::Frame(_))) => {
-                // Raw frame passthrough - continue
                 continue;
             }
             Some(Ok(Message::Close(_))) => {
@@ -2403,7 +2382,7 @@ where
                     status = event_error_status(&parsed).unwrap_or(500);
                 }
 
-                if is_terminal_event(&parsed) {
+                if event_is_terminal(&parsed) {
                     if is_previous_response_missing(&parsed) {
                         terminal_item = Some(Err(CodexError {
                             status: 0,
@@ -3330,22 +3309,22 @@ mod tests {
     #[test]
     fn is_terminal_event_detection() {
         let completed = serde_json::json!({"type": "response.completed"});
-        assert!(is_terminal_event(&completed));
+        assert!(event_is_terminal(&completed));
 
         let done = serde_json::json!({"type": "response.done"});
-        assert!(is_terminal_event(&done));
+        assert!(event_is_terminal(&done));
 
         let delta = serde_json::json!({"type": "response.output_text.delta"});
-        assert!(!is_terminal_event(&delta));
+        assert!(!event_is_terminal(&delta));
 
         let error = serde_json::json!({"type": "error", "error": {"message": "fail"}});
-        assert!(is_terminal_event(&error));
+        assert!(event_is_terminal(&error));
 
         let response_error = serde_json::json!({
             "type": "response.error",
             "response": {"error": {"message": "fail"}}
         });
-        assert!(is_terminal_event(&response_error));
+        assert!(event_is_terminal(&response_error));
     }
 
     #[test]
@@ -3431,7 +3410,7 @@ mod tests {
 
         let replacement = Arc::new(PoolEntry::new(create_dummy_stream_async().await));
         pool_insert(owner.clone(), replacement.clone());
-        pool_remove_entry(&owner, &first);
+        invalidate_pool_entry(&owner, &first);
         let reservation = test_continuation(Some(owner.clone()), None, None, None);
         invalidate_codex_websocket_pool_socket(&reservation, Some(first.socket_id));
         assert!(Arc::ptr_eq(
@@ -3691,22 +3670,12 @@ mod tests {
                 }
             }
         });
-        let context = RequestContext {
-            notification_id: None,
-            req_id: "terminal-order-request".to_string(),
-            session_id: Some("header-session-is-not-pool-owner".to_string()),
-            session_seq: None,
-            provider: "codex".to_string(),
-            traffic: None,
-            monitor: None,
-        };
         let mut events = codex_websocket_event_stream(
             &test_websocket_client(),
             &WebSocketProxyConfig::direct(),
             &format!("http://{addr}/responses"),
             &HeaderMap::new(),
             &serde_json::json!({"type":"response.create","input":[]}),
-            &context,
             None,
             1_000,
             1_000,

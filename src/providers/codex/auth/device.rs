@@ -71,12 +71,6 @@ impl DeviceAuthClient {
         }
     }
 
-    #[cfg(test)]
-    pub fn with_sleeper(mut self, sleeper: Box<dyn Sleeper>) -> Self {
-        self.sleeper = sleeper;
-        self
-    }
-
     pub fn init(&self) -> Result<DeviceInit, anyhow::Error> {
         let body = serde_json::json!({ "client_id": CLIENT_ID });
         let resp = self

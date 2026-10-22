@@ -222,7 +222,6 @@ impl CodexImagesBackend {
             ));
         }
         if !status.is_success() {
-            // EFFICIENCY: for error responses, consume a small diagnostic prefix rather than full body
             let mut response = image_error_response(ImageRequestError {
                 status,
                 message: format!("Codex image service returned HTTP {}", status.as_u16()),

@@ -1778,7 +1778,6 @@ impl CodexHttpClient {
                         &self.base_url,
                         &ws_headers,
                         &ws_body,
-                        ctx,
                         ctx.traffic.as_deref(),
                         super::websocket::WEBSOCKET_CONNECT_TIMEOUT_MS,
                         super::websocket::WEBSOCKET_IDLE_TIMEOUT_MS,
@@ -1804,7 +1803,6 @@ impl CodexHttpClient {
                         &self.base_url,
                         &ws_headers,
                         &ws_body,
-                        ctx,
                         ctx.traffic.as_deref(),
                         super::websocket::WEBSOCKET_CONNECT_TIMEOUT_MS,
                         super::websocket::WEBSOCKET_IDLE_TIMEOUT_MS,
@@ -2191,7 +2189,6 @@ impl CodexHttpClient {
                 &self.base_url,
                 &ws_headers,
                 &ws_body,
-                &ctx,
                 ctx.traffic.clone(),
                 super::websocket::WEBSOCKET_CONNECT_TIMEOUT_MS,
                 super::websocket::WEBSOCKET_IDLE_TIMEOUT_MS,
@@ -2353,7 +2350,7 @@ impl CodexHttpClient {
                 }
 
                 let terminal = item.as_ref().is_err()
-                    || item.as_ref().is_ok_and(super::websocket::is_terminal_event);
+                    || item.as_ref().is_ok_and(super::events::event_is_terminal);
                 match item {
                     Ok(payload) => match super::events::classify_stream_event(&payload) {
                         super::events::CodexStreamEventKind::TerminalFailure => {
@@ -3393,9 +3390,6 @@ fn is_retryable_transport_error(err: &CodexError) -> bool {
         if err.detail.as_deref() == Some(super::websocket::WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL) {
             return false;
         }
-        return err.status == 0 || should_retry_codex_status(err.status);
-    }
-    if err.detail.as_deref() == Some("websocket_pre_request") {
         return err.status == 0 || should_retry_codex_status(err.status);
     }
     if err.detail.as_deref() == Some(super::websocket::WEBSOCKET_KEEPALIVE_FAILURE_DETAIL) {
@@ -5788,14 +5782,14 @@ mod tests {
     }
 
     #[test]
-    fn websocket_pre_request_502_is_retryable() {
+    fn websocket_handshake_502_is_retryable() {
         let err = CodexError {
             status: 502,
             message: "WebSocket connect error".to_string(),
-            detail: Some("websocket_pre_request".to_string()),
+            detail: None,
             retry_after: Some("3".to_string()),
             usage_limit: None,
-            origin: CodexErrorOrigin::WebSocket,
+            origin: CodexErrorOrigin::WebSocketHandshake,
         };
 
         assert!(is_retryable_transport_error(&err));
@@ -5819,28 +5813,28 @@ mod tests {
     }
 
     #[test]
-    fn websocket_pre_request_statusless_error_is_retryable() {
+    fn websocket_handshake_statusless_error_is_retryable() {
         let err = CodexError {
             status: 0,
             message: "WebSocket connect timeout after 15000ms".to_string(),
-            detail: Some("websocket_pre_request".to_string()),
+            detail: None,
             retry_after: None,
             usage_limit: None,
-            origin: CodexErrorOrigin::WebSocket,
+            origin: CodexErrorOrigin::WebSocketHandshake,
         };
 
         assert!(is_retryable_transport_error(&err));
     }
 
     #[test]
-    fn websocket_pre_request_400_is_not_retryable() {
+    fn websocket_handshake_400_is_not_retryable() {
         let err = CodexError {
             status: 400,
             message: "WebSocket connect error".to_string(),
-            detail: Some("websocket_pre_request".to_string()),
+            detail: None,
             retry_after: None,
             usage_limit: None,
-            origin: CodexErrorOrigin::WebSocket,
+            origin: CodexErrorOrigin::WebSocketHandshake,
         };
 
         assert!(!is_retryable_transport_error(&err));

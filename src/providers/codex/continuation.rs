@@ -471,7 +471,7 @@ pub fn is_current_turn(session_id: Option<&str>, turn_id: Option<u64>) -> bool {
     is_current_turn_inner(owner.as_ref(), turn_id)
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn is_current_turn_for_owner(reservation: &ContinuationReservation) -> bool {
     is_current_turn_inner(reservation.owner(), reservation.turn_id())
 }

@@ -66,7 +66,6 @@ const MAX_EMPTY_COMPLETION_RETRIES: u32 = 2;
 const EMPTY_COMPLETION_RETRY_BUDGET: Duration = Duration::from_secs(60);
 const EMPTY_CODEX_COMPLETION_DETAIL: &str = "empty_codex_completion";
 const LIVE_STREAM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
-use self::translate::stream::translate_stream_bytes_with_traffic;
 
 // ---------------------------------------------------------------------------
 // Provider
@@ -488,82 +487,36 @@ impl CodexProvider {
             ])),
         );
 
-        if want_stream {
-            let estimated_input_tokens = count_translated_tokens(&translated);
-            let sse_bytes = match translate_stream_bytes_with_traffic(
-                &upstream.body,
-                &message_id,
-                model,
-                estimated_input_tokens,
-                ctx.traffic.as_deref(),
-            ) {
-                Ok(b) => b,
-                Err(e) => {
-                    abort_compaction_attempt(ctx.session_id.as_deref(), compaction_attempt);
-                    abort_continuation_for_owner(&request_continuation);
-                    return map_codex_failure_to_response(&format!(
-                        "Stream translation error: {e}"
-                    ));
-                }
-            };
-            if let Some(monitor) = ctx.monitor.as_ref() {
-                let (input_tokens, output_tokens) = usage_from_anthropic_sse(&sse_bytes);
-                monitor.stream_progress(
-                    &ctx.req_id,
-                    sse_bytes.len() as u64,
-                    count_sse_events(&sse_bytes),
-                    input_tokens,
-                    output_tokens,
-                );
-            }
-            update_continuation_from_upstream(
-                ctx.session_id.as_deref(),
-                &request_continuation,
-                compaction_attempt,
-                &translated,
-                &upstream.body,
-                upstream.socket_id,
-                compact_boundary,
-            );
-
-            let headers = [
-                (http::header::CONTENT_TYPE, "text/event-stream"),
-                (http::header::CACHE_CONTROL, "no-cache"),
-                (http::header::CONNECTION, "keep-alive"),
-            ];
-            (headers, sse_bytes).into_response()
-        } else {
-            match accumulate_response_with_traffic(
-                &upstream.body,
-                &message_id,
-                model,
-                ctx.traffic.as_deref(),
-            ) {
-                Ok(json) => {
-                    if let Some(monitor) = ctx.monitor.as_ref() {
-                        monitor.usage_updated(
-                            &ctx.req_id,
-                            json.pointer("/usage/input_tokens").and_then(|v| v.as_u64()),
-                            json.pointer("/usage/output_tokens")
-                                .and_then(|v| v.as_u64()),
-                        );
-                    }
-                    update_continuation_from_upstream(
-                        ctx.session_id.as_deref(),
-                        &request_continuation,
-                        compaction_attempt,
-                        &translated,
-                        &upstream.body,
-                        upstream.socket_id,
-                        compact_boundary,
+        match accumulate_response_with_traffic(
+            &upstream.body,
+            &message_id,
+            model,
+            ctx.traffic.as_deref(),
+        ) {
+            Ok(json) => {
+                if let Some(monitor) = ctx.monitor.as_ref() {
+                    monitor.usage_updated(
+                        &ctx.req_id,
+                        json.pointer("/usage/input_tokens").and_then(|v| v.as_u64()),
+                        json.pointer("/usage/output_tokens")
+                            .and_then(|v| v.as_u64()),
                     );
-                    (StatusCode::OK, Json(json)).into_response()
                 }
-                Err(e) => {
-                    abort_compaction_attempt(ctx.session_id.as_deref(), compaction_attempt);
-                    abort_continuation_for_owner(&request_continuation);
-                    map_codex_failure_to_response(&format!("Accumulation error: {e}"))
-                }
+                update_continuation_from_upstream(
+                    ctx.session_id.as_deref(),
+                    &request_continuation,
+                    compaction_attempt,
+                    &translated,
+                    &upstream.body,
+                    upstream.socket_id,
+                    compact_boundary,
+                );
+                (StatusCode::OK, Json(json)).into_response()
+            }
+            Err(e) => {
+                abort_compaction_attempt(ctx.session_id.as_deref(), compaction_attempt);
+                abort_continuation_for_owner(&request_continuation);
+                map_codex_failure_to_response(&format!("Accumulation error: {e}"))
             }
         }
     }
@@ -1211,7 +1164,7 @@ async fn live_stream_response_once(
         };
         pending_chunk.extend_from_slice(&chunk);
         if terminal
-            && is_codex_success_terminal_event(&payload)
+            && events::event_is_success_terminal(&payload)
             && !translator.has_semantic_output()
         {
             // Record shape only; never log prompt or generated content by default.
@@ -1686,9 +1639,7 @@ fn append_upstream_sse_payload(buffer: &mut Vec<u8>, payload: &serde_json::Value
     buffer.push(b'\n');
 }
 
-/// Keeps the quota numbers a `codex.rate_limits` event carries, so the response
-/// to the request after this one can pass them to the client. Every other event
-/// leaves the snapshot alone.
+/// Records quota telemetry from `codex.rate_limits` events.
 fn record_rate_limit_telemetry(payload: &serde_json::Value) {
     if payload.get("type").and_then(|value| value.as_str()) == Some("codex.rate_limits") {
         rate_limits::record(rate_limits::event_headers(payload));
@@ -1745,10 +1696,6 @@ fn is_empty_codex_success_completion(upstream_sse: &[u8]) -> bool {
         }
     }
     saw_success_terminal
-}
-
-fn is_codex_success_terminal_event(payload: &serde_json::Value) -> bool {
-    events::event_is_success_terminal(payload)
 }
 
 fn retryable_live_start_codex_error(err: &client::CodexError) -> bool {
