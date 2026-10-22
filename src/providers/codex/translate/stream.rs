@@ -492,6 +492,103 @@ mod tests {
     }
 
     #[test]
+    fn actual_service_tier_usage_matches_buffered_and_live_responses() {
+        use crate::anthropic::sse::parse_sse_events;
+        use crate::providers::codex::translate::{
+            accumulate::accumulate_response, live_stream::LiveStreamTranslator,
+        };
+        use serde_json::{Value, json};
+
+        let terminal_usage = |bytes: &[u8]| {
+            parse_sse_events(bytes)
+                .into_iter()
+                .filter_map(|event| serde_json::from_str::<Value>(&event.data).ok())
+                .find(|event| event["type"] == "message_delta")
+                .unwrap()["usage"]
+                .clone()
+        };
+        for (created, completed, speed) in [
+            (Some("priority"), None, Some("fast")),
+            (Some("default"), None, Some("standard")),
+            (None, Some("priority"), Some("fast")),
+            (None, Some("ultrafast"), Some("fast")),
+            (None, Some("default"), Some("standard")),
+            (None, Some("standard"), Some("standard")),
+            (None, Some("flex"), Some("standard")),
+            (Some("priority"), Some("default"), Some("standard")),
+            (Some("default"), Some("priority"), Some("fast")),
+            (Some("priority"), Some("future-tier"), None),
+            (Some("priority"), Some("auto"), None),
+            (Some("future-tier"), None, None),
+            (None, None, None),
+        ] {
+            for with_usage in [true, false] {
+                let mut created_response = json!({"metadata":{"service_tier":"priority"}});
+                if let Some(tier) = created {
+                    created_response["service_tier"] = json!(tier);
+                }
+                let mut completed_response = json!({});
+                if let Some(tier) = completed {
+                    completed_response["service_tier"] = json!(tier);
+                }
+                if with_usage {
+                    completed_response["usage"] = json!({
+                        "input_tokens":100, "output_tokens":50,
+                        "input_tokens_details":{"cached_tokens":20},
+                        "output_tokens_details":{"reasoning_tokens":30}
+                    });
+                }
+                let trace = [
+                    json!({"type":"response.created", "response":created_response}),
+                    json!({"type":"codex.rate_limits", "plan_type":"pro",
+                        "rate_limits":{"primary":{"used_percent":8.0}}}),
+                    json!({"type":"response.completed", "response":completed_response}),
+                ];
+                // Even a fast model alias is not evidence of the tier actually served.
+                let model = "gpt-5.5-fast";
+                let mut live = LiveStreamTranslator::new("msg_1", model);
+                let mut live_bytes = Vec::new();
+                let mut upstream = String::new();
+                for event in &trace {
+                    live_bytes.extend(live.accept(event, None).unwrap());
+                    upstream.push_str(&format!("data: {event}\n\n"));
+                }
+                let buffered = translate_stream_bytes(upstream.as_bytes(), "msg_1", model).unwrap();
+                let accumulated = accumulate_response(upstream.as_bytes(), "msg_1", model).unwrap();
+                let mut expected = json!({
+                    "input_tokens":0, "output_tokens":0,
+                    "cache_creation_input_tokens":0, "cache_read_input_tokens":0,
+                    "codex_rate_limits":{"plan_type":"pro", "primary":{"used_percent":8.0}}
+                });
+                if with_usage {
+                    expected["input_tokens"] = json!(80);
+                    expected["output_tokens"] = json!(50);
+                    expected["cache_read_input_tokens"] = json!(20);
+                    expected["output_tokens_details"] =
+                        json!({"reasoning_tokens":30,"thinking_tokens":30});
+                }
+                if let Some(speed) = speed {
+                    expected["speed"] = json!(speed);
+                }
+                assert_eq!(
+                    terminal_usage(&live_bytes),
+                    expected,
+                    "live {created:?}/{completed:?}"
+                );
+                assert_eq!(
+                    terminal_usage(&buffered),
+                    expected,
+                    "SSE {created:?}/{completed:?}"
+                );
+                assert_eq!(
+                    accumulated["usage"], expected,
+                    "JSON {created:?}/{completed:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn stream_translates_text_response() {
         let upstream = format!(
             "{}{}{}{}",

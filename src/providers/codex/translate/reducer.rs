@@ -50,6 +50,8 @@ pub struct CodexUsage {
     pub output_tokens: Option<u64>,
     pub input_tokens_details_cached: Option<u64>,
     pub output_tokens_details_reasoning: Option<u64>,
+    /// Actual tier reported by the response, not the requested tier.
+    pub service_tier: Option<String>,
     /// Latest `codex.rate_limits` snapshot seen on the stream that produced
     /// this usage. Codex sends it as its own event before any usage exists,
     /// so the translator carries it here for the mapper.
@@ -309,6 +311,7 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
     let mut active_thinking: Option<ActiveThinking> = None;
     let mut saw_tool_use = false;
     let mut final_usage: Option<CodexUsage> = None;
+    let mut service_tier: Option<String> = None;
     let mut latest_rate_limits: Option<Box<CodexRateLimits>> = None;
     let mut response_id: Option<String> = None;
     let mut terminal_type: Option<String> = None;
@@ -426,6 +429,14 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                 retry_after_seconds,
                 diagnostics: None,
             });
+        }
+
+        if t == "response.created" {
+            service_tier = p
+                .pointer("/response/service_tier")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+            continue;
         }
 
         if t == "codex.rate_limits" {
@@ -841,6 +852,7 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                 .map(|s| s.to_string());
             final_usage = p.get("response").map(parse_codex_usage);
             if let Some(usage) = final_usage.as_mut() {
+                usage.service_tier = usage.service_tier.take().or(service_tier.take());
                 usage.rate_limits = latest_rate_limits.clone();
             }
             continuation_eligible = t == "response.completed" || t == "response.done";
@@ -932,12 +944,13 @@ fn describe_open_blocks(
     out
 }
 
-fn parse_codex_usage(response: &serde_json::Value) -> CodexUsage {
-    let usage = match response.get("usage") {
-        Some(u) => u,
-        None => return CodexUsage::default(),
-    };
+pub(super) fn parse_codex_usage(response: &serde_json::Value) -> CodexUsage {
+    let usage = response.get("usage").unwrap_or(&serde_json::Value::Null);
     CodexUsage {
+        service_tier: response
+            .get("service_tier")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
         input_tokens: usage.get("input_tokens").and_then(|v| v.as_u64()),
         output_tokens: usage.get("output_tokens").and_then(|v| v.as_u64()),
         input_tokens_details_cached: usage
@@ -1069,6 +1082,11 @@ pub fn map_codex_usage_to_anthropic(
     let input_tokens = total_input.saturating_sub(cached);
 
     let mut result = AnthropicUsage {
+        speed: match usage.service_tier.as_deref() {
+            Some("priority" | "ultrafast") => Some("fast".to_string()),
+            Some("default" | "standard" | "flex") => Some("standard".to_string()),
+            _ => None,
+        },
         input_tokens,
         output_tokens: usage.output_tokens.unwrap_or(0),
         cache_creation_input_tokens: 0,
@@ -1096,6 +1114,9 @@ pub fn map_codex_usage_to_anthropic(
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct AnthropicUsage {
+    /// Only report speed when an upstream response confirms a known tier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed: Option<String>,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_creation_input_tokens: u64,
@@ -1544,6 +1565,7 @@ mod tests {
     #[test]
     fn map_usage_reports_cached_prompt_tokens() {
         let usage = CodexUsage {
+            service_tier: None,
             input_tokens: Some(100),
             output_tokens: Some(50),
             input_tokens_details_cached: Some(20),
@@ -1561,6 +1583,7 @@ mod tests {
     #[test]
     fn map_usage_reports_reasoning_and_rate_limits() {
         let usage = CodexUsage {
+            service_tier: None,
             input_tokens: Some(100),
             output_tokens: Some(50),
             input_tokens_details_cached: None,

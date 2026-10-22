@@ -8,7 +8,7 @@ use super::read_rewrite::{repair_whitespace_stalled_read_args, sanitize_read_arg
 use super::reasoning_signature::{PendingReasoning, encode_reasoning_signature};
 use super::reducer::{
     CodexRateLimits, CodexUsage, STOP_END_TURN, STOP_TOOL_USE, map_codex_usage_to_anthropic,
-    parse_codex_rate_limits,
+    parse_codex_rate_limits, parse_codex_usage,
 };
 
 pub(crate) const BUFFERED_TOOL_MAX_ARGS_BYTES: usize = 5_000_000;
@@ -160,6 +160,7 @@ pub struct LiveStreamTranslator {
     // Latest `codex.rate_limits` event seen on this stream; handed to the
     // usage mapper at finish so the terminal usage block carries the meter.
     rate_limits: Option<Box<CodexRateLimits>>,
+    service_tier: Option<String>,
 }
 
 impl LiveStreamTranslator {
@@ -191,6 +192,7 @@ impl LiveStreamTranslator {
             estimated_input_tokens,
             finished: false,
             rate_limits: None,
+            service_tier: None,
         }
     }
 
@@ -215,7 +217,14 @@ impl LiveStreamTranslator {
                 self.rate_limits = parse_codex_rate_limits(payload).or(self.rate_limits.take());
                 self.emit_ping(traffic, &mut out);
             }
-            "keepalive" | "response.created" | "response.in_progress" => {
+            "response.created" => {
+                self.service_tier = payload
+                    .pointer("/response/service_tier")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned);
+                self.emit_ping(traffic, &mut out);
+            }
+            "keepalive" | "response.in_progress" => {
                 self.emit_ping(traffic, &mut out);
             }
             "response.web_search_call.in_progress"
@@ -292,6 +301,7 @@ impl LiveStreamTranslator {
         self.close_thinking(traffic, &mut out);
         self.reasoning_by_output_index.clear();
         self.item_id_to_output_index.clear();
+        self.service_tier = None;
         // Preserve message_started and anthropic_index: one downstream message,
         // with fresh block indices for the replacement generation.
         out
@@ -1117,6 +1127,7 @@ impl LiveStreamTranslator {
         self.ensure_message_start(traffic, out);
         let mut usage = payload.get("response").map(parse_codex_usage);
         if let Some(usage) = usage.as_mut() {
+            usage.service_tier = usage.service_tier.take().or(self.service_tier.take());
             usage.rate_limits = self.rate_limits.clone();
         }
         let stop_reason = if self.saw_tool_use {
@@ -1296,26 +1307,6 @@ fn output_index(payload: &serde_json::Value) -> usize {
         .unwrap_or(0) as usize
 }
 
-fn parse_codex_usage(response: &serde_json::Value) -> CodexUsage {
-    let usage = match response.get("usage") {
-        Some(u) => u,
-        None => return CodexUsage::default(),
-    };
-    CodexUsage {
-        input_tokens: usage.get("input_tokens").and_then(|v| v.as_u64()),
-        output_tokens: usage.get("output_tokens").and_then(|v| v.as_u64()),
-        input_tokens_details_cached: usage
-            .get("input_tokens_details")
-            .and_then(|d| d.get("cached_tokens"))
-            .and_then(|v| v.as_u64()),
-        output_tokens_details_reasoning: usage
-            .get("output_tokens_details")
-            .and_then(|d| d.get("reasoning_tokens"))
-            .and_then(|v| v.as_u64()),
-        rate_limits: None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1329,6 +1320,30 @@ mod tests {
             out.extend(translator.accept(&event, None).unwrap());
         }
         String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn reconnect_discards_previous_response_service_tier() {
+        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.5");
+        translator
+            .accept(
+                &json!({"type":"response.created", "response":{"service_tier":"priority"}}),
+                None,
+            )
+            .unwrap();
+        translator.prepare_reconnect(None);
+        let out = translator
+            .accept(
+                &json!({"type":"response.completed", "response":{"usage":{}}}),
+                None,
+            )
+            .unwrap();
+        let delta = parse_sse_events(&out)
+            .into_iter()
+            .filter_map(|event| serde_json::from_str::<serde_json::Value>(&event.data).ok())
+            .find(|event| event["type"] == "message_delta")
+            .unwrap();
+        assert!(delta["usage"].get("speed").is_none());
     }
 
     #[test]
