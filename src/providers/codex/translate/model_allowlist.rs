@@ -244,13 +244,7 @@ pub fn model_reasoning_summary(
         .map(str::to_string)
         .or_else(|| metadata.as_ref()?.default_reasoning_summary.clone())
         .or_else(|| fallback.map(str::to_string));
-    Ok(summary.map(|summary| {
-        if summary == "off" {
-            "none".to_string()
-        } else {
-            summary
-        }
-    }))
+    Ok(summary.filter(|summary| !matches!(summary.as_str(), "off" | "none")))
 }
 
 pub fn model_verbosity(model: &str, requested: Option<&str>) -> anyhow::Result<Option<String>> {

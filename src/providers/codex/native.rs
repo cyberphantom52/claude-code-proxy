@@ -203,9 +203,9 @@ fn apply_native_capabilities(
         }
     }
 
-    let mut reasoning = match object.get("reasoning") {
+    let mut reasoning = match object.get_mut("reasoning") {
         None | Some(Value::Null) => Map::new(),
-        Some(Value::Object(reasoning)) => reasoning.clone(),
+        Some(Value::Object(reasoning)) => std::mem::take(reasoning),
         Some(_) => {
             return Err(invalid_capability(
                 "reasoning",
