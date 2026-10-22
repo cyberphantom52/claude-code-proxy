@@ -72,15 +72,14 @@ dashboard leaves the proxy running.
 Start Claude Code in another:
 
 ```sh
-claude-code-proxy launch --model fable --small-model haiku
+ANTHROPIC_BASE_URL=http://127.0.0.1:18765 \
+ANTHROPIC_AUTH_TOKEN=unused \
+  claude
 ```
 
-`launch` targets the already-running proxy and sets child-only client variables,
-including tool search and model-derived context/compaction limits. It does not
-rewrite global Claude settings. For a 272,000-token active context, the compaction
-window ceiling is 244,800 tokens (or lower model metadata), not the raw limit;
-Claude Code can compact earlier.
-Use `launch --print-env` to inspect the environment without starting Claude.
+These connection settings apply only to this command; no global settings change
+is needed. Optionally add `ANTHROPIC_MODEL=fable` and
+`ANTHROPIC_SMALL_FAST_MODEL=haiku` to select main and background model families.
 
 Switch models inside Claude Code without exiting:
 
@@ -93,9 +92,9 @@ Switch models inside Claude Code without exiting:
 Fable maps to `gpt-6-astra`, Opus to `gpt-6.1-sol`, Sonnet to `gpt-6-sol`,
 and Haiku to `gpt-6-luna`. Well-formed explicit IDs pass through even when
 absent from discovery; upstream validates access. Remove conflicting proxy-side
-`CCP_CODEX_MODEL` / `codex.model` overrides before launch. Errors never cause
-substitution with a different model. For an unknown context window, launch
-requires an explicit safe `--context-window`, such as `200000`.
+`CCP_CODEX_MODEL` / `codex.model` overrides on the proxy. Errors never cause
+substitution with a different model. `[1m]` cannot increase the upstream context
+window; Claude Code manages client compaction independently.
 
 See [Getting started](https://claude-code-proxy.raine.dev/getting-started/)
 for the complete first session.

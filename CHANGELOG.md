@@ -359,7 +359,7 @@ description: Release notes for claude-code-proxy.
   CLI, preventing either application from invalidating the other's login. Users
   who relied on the native Codex login must sign in to the proxy once after
   upgrading.
-- [Expanded guidance](https://github.com/raine/claude-code-proxy/#switching-models-and-backends)
+- [Expanded guidance](https://claude-code-proxy.raine.dev/using/switching-models-and-backends/)
   explains how to switch models within the proxy and how to switch between the
   proxy and direct Anthropic.
 

@@ -1,6 +1,6 @@
 ---
 title: Models and routing
-description: Discover subscription Codex models and select family aliases, supported service tiers, and safe context defaults.
+description: Discover subscription Codex models and select family aliases and supported service tiers.
 ---
 
 All model requests use Codex. Claude-style names are compatibility aliases, not access to Anthropic models.
@@ -51,27 +51,18 @@ Stock Claude Code currently supports `/fast` only on Opus and may switch another
 /model haiku-fast
 ```
 
-The proxy's `speed` mapping preserves whatever model the client actually sends; it does not make stock `/fast` an all-family control. There is no documented gateway flag that enables fast mode for every family. The launcher sets child-only `CLAUDE_CODE_SKIP_FAST_MODE_NETWORK_ERRORS=1` and `CLAUDE_CODE_SKIP_FAST_MODE_ORG_CHECK=1` to bypass Anthropic client availability checks, without changing global settings. These do not bypass Codex OAuth, model/tier support, entitlement, billing, or quota. The stock CLI's Opus-only `/fast` restriction still applies. See Claude Code's [fast mode documentation](https://code.claude.com/docs/en/fast-mode).
+The proxy's `speed` mapping preserves whatever model the client actually sends; it does not make stock `/fast` an all-family control. There is no documented gateway flag that enables fast mode for every family. Client availability checks do not bypass Codex OAuth, model/tier support, entitlement, billing, or quota. See Claude Code's [fast mode documentation](https://code.claude.com/docs/en/fast-mode).
 
 The proxy uses model metadata for default effort, reasoning summaries, verbosity, Responses lane, and context limits. Explicit incompatible controls fail. Missing metadata means unknown, not unsupported; it retains the compatibility fallback rather than treating an absent flag as `false`. Discovery supplies model metadata only: it does not fetch or execute prompts or take over Claude Code's tools.
 
 ## Context and small models
 
-Use the launcher for model-derived client limits:
+`ANTHROPIC_MODEL` selects the main model and `ANTHROPIC_SMALL_FAST_MODEL` independently selects the background model when starting `claude`; see [Configure Claude Code](/using/configure-claude-code/).
 
-```sh
-claude-code-proxy launch --model fable --small-model haiku
-claude-code-proxy launch --model opus --small-model sonnet --print-env
-```
-
-It targets an already-running proxy. The client context cap uses the smaller usable budget of the two models, including metadata safety headroom (95% by default); compaction uses at most 90% of the active window, further capped by advertised compaction metadata and usable budget. For a 272,000-token active context with default headroom, the client cap is **258,400** and the compaction window ceiling is **244,800**, not 272,000. Actual compaction can happen earlier. A larger `max_context_window`, such as 872,000, never becomes the active window. If active context is unknown—even when a maximum is advertised—supply a known-safe `--context-window <tokens>`; this flag cannot raise an advertised limit. The launcher rejects safe compaction windows below the client's supported 100,000-token minimum and caps them at 1,000,000.
-
-Explicit IDs absent from metadata are accepted, but the launcher requires an explicit safe capacity, for example `claude-code-proxy launch --model future-model --context-window 200000`; this does not assert upstream availability. `--print-env` can inspect the result without launching Claude.
-
-`[1m]` is only a Claude Code compatibility hint, stripped before upstream matching. It does not enlarge Codex capacity. The small model handles background work independently of the main model. If you switch to a model with a smaller context during a session, compact early and keep the launch cap safe for all models you plan to use.
+`[1m]` is only a Claude Code compatibility hint, stripped before upstream matching. It does not enlarge Codex capacity. Claude Code's client compaction is independent of upstream metadata; a larger advertised `max_context_window` does not establish the active subscription window. If you switch to a smaller model during a session, compact early with `/compact`.
 
 ## Switching and gateway discovery
 
 Within Claude Code, use `/model fable`, `/model opus`, `/model sonnet`, or an explicit Codex ID. No exit or global `settings.json` rewrite is needed. See [Switching models](/using/switching-models/) for examples and forced-model override conflicts.
 
-The launcher sets `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` for the client's best-effort gateway picker. For manual launches you can set it before starting Claude Code. `/v1/models` includes Codex IDs and Claude-style aliases, but picker enumeration depends on the client build and its own filters; it is not a guarantee that every raw Codex ID appears. Typed `/model` aliases and Codex IDs work independently of the picker. Client gateway discovery is separate from the proxy's default-on upstream catalog discovery.
+`/v1/models` includes Codex IDs and Claude-style aliases, but picker enumeration depends on the client build and its own filters; it is not a guarantee that every raw Codex ID appears. Typed `/model` aliases and Codex IDs work independently of the picker. Client gateway discovery is separate from the proxy's default-on upstream catalog discovery.

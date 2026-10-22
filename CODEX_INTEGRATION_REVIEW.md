@@ -177,6 +177,8 @@ The release CLI was also checked with isolated `CCP_CONFIG_DIR`, `CODEX_HOME` an
 
 ## Model-aware integration follow-up
 
+This section records the `fe1b5db` delivery snapshot. The subsequent cleanup removes its optional launcher and startup context policy; authenticated discovery, alias routing and model-aware request capabilities remain.
+
 Implemented after the review above, using OpenAI Codex source `61f34c35af77777db4d77d0ea2aeb8547a6b4523` and discovery compatibility version `0.163.0` (stable source `83086188ae0614bd882818ff1aa23f3194962012`):
 
 - Authenticated subscription `/models` discovery uses proxy-owned OAuth. There is no automatic `~/.codex`, `CODEX_HOME`, or native CLI credential/configuration dependency. Optional metadata imports must be explicitly configured.
@@ -202,3 +204,35 @@ On this final source/test state, `cargo fmt --all -- --check`, `cargo clippy --a
 The release binary reports `0.1.45`. An additional isolated CLI check used a fresh synthetic `HOME`, `CCP_CONFIG_DIR`, `CODEX_HOME`, authentication file and explicit metadata import, with discovery disabled. It verified model listing, all four family launch environments, the 258,400/244,800 context defaults, an unknown explicit model with a safe override, rejection of all four retired backend commands, and unchanged synthetic Claude settings, auth and native cache files. This check started neither Claude Code nor an upstream network request.
 
 Documentation syntax, examples and local navigation passed static checks. The full Astro build remains skipped because Bun/documentation dependencies are absent. No controlled live generation, quota/latency benchmark, or actual Claude Code `/fast` UI verification was performed. The child-only availability skips do not establish upstream fast-tier entitlement.
+
+## Full legacy cleanup sweep
+
+Starting from `fe1b5db`, five subagents swept the tracked repository across runtime/UI/storage, Codex transports/auth, protocol translators, integration tests, and manifests/tooling/documentation. Changes remove proven leftovers rather than redesign active features.
+
+- **Remove the optional launcher:** at the user's explicit direction, delete `launch`, its module/dispatch, startup-only context calculations and dedicated tests. Current examples invoke normal `claude` with connection variables; no replacement wrapper, automatic client configuration, or global settings writes. Proxy-owned discovery, raw advertised metadata, family routing and request capability handling remain.
+- **Delete retired translation policy:** remove the unused generic OpenAI-compatible translator entrypoint and its alternate-backend configuration branches. The sole content-normalization caller already required a null missing-tool-input default; remove that selectable parameter while preserving the default and explicit values.
+- **Reuse active protocol helpers:** consolidate duplicate Read-repair and web-search parsing/ID helpers. Delete a write-only buffered block map and unread tool-state field; existing reducer validation and live-stream behavior remain unchanged. This is not a fix for the original tool-stream findings.
+- **Trim transport scaffolding:** delete an unreachable buffered-stream response branch, private forwarding aliases, an unproduced legacy retry marker, an unused retry-after extractor/test setter and unused internal WebSocket context arguments. Preserve actual typed handshake retry/fallback behavior, socket ownership and no-replay guards.
+- **Simplify runtime internals:** use existing server entrypoints/logging paths and standard collection/time/file helpers; remove redundant private marker/state, repeated directory setup and overwritten demo assignments. New regressions preserve the intentionally different legacy auth-schema fallback paths and sorted/unique catalog listings. Synthetic demo labels now match current Sonnet routing.
+- **Remove false/redundant coverage:** delete nine WebSocket tests that only exercised handwritten requests, their own SSE helper or the third-party socket library, including swallowed failures and a tautological assertion. Production WebSocket unit tests, proxy/continuation/smoke integrations and public API compatibility tests remain. Merge duplicate auth-path and health checks; strengthen actual token-count/log-redaction assertions and retain both meaningful fixtures.
+- **Isolate test side effects:** env-cleared subprocesses exercise catalog imports, logging/traffic factories and CLI operations. Existing serialized transport suites use their current RAII guards to clear ambient model/traffic settings and keep state under temporary roots. No new shared-process mutation pattern or runner framework was introduced; the existing guards still serialize and restore affected variables. The shared-process server suite still needs an externally clean profile for its production logging/config reads; its injected missing-auth client prevents ambient discovery.
+- **Remove unused build/documentation residue:** drop three unused direct dependencies (`thiserror`, `tracing`, `tracing-subscriber`), unused Clap/Axum/UUID features and ten unreachable lockfile packages without version bumps; move test-only Tower to dev dependencies. Remove the root Bun-install pane, unused screenshot/image-zoom/provider-stack assets, stale user-agent pin and obsolete helper examples. Correct the generated `llms.txt` full-body description while preserving build behavior, release targets, historical provenance and redirect migrations.
+
+Intentional public Codex/client compatibility, session-only APIs, keychain and credential migrations, legacy config/environment aliases, account-scoped discovery/authentication and explicit model-ID passthrough remain. Separate original correctness/security findings are still follow-up work.
+
+### Sweep validation
+
+On macOS, the final unified run passed formatting, strict all-target Clippy (`-D warnings`), the locked offline full suite and the locked offline release build. Validation used a clean temporary `HOME`, `CCP_CONFIG_DIR` and state root, retained only the existing Rust tool/cache locations, and kept normal test parallelism. **842 top-level tests passed, zero failed**: 667 library tests, 6 binary unit tests and 169 integration tests; four nested subprocess summaries were not counted again. The decrease from 852 reflects deleted launcher/math, false-coverage and duplicate cases, with new focused regressions added for active behavior.
+
+The release binary reports `0.1.45`. An isolated direct CLI/server check confirmed that `launch` is rejected, offline model/family listings still work, the real release server serves health/models routes and shuts down cleanly, and synthetic auth, Claude settings and native-cache files remain unchanged. It started no Claude process and made no live upstream request.
+
+Shell/workflow/configuration syntax, offline dependency metadata, documentation examples and 65 local links/anchors passed static checks. The full Astro build remains skipped because Bun/docs dependencies are absent. Cross-platform compilation, actual Claude Code `/fast` UI, live generation and quota/latency remain unverified; full offline cross-platform metadata could not resolve uncached `crossterm_winapi` without a download. No dependency versions were upgraded, user credentials/settings changed, or remote commits pushed.
+
+Incremental source/test/tooling commits:
+
+- `5f4ba8b`: remove the optional launcher and startup context policy.
+- `65e127a`: remove retired translator policy and duplicate protocol helpers.
+- `056aae5`: delete unreachable transport paths and private compatibility residue.
+- `725d4c4`: simplify runtime storage, registry and monitoring internals.
+- `2db81dd`: remove false legacy coverage and isolate integration fixtures.
+- `8cf0beb`: prune unused dependencies, features and obsolete build assets.

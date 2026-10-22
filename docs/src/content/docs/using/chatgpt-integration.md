@@ -50,19 +50,21 @@ to start the source build. Restart any already-running proxy after installation.
 In another terminal, launch Claude Code:
 
 ```sh
-claude-code-proxy launch --model fable --small-model haiku
+ANTHROPIC_BASE_URL=http://127.0.0.1:18765 \
+ANTHROPIC_AUTH_TOKEN=unused \
+ANTHROPIC_MODEL=fable \
+ANTHROPIC_SMALL_FAST_MODEL=haiku \
+  claude
 ```
 
-The launcher uses the already-running proxy, sets child-only client variables
-including tool search, and does not rewrite global Claude Code settings.
-Fable maps to Astra; Haiku maps to Luna. Switch in the running Claude Code
-session with `/model fable`, `/model opus` (GPT-6.1 Sol), or `/model sonnet`
-(GPT-6 Sol), or use explicit Codex IDs. Haiku maps to Luna. Remove conflicting
-`CCP_CODEX_MODEL` / `codex.model` forced overrides before launch. Well-formed
-opaque IDs pass through even when absent from discovery; upstream validates
-availability and entitlement. Known incompatible parameters error, never choose
-another model. Unknown context metadata requires a verified safe
-`--context-window`, such as `200000`.
+These settings connect to the already-running proxy for this command without
+rewriting global Claude Code settings. Fable maps to Astra; Haiku maps to Luna.
+Switch in the running Claude Code session with `/model fable`, `/model opus`
+(GPT-6.1 Sol), or `/model sonnet` (GPT-6 Sol), or use explicit Codex IDs. Remove
+conflicting `CCP_CODEX_MODEL` / `codex.model` forced overrides from the proxy.
+Well-formed opaque IDs pass through even when absent from discovery; upstream
+validates availability and entitlement. Known incompatible parameters error,
+never choose another model.
 
 The proxy now discovers models directly using its own authenticated ChatGPT
 subscription: `GET /backend-api/codex/models?client_version=0.163.0`.
@@ -72,12 +74,10 @@ or `CODEX_HOME`. Discovery defaults on; `CCP_CODEX_MODEL_DISCOVERY=0` or
 Only an explicit `CCP_CODEX_MODELS_FILE` / `codex.modelsFile` imports a file.
 Catalog presence does not guarantee upstream entitlement or quota.
 
-Client limits use the models' active context metadata, not their largest possible
-window or a `[1m]` hint. For a 272,000-token active context, compaction is capped
-at 244,800 tokens, possibly lower with other advertised limits. Use
-`claude-code-proxy launch --print-env` to inspect the computed environment.
-See [Models and routing](/using/models-and-routing/) for cache, capability,
-service-tier, and alias rules.
+`[1m]` cannot expand the active upstream context window. Claude Code manages
+client compaction independently; use `/compact` early before reaching a limit
+or switching to a smaller model. See [Models and routing](/using/models-and-routing/)
+for cache, capability, service-tier, and alias rules.
 
 Transport defaults to `auto`: WebSocket first, with HTTP fallback if setup fails
 before a request is sent. Compaction summaries use HTTP. Tool search appends

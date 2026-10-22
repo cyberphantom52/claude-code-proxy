@@ -40,7 +40,7 @@ Codex through a ChatGPT subscription is the only upstream backend. Claude Code i
 - Family aliases map Fable to Astra, Opus to GPT-6.1 Sol, Sonnet to GPT-6 Sol, and Haiku to Luna. There is no hardcoded/catalog admission allowlist or silent model substitution; unknown IDs are validated upstream, while malformed IDs and incompatible known controls fail. `/model` switching does not require exit or global settings rewrites.
 - Stock Claude Code `/fast` is Opus-only and may change the model before the proxy sees it. Messages `speed: "fast"` requests priority for the received model; other families can use supported `-fast` aliases without relying on that UI. Client fast-mode check bypasses do not grant upstream entitlement.
 - Missing capability metadata is unknown, not `false`. Actual advertised service-tier IDs determine acceleration; default-tier metadata does not opt into paid service automatically.
-- `[1m]` is a client hint, not a context increase. The launcher uses active context and metadata safety headroom; a 272,000-token active window has at most a 244,800 compaction window ceiling (actual compaction may occur earlier).
+- `[1m]` is a client hint, not an upstream context increase. Claude Code manages client compaction independently of the proxy's model metadata.
 - Optional WebSocket continuation and server compaction state live in memory and are invalidated when their model or history assumptions change. Restarts clear them; portable Claude Code history remains the fallback.
 - Automatic transport fallback happens only before a request is sent, avoiding replay of possible side effects.
 

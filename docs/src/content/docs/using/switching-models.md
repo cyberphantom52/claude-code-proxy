@@ -6,7 +6,11 @@ description: Switch Codex model families inside Claude Code without exiting or r
 With the proxy already running, launch Claude Code once:
 
 ```sh
-claude-code-proxy launch --model fable --small-model haiku
+ANTHROPIC_BASE_URL=http://127.0.0.1:18765 \
+ANTHROPIC_AUTH_TOKEN=unused \
+ANTHROPIC_MODEL=fable \
+ANTHROPIC_SMALL_FAST_MODEL=haiku \
+  claude
 ```
 
 Then switch **inside the running Claude Code session**:
@@ -40,10 +44,10 @@ No exit or global `settings.json` override is needed. `ANTHROPIC_MODEL` sets the
 
 ## Forced model overrides
 
-`CCP_CODEX_MODEL` or `codex.model` is a legacy model pin. Anthropic Messages requests that conflict with it fail instead of silently changing models. Remove the pin **before launch**, and restart the proxy if its configuration changed. The launcher rejects conflicting pins in its own configuration, but cannot inspect a separately running proxy's environment. OpenAI-compatible requests preserve their own model IDs.
+`CCP_CODEX_MODEL` or `codex.model` is a legacy model pin. Anthropic Messages requests that conflict with it fail instead of silently changing models. Remove the pin from the proxy configuration and restart the proxy if its configuration changed. OpenAI-compatible requests preserve their own model IDs.
 
 ## Context and connection boundaries
 
-The launcher derives conservative context/compaction limits from the main and small models at launch; `/model` does not recompute those environment variables. Keep the cap safe for all models you intend to use and compact early before switching to a smaller window. `[1m]` never increases upstream capacity.
+Claude Code manages client compaction independently of the proxy's model metadata. Compact early before switching to a smaller upstream window. `[1m]` never increases upstream capacity.
 
 Claude Code keeps portable conversation history, but model changes can invalidate optional Codex continuation or compaction state. Changing the base URL or credentials requires a new client process; changing the model does not. See [Models and routing](/using/models-and-routing/) for discovery and capability rules.

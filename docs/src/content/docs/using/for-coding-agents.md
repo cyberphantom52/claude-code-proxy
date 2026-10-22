@@ -7,10 +7,10 @@ This site publishes machine-readable documentation for coding agents alongside t
 
 ## Machine-readable docs
 
-- [`/llms.txt`](/llms.txt) is the compact index and is linked in the site header.
-- [`/llms-full.txt`](/llms-full.txt) contains the assembled documentation body for retrieval when the index is not enough.
+- [`/llms.txt`](/llms.txt) contains the assembled documentation body and is linked in the site header.
+- [`/llms-full.txt`](/llms-full.txt) contains the same body: the site build copies it to `llms.txt`, replacing the plugin's compact index.
 
-Start with `llms.txt`, follow only the pages relevant to the task, and prefer canonical reference pages over copied command tables in prompts or project notes.
+Retrieve `llms.txt` for the full documentation, or read individual relevant pages. Prefer canonical reference pages over copied command tables in prompts or project notes.
 
 ## Discover models at runtime
 
@@ -21,18 +21,19 @@ claude-code-proxy models
 curl -s http://127.0.0.1:18765/v1/models
 ```
 
-Use the proxy's authenticated live Codex catalog rather than maintaining an exhaustive model list in agent memory. It is fetched directly with proxy-owned ChatGPT OAuth, no Codex CLI installation or automatic native config/cache reads. Built-in/explicit-import fallback is available; `CCP_CODEX_MODEL_DISCOVERY=0` opts out of discovery network requests. Model metadata and ChatGPT access can change; listing does not guarantee entitlement or quota. Claude-style aliases target Codex, not Anthropic: Fable → Astra, Opus → GPT-6.1 Sol, Sonnet → GPT-6 Sol, Haiku → Luna. Discovery is not an admission allowlist: well-formed opaque IDs pass through for upstream validation even when absent from the catalog. Built-ins are fallback metadata hints. Explicit selection never silently falls back to another model; unknown context metadata requires an explicit safe launch cap.
+Use the proxy's authenticated live Codex catalog rather than maintaining an exhaustive model list in agent memory. It is fetched directly with proxy-owned ChatGPT OAuth, no Codex CLI installation or automatic native config/cache reads. Built-in/explicit-import fallback is available; `CCP_CODEX_MODEL_DISCOVERY=0` opts out of discovery network requests. Model metadata and ChatGPT access can change; listing does not guarantee entitlement or quota. Claude-style aliases target Codex, not Anthropic: Fable → Astra, Opus → GPT-6.1 Sol, Sonnet → GPT-6 Sol, Haiku → Luna. Discovery is not an admission allowlist: well-formed opaque IDs pass through for upstream validation even when absent from the catalog. Built-ins are fallback metadata hints. Explicit selection never silently falls back to another model.
 
 ## Minimal environment contract
 
-Prefer the child-only launcher against a running proxy:
+Connect Claude Code to a running proxy:
 
 ```sh
-claude-code-proxy launch --model fable --small-model haiku
-claude-code-proxy launch --print-env
+ANTHROPIC_BASE_URL=http://127.0.0.1:18765 \
+ANTHROPIC_AUTH_TOKEN=unused \
+  claude
 ```
 
-It sets client connection/model variables, `ENABLE_TOOL_SEARCH=true`, best-effort gateway discovery, model-derived context/compaction budgets, and nonessential/non-streaming-fallback guards. It does not edit global settings or take over tools. For manual setup use [Configure Claude Code](/using/configure-claude-code/). In the session, `/model fable`, `/model opus`, and `/model sonnet` switch models without exit; remove conflicting proxy-side `CCP_CODEX_MODEL` / `codex.model` forced overrides first.
+Optionally add `ANTHROPIC_MODEL=fable` and `ANTHROPIC_SMALL_FAST_MODEL=haiku` for independent main/background families. No global settings change is needed. For optional tool search use [Configure Claude Code](/using/configure-claude-code/). In the session, `/model fable`, `/model opus`, and `/model sonnet` switch models without exit; remove conflicting proxy-side `CCP_CODEX_MODEL` / `codex.model` forced overrides first.
 
 `ANTHROPIC_*` and `CLAUDE_CODE_*` configure the Claude Code client. `CCP_*`, `PORT`, and `config.json` configure the proxy process. Keep those layers separate when editing settings or debugging a launch.
 

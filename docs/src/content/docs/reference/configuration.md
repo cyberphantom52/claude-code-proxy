@@ -15,7 +15,6 @@ These settings configure the proxy process. Claude Code client settings such as 
   "port": 18765,
   "codex": {
     "originator": "claude-code-proxy",
-    "userAgent": "claude-code-proxy/0.1.24",
     "modelDiscovery": true,
     "baseUrl": "https://chatgpt.com/backend-api/codex/responses",
     "transport": "auto",
@@ -78,7 +77,7 @@ Proxy URLs may use `http`, `https`, `socks4`, `socks4a`, `socks5`, or `socks5h`.
 
 | Environment | Config key | Default | Purpose |
 | --- | --- | --- | --- |
-| `CCP_CODEX_MODEL` | `codex.model` | unset | Legacy model pin checked by Anthropic Messages and the launcher: conflicting selections fail rather than silently replacing the requested model. Remove it for independent main/small selection and `/model` switching. OpenAI-compatible requests preserve their own model IDs. |
+| `CCP_CODEX_MODEL` | `codex.model` | unset | Legacy model pin checked by Anthropic Messages: conflicting selections fail rather than silently replacing the requested model. Remove it for independent main/small selection and `/model` switching. OpenAI-compatible requests preserve their own model IDs. |
 | `CCP_CODEX_MODEL_DISCOVERY` | `codex.modelDiscovery` | `true` | Fetches authenticated subscription model metadata. Set `0` / `false` for built-in/explicit-import fallback without discovery network requests. |
 | `CCP_CODEX_MODELS_FILE` | `codex.modelsFile` | unset | Explicit optional model metadata import path; no automatic native Codex cache/config reads. |
 | `CCP_CODEX_EFFORT` | `codex.effort` | model default | Forces reasoning effort; the selected model must support it. Known values include `none`, `low`, `medium`, `high`, `xhigh`, and `max`; advertised native values are model-dependent. |
