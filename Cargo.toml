@@ -19,7 +19,6 @@ tower = { version = "0.5", features = ["util"] }
 http = "1"
 http-body-util = "0.1"
 bytes = "1"
-futures-core = "0.3"
 futures-util = "0.3"
 async-trait = "0.1"
 tracing = "0.1"

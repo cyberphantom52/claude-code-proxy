@@ -1,5 +1,5 @@
 {
-  description = "Anthropic-compatible proxy for Claude Code provider backends";
+  description = "Anthropic-compatible proxy for ChatGPT subscription Codex";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";

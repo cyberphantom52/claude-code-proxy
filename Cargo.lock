@@ -336,7 +336,6 @@ dependencies = [
  "bytes",
  "clap",
  "crossterm",
- "futures-core",
  "futures-util",
  "http",
  "http-body-util",

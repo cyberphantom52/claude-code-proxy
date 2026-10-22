@@ -11,10 +11,10 @@ Usage:
 
 Prerequisites:
   - Run from a checkout of claude-code-proxy.
-  - Install cargo, curl, and the upstream provider credentials you need.
-  - Authenticate providers with the normal `claude-code-proxy <provider> auth`
-    commands. This helper reads the normal config directory, so existing logins
-    remain available.
+  - Install cargo and curl.
+  - Authenticate your ChatGPT subscription with `claude-code-proxy codex auth login`.
+    This helper reads the normal config directory, so existing logins remain
+    available.
 
 The helper builds the debug binary, retries random dynamic ports until the
 health endpoint responds, and enables:
