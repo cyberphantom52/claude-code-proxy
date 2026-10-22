@@ -1,10 +1,6 @@
 use crate::anthropic::sse::parse_sse_events;
-use crate::providers::codex::events::{
-    CodexFailureKind, classify_event_failure, is_standard_max_output_tokens_incomplete,
-    response_is_incomplete_terminal,
-};
+use crate::providers::codex::events::{CodexFailureKind, classify_event_failure};
 
-use super::IncompleteResponsePolicy;
 use super::read_rewrite::sanitize_read_args;
 use super::reasoning_signature::{PendingReasoning, ReasoningReplay, encode_reasoning_signature};
 use super::request::ResponsesInputItem;
@@ -109,7 +105,6 @@ pub fn parse_codex_rate_limits(payload: &serde_json::Value) -> Option<Box<CodexR
 pub type StopReason = &'static str;
 pub const STOP_END_TURN: &str = "end_turn";
 pub const STOP_TOOL_USE: &str = "tool_use";
-pub const STOP_MAX_TOKENS: &str = "max_tokens";
 
 pub type TerminalType = &'static str;
 pub const TERM_COMPLETED: &str = "response.completed";
@@ -299,13 +294,6 @@ pub fn finish_metadata_from_upstream(
 }
 
 pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, UpstreamStreamError> {
-    reduce_upstream_bytes_with_policy(input, IncompleteResponsePolicy::Error)
-}
-
-pub(crate) fn reduce_upstream_bytes_with_policy(
-    input: &[u8],
-    incomplete_response_policy: IncompleteResponsePolicy,
-) -> Result<Vec<ReducerEvent>, UpstreamStreamError> {
     let sse_events = parse_sse_events(input);
     let mut out = Vec::new();
 
@@ -325,7 +313,6 @@ pub(crate) fn reduce_upstream_bytes_with_policy(
     let mut response_id: Option<String> = None;
     let mut terminal_type: Option<String> = None;
     let mut continuation_eligible = false;
-    let mut incomplete = false;
     let mut web_search_requests = 0usize;
     let mut _saw_terminal = false;
     let mut event_count = 0usize;
@@ -420,10 +407,7 @@ pub(crate) fn reduce_upstream_bytes_with_policy(
             });
         }
 
-        let allowed_incomplete = incomplete_response_policy
-            == IncompleteResponsePolicy::AllowMaxOutputTokens
-            && is_standard_max_output_tokens_incomplete(&p);
-        if !allowed_incomplete && let Some(failure) = classify_event_failure(&p) {
+        if let Some(failure) = classify_event_failure(&p) {
             let kind = match failure.kind {
                 CodexFailureKind::RateLimit => UpstreamErrorKind::RateLimit,
                 CodexFailureKind::Overloaded => UpstreamErrorKind::Overloaded,
@@ -859,9 +843,7 @@ pub(crate) fn reduce_upstream_bytes_with_policy(
             if let Some(usage) = final_usage.as_mut() {
                 usage.rate_limits = latest_rate_limits.clone();
             }
-            incomplete = response_is_incomplete_terminal(&p);
-            continuation_eligible =
-                (t == "response.completed" || t == "response.done") && !incomplete;
+            continuation_eligible = t == "response.completed" || t == "response.done";
             continue;
         }
     }
@@ -893,9 +875,7 @@ pub(crate) fn reduce_upstream_bytes_with_policy(
         &mut output_items_by_index,
     );
 
-    let stop_reason: StopReason = if incomplete {
-        STOP_MAX_TOKENS
-    } else if saw_tool_use {
+    let stop_reason: StopReason = if saw_tool_use {
         STOP_TOOL_USE
     } else {
         STOP_END_TURN
@@ -1437,98 +1417,6 @@ mod tests {
     }
 
     #[test]
-    fn standard_responses_policy_maps_max_output_tokens_to_finish() {
-        let upstream = sse(
-            "response.incomplete",
-            json!({"response":{"id":"resp_1","status":"incomplete","error":null,"incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":2,"output_tokens":8}}}),
-        );
-        let out = reduce_upstream_bytes_with_policy(
-            upstream.as_bytes(),
-            IncompleteResponsePolicy::AllowMaxOutputTokens,
-        )
-        .unwrap();
-        let Some(ReducerEvent::Finish {
-            stop_reason,
-            terminal_type,
-            continuation_eligible,
-            usage,
-            ..
-        }) = out.last()
-        else {
-            panic!("expected Finish");
-        };
-        assert_eq!(*stop_reason, STOP_MAX_TOKENS);
-        assert_eq!(terminal_type, TERM_INCOMPLETE);
-        assert!(!continuation_eligible);
-        assert_eq!(
-            usage.as_ref().and_then(|usage| usage.output_tokens),
-            Some(8)
-        );
-    }
-
-    #[test]
-    fn standard_responses_policy_rejects_a_second_terminal_event() {
-        let upstream = format!(
-            "{}{}",
-            sse(
-                "response.incomplete",
-                json!({"response":{"id":"resp_1","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{}}}),
-            ),
-            sse(
-                "response.completed",
-                json!({"response":{"id":"resp_1","status":"completed","usage":{}}}),
-            ),
-        );
-        let err = reduce_upstream_bytes_with_policy(
-            upstream.as_bytes(),
-            IncompleteResponsePolicy::AllowMaxOutputTokens,
-        )
-        .unwrap_err();
-        assert_eq!(err.kind, UpstreamErrorKind::Transient);
-        assert!(err.message.contains("multiple terminal"));
-    }
-
-    #[test]
-    fn standard_responses_policy_rejects_content_after_terminal() {
-        let trailing_events = [
-            (
-                "response.output_text.delta",
-                json!({"output_index":0,"delta":"late"}),
-            ),
-            (
-                "response.output_item.added",
-                json!({
-                    "output_index":0,
-                    "item":{"type":"message","id":"msg_late"}
-                }),
-            ),
-        ];
-
-        for (event_type, payload) in trailing_events {
-            let upstream = format!(
-                "{}{}",
-                sse(
-                    "response.incomplete",
-                    json!({"response":{"id":"resp_1","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{}}}),
-                ),
-                sse(event_type, payload),
-            );
-            let err = reduce_upstream_bytes_with_policy(
-                upstream.as_bytes(),
-                IncompleteResponsePolicy::AllowMaxOutputTokens,
-            )
-            .unwrap_err();
-
-            assert_eq!(err.kind, UpstreamErrorKind::Transient);
-            assert!(err.message.contains("after the terminal"));
-            let diagnostics = err.diagnostics.expect("expected diagnostics");
-            assert_eq!(diagnostics.event_count, 2);
-            assert_eq!(diagnostics.last_event_type.as_deref(), Some(event_type));
-            assert!(diagnostics.saw_terminal_event);
-        }
-    }
-
-    #[test]
     fn completed_terminal_followed_by_done_marker_remains_valid() {
         let upstream = format!(
             "{}data: [DONE]\n\n",
@@ -1561,44 +1449,6 @@ mod tests {
             panic!("expected Finish");
         };
         assert_eq!(*stop_reason, STOP_END_TURN);
-    }
-
-    #[test]
-    fn standard_responses_max_tokens_takes_priority_over_tool_use() {
-        let upstream = format!(
-            "{}{}{}{}",
-            sse(
-                "response.output_item.added",
-                json!({
-                    "output_index":0,
-                    "item":{"type":"function_call","call_id":"call_1","name":"Read"}
-                }),
-            ),
-            sse(
-                "response.function_call_arguments.delta",
-                json!({"output_index":0,"delta":"{}"}),
-            ),
-            sse(
-                "response.output_item.done",
-                json!({
-                    "output_index":0,
-                    "item":{"type":"function_call","call_id":"call_1","name":"Read","arguments":"{}"}
-                }),
-            ),
-            sse(
-                "response.incomplete",
-                json!({"response":{"id":"resp_1","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{}}}),
-            ),
-        );
-        let out = reduce_upstream_bytes_with_policy(
-            upstream.as_bytes(),
-            IncompleteResponsePolicy::AllowMaxOutputTokens,
-        )
-        .unwrap();
-        let Some(ReducerEvent::Finish { stop_reason, .. }) = out.last() else {
-            panic!("expected Finish");
-        };
-        assert_eq!(*stop_reason, STOP_MAX_TOKENS);
     }
 
     #[test]

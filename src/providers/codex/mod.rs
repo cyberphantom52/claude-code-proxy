@@ -71,10 +71,6 @@ use self::translate::stream::translate_stream_bytes_with_traffic;
 // Provider
 // ---------------------------------------------------------------------------
 
-pub(crate) fn clear_session_compaction(session_id: &str) {
-    compaction::clear_compaction(session_id);
-}
-
 pub struct CodexProvider {
     client: Arc<CodexHttpClient>,
 }

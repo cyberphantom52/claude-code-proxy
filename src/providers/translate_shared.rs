@@ -116,34 +116,6 @@ pub fn image_source_to_url(source: &ImageSource) -> String {
     }
 }
 
-pub fn image_block_to_url(block: &Value) -> String {
-    let source_type = block
-        .get("source")
-        .and_then(|s| s.get("type"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("base64");
-    if source_type == "url" {
-        block
-            .get("source")
-            .and_then(|s| s.get("url"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string()
-    } else {
-        let media_type = block
-            .get("source")
-            .and_then(|s| s.get("media_type"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("image/png");
-        let data = block
-            .get("source")
-            .and_then(|s| s.get("data"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        format!("data:{media_type};base64,{data}")
-    }
-}
-
 fn parse_content_block(value: &Value, missing_tool_input: Value) -> Option<ContentBlock> {
     let kind = value.get("type").and_then(|v| v.as_str())?;
     match kind {
