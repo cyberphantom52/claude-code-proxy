@@ -15,8 +15,8 @@ Codex through a ChatGPT subscription is the only upstream backend. Claude Code i
 ## Anthropic Messages
 
 - Supports Claude Code's practical streaming and non-streaming usage, not complete Anthropic protocol equivalence. `?beta=true` uses the same implementation.
-- Function tools and results translate to Codex; Claude Code executes its tools. Native Codex CLI agent tools are not added by the proxy.
-- Base64 user images and supported base64 tool-result images map to Responses images. Remote URLs and malformed or unsupported nested images remain text placeholders.
+- Function tools and results translate to Codex; Claude Code executes its tools. Native Codex CLI agent tools are not added by the proxy. Tool completion, identity and argument consistency are validated in streaming and accumulated responses; missing finalization fails instead of reporting a successful tool turn.
+- Top-level user images accept supported base64 or URL source structures; the upstream model must accept images. Supported base64 tool-result images map to Responses images. Unsupported/malformed nested blocks remain explicit text placeholders. Unsupported top-level blocks, including documents/PDFs, and malformed required fields return indexed HTTP 400 errors rather than being dropped.
 - Reasoning summaries can become thinking blocks; Codex may omit a summary. Encrypted reasoning and compaction items remain opaque continuation data, not exposed chain of thought.
 - Hosted web search supports mapped domain filters. Anthropic `max_uses` is not enforced because Codex exposes no equivalent limit.
 - Strict JSON schema output translates; Anthropic-only fields without a mapping can be omitted.
@@ -25,7 +25,7 @@ Codex through a ChatGPT subscription is the only upstream backend. Claude Code i
 ## Optional OpenAI-compatible routes
 
 - `CCP_CODEX_RESPONSES_API=1` enables native Codex `/v1/responses` passthrough and `/v1/chat/completions` compatibility.
-- Chat Completions supports text and model-supported `image_url` input parts, reasoning effort, verbosity, service tier, and output formats. Explicit parallel-call intent is validated, but function tools/calls are not supported. Output token limits, audio, log probabilities, and multiple choices remain unsupported.
+- Chat Completions supports text and model-supported `image_url` input parts, reasoning effort, verbosity, service tier, and output formats. Explicit parallel-call intent is validated, but function tools/calls are not supported. Output token limits, audio, log probabilities, and multiple choices remain unsupported. Buffered/streamed collection is bounded to 8 MiB; usage streaming uses a separate final empty-choices chunk.
 - Responses forwards native Codex input and JSON or SSE output. It does not add stored response retrieval/deletion or WebSocket ingress.
 - Unsupported non-null compatibility fields return errors rather than being silently ignored. These routes do not promise full public OpenAI API equivalence.
 
@@ -41,7 +41,7 @@ Codex through a ChatGPT subscription is the only upstream backend. Claude Code i
 - Stock Claude Code `/fast` is Opus-only and may change the model before the proxy sees it. Messages `speed: "fast"` requests priority for the received model; other families can use supported `-fast` aliases without relying on that UI. Client fast-mode check bypasses do not grant upstream entitlement.
 - Missing capability metadata is unknown, not `false`. Actual advertised service-tier IDs determine acceleration; default-tier metadata does not opt into paid service automatically.
 - `[1m]` is a client hint, not an upstream context increase. Claude Code manages client compaction independently of the proxy's model metadata.
-- Optional WebSocket continuation and server compaction state live in memory and are invalidated when their model or history assumptions change. Restarts clear them; portable Claude Code history remains the fallback.
+- Optional WebSocket continuation and server compaction state live only in memory. Reuse requires typed conversation/agent ownership, the same model/history assumptions, endpoint, selected account/token and durable auth generation. Missing provenance, logout/relogin, token rotation or ownership changes prevent cached opaque reuse; portable Claude Code history remains the fallback. Both optimizations remain off by default.
 - Automatic transport fallback happens only before a request is sent, avoiding replay of possible side effects.
 
 ## Diagnostics and privacy

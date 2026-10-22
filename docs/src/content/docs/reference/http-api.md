@@ -35,9 +35,11 @@ The request `model` selects a well-formed opaque model ID or Claude-style family
 
 `speed: "fast"` explicitly requests Codex priority service for the model received; `speed: "standard"` clears acceleration. This request choice overrides configured service tiers and suffixes, and an unsupported known priority tier errors. Stock Claude Code's `/fast` is currently Opus-only and may switch the model before sending the request; the proxy does not undo that client choice. See [fast-mode limits](/using/models-and-routing/#claude-code-fast-is-opus-only).
 
+Unsupported top-level content, including document/PDF blocks, and malformed required block fields return HTTP 400 with the message/block path instead of disappearing. Unsupported nested tool-result blocks retain explicit omission placeholders. Tool calls require validated authoritative completion; unfinished, malformed, oversized or conflicting arguments do not become successful tool turns.
+
 Streaming responses use Anthropic SSE events such as `message_start`, `content_block_start`, `content_block_delta`, `content_block_stop`, `message_delta`, and `message_stop`. Non-streaming requests are accumulated from the provider's stream.
 
-Codex responses carry the quota headers Codex reports for the subscription: `x-codex-plan-type`, `x-codex-active-limit`, `x-codex-credits-*`, and, for every limit family, `-used-percent`, `-window-minutes`, `-reset-at`, `-reset-after-seconds`, `-limit-name`, and `-over-secondary-limit-percent`. Which family a window belongs to and how long that window runs come from the headers themselves: a plan may meter a weekly window as `primary` and no secondary window at all. The values are the ones Codex sent for the request being answered. A response that arrives before any telemetry does carries the previous values, or none.
+Subscription quota headers include allowlisted `x-codex-plan-type`, `x-codex-active-limit`, `x-codex-credits-*` and advertised limit-family fields when supplied upstream. Window meanings and durations come from Codex; `primary` is not necessarily a five-hour window. Messages telemetry is request-local, never copied from an earlier request or another account. Headers already emitted cannot be amended by later WebSocket quota events; terminal usage may contain newer telemetry. Native Responses and Chat Completions forward their own upstream allowlisted quota headers, not a global snapshot.
 
 Malformed model IDs and incompatible known controls return local validation errors. Well-formed IDs, including ones absent from discovery, reach upstream for model/access validation without silent substitution. Missing provider auth returns HTTP 401.
 
@@ -70,7 +72,7 @@ Returns Anthropic-shaped model discovery:
 }
 ```
 
-An optional `limit` query truncates `data` and sets `has_more`. The route does not expose a pagination cursor.
+Optional `limit` is an integer from 1 to 1000; omitting it preserves the full listing. Use exclusive `after_id=<last_id>` for the next page or `before_id=<first_id>` for the preceding page. Backward pages contain the nearest preceding entries in ascending order; `has_more` refers to the requested direction. Empty, unknown or conflicting cursors and invalid limits return HTTP 400. Unrelated query parameters remain tolerated.
 
 The proxy prepares the account-scoped authenticated subscription catalog, using default-on direct upstream discovery with bounded cache/fallback behavior. No native Codex CLI installation or automatic `~/.codex` / `CODEX_HOME` reads are required. The live catalog governs discovered metadata, menus, and default choices, not model admission. Well-formed opaque IDs absent from discovery are still forwarded; hidden returned entries remain explicitly requestable. `supported_in_api: false` is not a subscription access block. Model listing does not guarantee entitlement or quota; see [Models and routing](/using/models-and-routing/).
 
@@ -88,7 +90,7 @@ curl http://127.0.0.1:18765/v1/chat/completions \
 
 Supports text messages and `image_url` content parts when the selected model accepts images, plus `reasoning_effort`, `verbosity`, `service_tier`, `parallel_tool_calls`, `response_format`, `stream_options.include_usage`, `temperature`, `top_p`, and `user`. Omitted effort uses the model's advertised default, with a compatibility fallback when metadata is absent; the proxy-wide Codex effort override takes precedence. Explicit incompatible controls fail; sampling controls are rejected on Responses Lite. Accepting `parallel_tool_calls` does not add function-tool support. Function tools/calls, audio, log probabilities, multiple choices, storage, and output token limits remain unsupported.
 
-Non-streaming requests return a `chat.completion` object. Streaming requests return `chat.completion.chunk` events followed by `data: [DONE]`. Unsupported non-null fields return `invalid_request_error` with the field named in `error.param`.
+Non-streaming requests return a `chat.completion` object. Streaming requests return `chat.completion.chunk` events with stable completion identity, followed by `data: [DONE]`. With `stream_options.include_usage`, ordinary chunks carry `usage: null` and a separate final `choices: []` chunk carries full usage before `[DONE]`. Cached/reasoning usage details and confirmed service tier are preserved when supplied. Collected bodies, pending frames, total stream input and accumulated text are bounded to 8 MiB; exceeding the budget fails explicitly. Unsupported non-null fields return `invalid_request_error` with the field named in `error.param`.
 
 ## `POST /v1/images/generations`
 

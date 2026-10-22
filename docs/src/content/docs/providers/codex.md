@@ -22,7 +22,7 @@ claude-code-proxy codex auth device
 claude-code-proxy codex auth status
 ```
 
-The proxy owns its tokens and does not read native Codex CLI credentials. It refreshes expiring access tokens with a single-flight guard. See [Files and storage](/reference/files-and-storage/) for credential locations.
+The proxy owns its tokens and does not read native Codex CLI credentials. Expiring-token refreshes are single-flight within each process; atomic credential snapshots and conditional writes coordinate with login/logout across cooperating processes. A rejected refresh does not erase a peer's pending successful rotation. Browser/device login stages share real remaining-time deadlines. See [Files and storage](/reference/files-and-storage/) for credentials, writable coordination files and compatibility limits.
 
 ## Models and fast mode
 
@@ -83,7 +83,7 @@ Claude Code summary compaction requests are capped at low effort by default beca
   or `codex.fullLane: true` still opts legacy `gpt-5.6-sol` and
   `gpt-5.6-terra` into the full lane for parallel tool calls; it does not
   force every other model off Lite. Explicit unsupported parallel calls fail.
-- Claude function tools and tool results map to Responses API function calls and outputs.
+- Claude function tools and tool results map to Responses API function calls and outputs. Completed calls must have valid object arguments consistent with their streamed identity/arguments; unfinished or conflicting calls fail instead of becoming successful tool turns. Complete done-only items are supported. Read whitespace repair waits for authoritative completion and does not terminate parallel siblings early.
 - With Claude Code's tool search on (`ENABLE_TOOL_SEARCH=true`, see [Configure Claude Code](/using/configure-claude-code/#mcp-tool-search)),
   a deferred tool reaches the model once `ToolSearch` loads it. On the Responses
   Lite lane, the proxy appends each loaded tool as its own `additional_tools` item
