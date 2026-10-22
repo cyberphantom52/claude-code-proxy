@@ -72,14 +72,22 @@ impl ChatCompletionsBackend {
         let bytes =
             match collect_body(upstream, self.client.body_idle_timeout_ms(), Some(&ctx)).await {
                 Ok(bytes) => bytes,
-                Err(error) => return error.response(),
+                Err(error) => {
+                    let mut response = error.response();
+                    response.headers_mut().extend(headers);
+                    return response;
+                }
             };
         if let Some(traffic) = ctx.traffic.as_deref() {
             traffic.write_bytes("032-upstream-response-body.sse", &bytes);
         }
         let completion = match response::aggregate_sse(&bytes, &request.model) {
             Ok(completion) => completion,
-            Err(error) => return error.response(),
+            Err(error) => {
+                let mut response = error.response();
+                response.headers_mut().extend(headers);
+                return response;
+            }
         };
         if let Some(usage) = completion.get("usage")
             && let Some(monitor) = ctx.monitor.as_ref()
@@ -122,6 +130,11 @@ async fn collect_body(
                     }
                     started = true;
                 }
+                if bytes.len().saturating_add(chunk.len()) > crate::traffic::MAX_SSE_CAPTURE_BYTES {
+                    return Err(ChatError::upstream(
+                        "Codex response exceeded the response byte limit",
+                    ));
+                }
                 bytes.extend_from_slice(&chunk);
                 if let Some(ctx) = ctx
                     && let Some(monitor) = ctx.monitor.as_ref()
@@ -160,10 +173,14 @@ fn codex_error_response(error: CodexError) -> Response {
 
 async fn upstream_error_response(upstream: reqwest::Response, idle_timeout_ms: u64) -> Response {
     let status = upstream.status();
-    let retry_after = upstream.headers().get(http::header::RETRY_AFTER).cloned();
+    let headers = stream::response_headers(upstream.headers());
     let bytes = match collect_body(upstream, idle_timeout_ms, None).await {
         Ok(bytes) => bytes,
-        Err(error) => return error.response(),
+        Err(error) => {
+            let mut response = error.response();
+            response.headers_mut().extend(headers);
+            return response;
+        }
     };
     let message = serde_json::from_slice::<Value>(&bytes)
         .ok()
@@ -183,14 +200,9 @@ async fn upstream_error_response(upstream: reqwest::Response, idle_timeout_ms: u
         StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
         _ => "api_error",
     };
-    let response = ChatError::new(status, kind, message, None, None).response();
-    if let Some(retry_after) = retry_after {
-        let (mut parts, body) = response.into_parts();
-        parts.headers.insert(http::header::RETRY_AFTER, retry_after);
-        Response::from_parts(parts, body)
-    } else {
-        response
-    }
+    let mut response = ChatError::new(status, kind, message, None, None).response();
+    response.headers_mut().extend(headers);
+    response
 }
 
 #[derive(Debug, Clone)]
@@ -315,8 +327,9 @@ mod tests {
     }
 
     async fn mock_backend(
-        sse_body: &'static [u8],
+        sse_body: impl Into<Vec<u8>>,
     ) -> (ChatCompletionsBackend, tokio::task::JoinHandle<Value>) {
+        let sse_body = sse_body.into();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -358,7 +371,7 @@ mod tests {
                 sse_body.len()
             );
             socket.write_all(response.as_bytes()).await.unwrap();
-            socket.write_all(sse_body).await.unwrap();
+            socket.write_all(&sse_body).await.unwrap();
             body
         });
         let client = CodexHttpClient::new_for_test(
@@ -443,6 +456,31 @@ mod tests {
         assert!(body.contains(r#""finish_reason":"stop""#));
         assert!(body.contains(r#""prompt_tokens":3"#));
         assert!(body.ends_with("data: [DONE]\n\n"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn buffered_body_is_bounded_before_sse_parsing() {
+        let (backend, server) =
+            mock_backend(vec![b'x'; crate::traffic::MAX_SSE_CAPTURE_BYTES + 1]).await;
+        let request = request::translate_request(json!({
+            "model":"gpt-5.6-sol", "messages":[{"role":"user","content":"hello"}]
+        }))
+        .unwrap();
+        let response = backend
+            .handle(request, context(MonitorHandle::new(10)))
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("byte limit")
+        );
         server.await.unwrap();
     }
 

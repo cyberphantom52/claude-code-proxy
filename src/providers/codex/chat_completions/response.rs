@@ -10,15 +10,19 @@ use super::ChatError;
 pub struct Usage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    details: serde_json::Map<String, Value>,
 }
 
 impl Usage {
     pub fn value(&self) -> Value {
-        json!({
-            "prompt_tokens": self.prompt_tokens,
-            "completion_tokens": self.completion_tokens,
-            "total_tokens": self.prompt_tokens.saturating_add(self.completion_tokens),
-        })
+        let mut value = Value::Object(self.details.clone());
+        value["prompt_tokens"] = json!(self.prompt_tokens);
+        value["completion_tokens"] = json!(self.completion_tokens);
+        if value.get("total_tokens").is_none() {
+            value["total_tokens"] =
+                json!(self.prompt_tokens.saturating_add(self.completion_tokens));
+        }
+        value
     }
 }
 
@@ -31,6 +35,8 @@ pub struct CompletionState {
     pub usage: Usage,
     pub finish_reason: &'static str,
     pub completed: bool,
+    pub service_tier: Option<String>,
+    identity_frozen: bool,
 }
 
 impl CompletionState {
@@ -43,7 +49,13 @@ impl CompletionState {
             usage: Usage::default(),
             finish_reason: "stop",
             completed: false,
+            service_tier: None,
+            identity_frozen: false,
         }
+    }
+
+    pub fn freeze_identity(&mut self) {
+        self.identity_frozen = true;
     }
 
     pub fn observe(&mut self, event: &Value) -> Result<Option<String>, ChatError> {
@@ -69,6 +81,13 @@ impl CompletionState {
                 let delta = event.get("delta").and_then(Value::as_str).ok_or_else(|| {
                     ChatError::upstream("Codex output-text delta did not contain text")
                 })?;
+                if self.text.len().saturating_add(delta.len())
+                    > crate::traffic::MAX_SSE_CAPTURE_BYTES
+                {
+                    return Err(ChatError::upstream(
+                        "Codex output text exceeded the response byte limit",
+                    ));
+                }
                 self.text.push_str(delta);
                 return Ok(Some(delta.to_string()));
             }
@@ -92,19 +111,24 @@ impl CompletionState {
     }
 
     fn update_metadata(&mut self, response: &Value) {
-        if let Some(id) = response.get("id").and_then(Value::as_str) {
-            self.id = chat_completion_id(id);
+        if !self.identity_frozen {
+            if let Some(id) = response.get("id").and_then(Value::as_str) {
+                self.id = chat_completion_id(id);
+            }
+            if let Some(model) = response.get("model").and_then(Value::as_str) {
+                self.model = model.to_string();
+            }
+            if let Some(created) = response
+                .get("created_at")
+                .or_else(|| response.get("created"))
+                .and_then(Value::as_f64)
+                .filter(|created| *created >= 0.0)
+            {
+                self.created = created as u64;
+            }
         }
-        if let Some(model) = response.get("model").and_then(Value::as_str) {
-            self.model = model.to_string();
-        }
-        if let Some(created) = response
-            .get("created_at")
-            .or_else(|| response.get("created"))
-            .and_then(Value::as_f64)
-            .filter(|created| *created >= 0.0)
-        {
-            self.created = created as u64;
+        if let Some(tier) = response.get("service_tier").and_then(Value::as_str) {
+            self.service_tier = Some(tier.to_string());
         }
         if let Some(usage) = response.get("usage") {
             self.usage.prompt_tokens = usage
@@ -115,11 +139,27 @@ impl CompletionState {
                 .get("output_tokens")
                 .and_then(Value::as_u64)
                 .unwrap_or(self.usage.completion_tokens);
+            if let Some(fields) = usage.as_object() {
+                for (name, value) in fields {
+                    let name = match name.as_str() {
+                        "input_tokens" | "output_tokens" => continue,
+                        "input_tokens_details" => "prompt_tokens_details",
+                        "output_tokens_details" => "completion_tokens_details",
+                        name => name,
+                    };
+                    self.usage.details.insert(name.to_string(), value.clone());
+                }
+            }
         }
     }
 }
 
 pub fn aggregate_sse(body: &[u8], requested_model: &str) -> Result<Value, ChatError> {
+    if body.len() > crate::traffic::MAX_SSE_CAPTURE_BYTES {
+        return Err(ChatError::upstream(
+            "Codex response exceeded the response byte limit",
+        ));
+    }
     let events = parse_sse_events(body);
     if events.is_empty() {
         return Err(ChatError::upstream(
@@ -148,7 +188,7 @@ pub fn aggregate_sse(body: &[u8], requested_model: &str) -> Result<Value, ChatEr
 }
 
 pub fn completion_value(state: &CompletionState) -> Value {
-    json!({
+    let mut value = json!({
         "id": state.id,
         "object": "chat.completion",
         "created": state.created,
@@ -159,7 +199,11 @@ pub fn completion_value(state: &CompletionState) -> Value {
             "finish_reason": state.finish_reason,
         }],
         "usage": state.usage.value(),
-    })
+    });
+    if let Some(tier) = &state.service_tier {
+        value["service_tier"] = json!(tier);
+    }
+    value
 }
 
 pub fn event_error(event: &Value) -> ChatError {
@@ -201,6 +245,29 @@ mod tests {
         assert_eq!(value["id"], "chatcmpl-123");
         assert_eq!(value["choices"][0]["message"]["content"], "hello");
         assert_eq!(value["usage"]["total_tokens"], 6);
+    }
+
+    #[test]
+    fn buffered_usage_details_and_actual_tier_are_preserved() {
+        let body = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"yes\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"service_tier\":\"priority\",\"usage\":{\"input_tokens\":4,\"output_tokens\":2,\"input_tokens_details\":{\"cached_tokens\":3},\"output_tokens_details\":{\"reasoning_tokens\":1}}}}\n\n";
+        let value = aggregate_sse(body, "requested").unwrap();
+        assert_eq!(value["service_tier"], "priority");
+        assert_eq!(value["usage"]["prompt_tokens_details"]["cached_tokens"], 3);
+        assert_eq!(
+            value["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            1
+        );
+    }
+
+    #[test]
+    fn accumulated_text_obeys_existing_byte_budget() {
+        let mut state = CompletionState::new("model");
+        state.text = "x".repeat(crate::traffic::MAX_SSE_CAPTURE_BYTES);
+        let error = state
+            .observe(&json!({"type":"response.output_text.delta","delta":"x"}))
+            .unwrap_err();
+        assert!(error.message.contains("byte limit"));
+        assert_eq!(state.text.len(), crate::traffic::MAX_SSE_CAPTURE_BYTES);
     }
 
     #[test]

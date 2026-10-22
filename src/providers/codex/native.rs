@@ -425,6 +425,9 @@ fn passthrough_headers(upstream: &HeaderMap) -> HeaderMap {
             headers.append(name.clone(), value.clone());
         }
     }
+    for (name, value) in super::rate_limits::telemetry_headers(upstream) {
+        headers.insert(name, value);
+    }
     headers
 }
 
@@ -474,7 +477,7 @@ impl NativeResponseObserver {
             ctx,
             is_sse,
             generation_started: false,
-            raw: Vec::with_capacity(64 * 1024),
+            raw: Vec::new(),
             raw_truncated: 0,
             pending: Vec::new(),
             pending_scan: 0,
@@ -517,6 +520,10 @@ impl NativeResponseObserver {
     }
 
     fn capture_raw(&mut self, chunk: &[u8]) {
+        // Non-SSE JSON still needs a bounded body for outcome/usage inspection.
+        if self.is_sse && self.ctx.traffic.is_none() {
+            return;
+        }
         let remaining = MAX_SSE_CAPTURE_BYTES.saturating_sub(self.raw.len());
         let captured = remaining.min(chunk.len());
         self.raw.extend_from_slice(&chunk[..captured]);
@@ -580,9 +587,19 @@ impl NativeResponseObserver {
         count
     }
 
-    fn record_event(&mut self, event: Option<&str>, value: Value) {
+    fn record_event(&mut self, event: Option<&str>, mut value: Value) {
+        if let Some(event) = event
+            && let Some(object) = value.as_object_mut()
+        {
+            object
+                .entry("type")
+                .or_insert_with(|| Value::String(event.to_string()));
+        }
         self.update_usage(&value);
         self.update_outcome(&value);
+        if self.ctx.traffic.is_none() {
+            return;
+        }
         let mut captured = value;
         if let Some(event) = event
             && let Some(object) = captured.as_object_mut()
@@ -610,6 +627,20 @@ impl NativeResponseObserver {
     }
 
     fn update_outcome(&self, value: &Value) {
+        // Shared classification includes nested failed/incomplete terminal responses.
+        if let Some(failure) = super::events::classify_event_failure(value) {
+            self.outcome.fail(failure.message);
+            return;
+        }
+        if !self.is_sse
+            && value.get("type").is_none()
+            && let Some(failure) = super::events::classify_event_failure(&json!({
+                "type": "response.completed", "response": value
+            }))
+        {
+            self.outcome.fail(failure.message);
+            return;
+        }
         let event_type = value.get("type").and_then(Value::as_str);
         let has_error = value.get("error").is_some_and(|error| !error.is_null());
         let failed_status = value.get("status").and_then(Value::as_str) == Some("failed");
@@ -882,6 +913,40 @@ mod tests {
     }
 
     #[test]
+    fn nested_terminal_failures_and_incomplete_events_record_outcomes_without_raw_capture() {
+        for (payload, expected) in [
+            (
+                json!({"type":"response.completed","error":null,"response":{"status":"failed","error":{"message":"nested failure"}}}),
+                "nested failure",
+            ),
+            (
+                json!({"type":"response.done","response":{"status":"completed","error":{"message":"late error"}}}),
+                "late error",
+            ),
+            (
+                json!({"type":"response.completed","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}),
+                "Incomplete response returned, reason: max_output_tokens",
+            ),
+        ] {
+            let outcome = NativeResponseOutcome::default();
+            let mut observer =
+                NativeResponseObserver::new(observer_context(), true, outcome.clone());
+            let bytes = format!("data: {payload}\n\n");
+            observer.observe(bytes.as_bytes());
+            assert_eq!(outcome.failure().as_deref(), Some(expected));
+            assert!(observer.raw.is_empty());
+            assert_eq!(observer.raw.capacity(), 0);
+        }
+        let outcome = NativeResponseOutcome::default();
+        let mut observer = NativeResponseObserver::new(observer_context(), false, outcome.clone());
+        observer.observe(
+            br#"{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}"#,
+        );
+        observer.finish("complete");
+        assert!(outcome.failure().unwrap().contains("max_output_tokens"));
+    }
+
+    #[test]
     fn completed_json_with_null_error_stays_successful() {
         let outcome = NativeResponseOutcome::default();
         let mut observer = NativeResponseObserver::new(observer_context(), false, outcome.clone());
@@ -1050,7 +1115,11 @@ mod tests {
         upstream.insert("x-request-id", "req_1".parse().unwrap());
         upstream.insert("x-ratelimit-remaining-requests", "2".parse().unwrap());
 
+        upstream.insert("x-codex-primary-used-percent", "12".parse().unwrap());
+        upstream.insert("x-codex-turn-state", "private".parse().unwrap());
         let headers = passthrough_headers(&upstream);
+        assert_eq!(headers["x-codex-primary-used-percent"], "12");
+        assert!(!headers.contains_key("x-codex-turn-state"));
         assert_eq!(
             headers.get(http::header::CONTENT_TYPE).unwrap(),
             "text/event-stream"
@@ -1059,6 +1128,55 @@ mod tests {
         assert_eq!(headers.get("x-ratelimit-remaining-requests").unwrap(), "2");
         assert!(headers.get(http::header::SET_COOKIE).is_none());
         assert!(headers.get(http::header::CONTENT_LENGTH).is_none());
+    }
+
+    #[tokio::test]
+    async fn nested_failure_observation_preserves_response_bytes() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+        const BODY: &[u8] = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"failed\",\"error\":{\"message\":\"late failure\"}}}\n\n";
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 8 * 1024];
+            let mut received = 0;
+            while !request[..received]
+                .windows(4)
+                .any(|bytes| bytes == b"\r\n\r\n")
+            {
+                assert!(
+                    received < request.len(),
+                    "mock request headers exceed limit"
+                );
+                let read = socket.read(&mut request[received..]).await.unwrap();
+                assert!(read > 0, "mock request ended before its headers");
+                received += read;
+            }
+            assert!(request[..received].starts_with(b"GET / HTTP/1.1\r\n"));
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                BODY.len()
+            );
+            socket.write_all(head.as_bytes()).await.unwrap();
+            socket.write_all(BODY).await.unwrap();
+            socket.shutdown().await.unwrap();
+        });
+        let upstream = reqwest::get(format!("http://{address}")).await.unwrap();
+        let response = passthrough_response(upstream, observer_context(), 1_000);
+        let outcome = response
+            .extensions()
+            .get::<NativeResponseOutcome>()
+            .unwrap()
+            .clone();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], BODY);
+        assert_eq!(outcome.failure().as_deref(), Some("late failure"));
+        server.await.unwrap();
     }
 
     #[test]
