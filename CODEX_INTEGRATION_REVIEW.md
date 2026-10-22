@@ -42,7 +42,7 @@ The Read whitespace-recovery path at `live_stream.rs:711-737` terminates the ent
 
 ### 2. High: bind reusable sockets and continuation to subscription identity
 
-`src/providers/codex/websocket.rs:311-338` stores pooled sockets by conversation identity only, without endpoint/account/credential generation. Pool acquisition at `:856-901` can reuse a socket authenticated as account A after durable credentials change to account B. Ping/Pong validates liveness, not account ownership.
+When optional continuation/WebSocket reuse is enabled, `src/providers/codex/websocket.rs:311-338` stores pooled sockets by conversation identity only, without endpoint/account/credential generation. Pool acquisition at `:856-901` can reuse a socket authenticated as account A after durable credentials change to account B. Ping/Pong validates liveness, not account ownership.
 
 **Smallest useful fix:** record endpoint and a nonsecret auth-generation fingerprint with the socket; discard mismatched state before sending and fall back to full translated history. Test switching account and endpoint while keeping the same conversation owner. Do not enable continuation by default until this is covered.
 
@@ -90,13 +90,23 @@ The Read whitespace-recovery path at `live_stream.rs:711-737` terminates the ent
 
 `src/providers/codex/translate/model_catalog.rs:23-49` primarily consumes model IDs, visibility/API support and Lite routing. Supported efforts, context budgets and tier/tool capabilities are not generally consumed; tier support remains hard-coded in `model_allowlist.rs:49-65,113-120`.
 
-Read only the metadata needed for actual validation and launch policy. Provide one explicit launch/setup command that selects accessible main/small models, enables deferred tool search and configures a conservative model-specific compaction threshold. Preserve opt-in deployment rather than silently modifying global Claude settings. A `[1m]` suffix does not increase the subscription's context limit. Fail clearly on incompatible requested capabilities; do not silently change the user's model.
+Read only the metadata needed for actual validation and launch policy. Prefer authenticated upstream model discovery, with built-in fallback and the existing local catalog as optional metadata, so using the proxy does not require installing Codex CLI. Native Codex fetches `GET models?client_version=…` and caches identity/version-aware results; consume supported efforts, active context and tool/tier capabilities rather than accepting IDs alone.
+
+Provide one explicit launch/setup command that selects accessible main/small models, enables deferred tool search and configures a conservative model-specific compaction threshold. Preserve opt-in deployment rather than silently modifying global Claude settings. A `[1m]` suffix does not increase the subscription's context limit. Fail clearly on incompatible requested capabilities; do not silently change the user's model. Native Codex's current default compaction policy is 90% of the resolved window (244,800 for 272,000), not waiting until the absolute model maximum; this is a useful benchmark, not a guaranteed ChatGPT entitlement.
+
+### Keep alias routing and translation in sync
+
+The versioned Claude alias lists are duplicated in `src/registry.rs:7-21` (post-cutover) and `src/providers/codex/translate/model_allowlist.rs:27-41`. They match only registered names, not wildcard families. For example, `claude-fable-5-1` is currently rejected despite the earlier documentation's `claude-fable-*` wording. The docs now state this exact-name boundary.
+
+Use one alias definition for routing and translation, with tests for the actual model IDs emitted by supported Claude Code releases. Keep short aliases and explicit Codex IDs working; don't hide future client incompatibility behind an undocumented fallback.
 
 ### Safe continuation and compaction rollout
 
 After the isolation and tool-validation tests pass, measure continuation hit/miss reasons, bytes replayed, cached-input ratio, first-token latency, reconnects and recovered failures. Compare stateless/full-history versus safe socket reuse on the same workloads before considering defaults. Keep existing owner/socket/append-only guards; don't relax them to manufacture hit rates.
 
 Server compaction should remain a bounded optimization over portable Claude history. Fix retained image budgeting first: `src/providers/codex/compaction.rs:460-480` retains images without debiting the token budget even though estimation charges each image 2,000 tokens. Do not add unbounded disk persistence as a shortcut to resume support.
+
+Native Codex also replays the opaque `x-codex-turn-state` response header within the **same turn**, including retries, and clears it across turns/auth ownership changes. The proxy currently has no such replay path. Model this only when an ingress request/turn boundary is unambiguous; do not store it indiscriminately for an entire conversation or expose it as quota telemetry. Compare current session/attempt headers against the official source without pretending to be a different first-party client.
 
 ### Narrow instruction/tool adaptation, not wholesale prompt rewriting
 
@@ -110,6 +120,18 @@ The Read rewrite at `translate/read_rewrite.rs:26-75` intentionally drops very l
 - Fix the shared Windows path discriminator: Rust reports `windows`, while `src/paths.rs:28,50` checks `win32`; test real platform strings.
 - Extend CI platform coverage and add a consented, opt-in live subscription smoke script. Do not run paid/quota-consuming live tests in ordinary CI or commit credentials/captures.
 
+## Official native benchmark sources
+
+Compared against OpenAI Codex source commit [`b337fe06b7d8d6e5b42295e04c5e92c2b9c46567`](https://github.com/openai/codex/commit/b337fe06b7d8d6e5b42295e04c5e92c2b9c46567), observed 2026-10-22:
+
+- [Request assembly, continuation compatibility and turn-state scope](https://github.com/openai/codex/blob/b337fe06b7d8d6e5b42295e04c5e92c2b9c46567/codex-rs/core/src/client.rs).
+- [Model discovery](https://github.com/openai/codex/blob/b337fe06b7d8d6e5b42295e04c5e92c2b9c46567/codex-rs/codex-api/src/endpoint/models.rs) and [capability/context-budget definitions](https://github.com/openai/codex/blob/b337fe06b7d8d6e5b42295e04c5e92c2b9c46567/codex-rs/protocol/src/openai_models.rs).
+- [Credential refresh and concurrent auth ownership](https://github.com/openai/codex/blob/b337fe06b7d8d6e5b42295e04c5e92c2b9c46567/codex-rs/login/src/auth/manager.rs).
+- [Native function-tool conversion](https://github.com/openai/codex/blob/b337fe06b7d8d6e5b42295e04c5e92c2b9c46567/codex-rs/tools/src/responses_api.rs): dynamic/MCP tools use `strict: false`; blanket strict-schema enforcement is not native parity.
+- [WebSocket semantics](https://developers.openai.com/api/docs/guides/websocket-mode), [reasoning](https://developers.openai.com/api/docs/guides/reasoning) and [compaction](https://developers.openai.com/api/docs/guides/compaction).
+
+These sources establish a comparison baseline, not a public compatibility guarantee for the private ChatGPT subscription endpoint. Public Platform API limits and features must not be assumed to be subscription entitlements.
+
 ## Delivery order and acceptance checks
 
 1. Record this review and scope; consolidate configuration, commands, routing and API ingress to Codex only, with rejection tests for removed backends.
@@ -118,4 +140,37 @@ The Read rewrite at `translate/read_rewrite.rs:26-75` intentionally drops very l
 4. Follow up separately with tool-stream parity, account-bound sockets/refresh, input validation and bounded buffers, each with a focused regression and commit.
 5. Add model-aware launch/context defaults and measured continuity improvements only after those correctness checks.
 
-Baseline checks executed before consolidation: `cargo test --all --locked` passed **1,205 tests**; `cargo fmt --all -- --check` passed. Tests use local mocks/synthetic credentials. Live ChatGPT OAuth, account access, generation quality and latency were **not** verified. Consolidation validation is recorded in its commits and the delivery summary.
+Baseline checks executed before consolidation: `cargo test --all --locked` passed **1,205 tests**; `cargo fmt --all -- --check` passed. Tests use local mocks/synthetic credentials. Live ChatGPT OAuth, account access, generation quality and latency were **not** verified.
+
+## Consolidation delivered
+
+The backend-removal request was implemented separately from the native-quality findings above:
+
+- `7c11773`: record the review and subscription-only scope before implementation.
+- `5139008`: Codex-only routing, configuration, commands and API ingress; explicit stale-alias migration errors; rejection and shutdown/stream-monitor regressions. Its full suite passed **821 tests**.
+- `d3a948c`: subscription-only documentation and installer guidance, obsolete page/screenshot removal and redirects for renamed guide URLs. Historical PR provenance remains intact.
+- `6c0bedc`: delete disconnected backend implementations and backend-only dependencies; remove OpenCode-only response policies while retaining strict Codex error behavior.
+
+Only Codex remains as a built-in upstream. Claude Code's Anthropic API and the optional OpenAI-compatible ingress APIs remain. Browser/device OAuth still uses the proxy's own ChatGPT subscription credentials; no Platform API-key authentication was added. Existing user credential files were not removed. Retired model IDs and backend commands are tested as rejected, not silently rerouted.
+
+The native-quality correctness findings are **follow-up work**, not fixes included in this consolidation. The lower test count reflects removal of retired-provider suites and seven alternate-provider policy tests, not a claim that native conformance is complete. Relevant Codex transport, continuation, compaction, tool, auth and cancellation coverage remains.
+
+Documentation syntax/navigation/local links/JSON examples and installer shell syntax passed static checks. A full Astro build was skipped because Bun and the documentation dependencies are not installed. Live subscription login/generation was not verified.
+
+A final test-isolation review found two redundant route-only smoke tests that constructed a real provider against ambient credentials. They were removed in `3eff18d` rather than adding global environment mutation; isolated mock-upstream tests already verify actual Codex routing and generation. Ordinary validation must not implicitly opt a logged-in developer into quota-consuming live calls.
+
+### Final validation result
+
+On the final source/test state, `cargo test --all --locked` passed **812 tests, zero failures**. Formatting, Clippy with `-D warnings`, and the locked release build all passed. The release binary starts and reports version `0.1.45`. Documentation's full Astro build and live subscription behavior remain unverified as noted above.
+
+### Reproduce final validation
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --all --locked
+cargo build --release --locked
+./target/release/claude-code-proxy --version
+```
+
+The release CLI was also checked with isolated `CCP_CONFIG_DIR`, `CODEX_HOME` and `HOME`: model discovery lists only Codex, and all four retired backend commands return exit code 2. No subscription credentials are needed for those checks.

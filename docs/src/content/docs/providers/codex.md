@@ -34,7 +34,7 @@ API-supported models extend the built-in list, including their `-fast` forms;
 hidden catalog models can be requested explicitly. This reads model metadata
 only. Proxy authentication still uses `claude-code-proxy codex auth login`.
 
-Claude-style aliases map to Codex models: `haiku` and `claude-haiku-*` to `gpt-6-luna`, `sonnet` and `claude-sonnet-*` to `gpt-5.6-terra`, and `opus`, `fable`, `claude-opus-*` (including `claude-opus-5-5`), and `claude-fable-*` to `gpt-6-sol`.
+Claude-style aliases map to Codex models: `haiku` to `gpt-6-luna`, `sonnet` to `gpt-5.6-terra`, and `opus` or `fable` to `gpt-6-sol`. Registered versioned Claude aliases use the same family mapping, including `claude-opus-5-5`. Run `claude-code-proxy models` for the exact supported names; arbitrary `claude-*` IDs are not accepted automatically.
 
 Append `-fast` to any registered Codex model to request `service_tier: "priority"`. For example, `gpt-6-sol-fast` selects `gpt-6-sol` with fast service.
 

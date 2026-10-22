@@ -16,13 +16,13 @@ The registry combines built-in models with API-supported entries in `$CODEX_HOME
 
 ## Claude-style aliases
 
-| Alias family | Codex model |
+| Alias | Codex model |
 | --- | --- |
-| `haiku`, `claude-haiku-*` | `gpt-6-luna` |
-| `sonnet`, `claude-sonnet-*` | `gpt-5.6-terra` |
-| `opus`, `fable`, `claude-opus-*`, `claude-fable-*` | `gpt-6-sol` |
+| `haiku` | `gpt-6-luna` |
+| `sonnet` | `gpt-5.6-terra` |
+| `opus`, `fable` | `gpt-6-sol` |
 
-Use concrete Codex IDs when you want explicit model selection.
+Registered versioned Claude aliases use the same family mapping. Run `claude-code-proxy models` for the exact supported names: arbitrary `claude-*` IDs are not accepted automatically. Use concrete Codex IDs when you want explicit model selection.
 
 ## Fast tiers
 
