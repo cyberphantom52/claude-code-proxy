@@ -70,7 +70,7 @@ fn mock_state_for_tick(
     );
     streaming.project = Some("claude-code-proxy".to_string());
     streaming.provider = Some("codex".to_string());
-    streaming.model = Some("claude-sonnet-4-6 → gpt-6-sol".to_string());
+    streaming.model = Some("gpt-6-sol".to_string());
     streaming.effort = Some("high".to_string());
     streaming.generation_finished_at = Some(now - Duration::from_secs(2));
     streaming.traffic_capture_path = Some(PathBuf::from(
@@ -170,7 +170,7 @@ fn mock_state_for_tick(
     );
     success.project = Some("claude-code-proxy".to_string());
     success.provider = Some("codex".to_string());
-    success.model = Some("claude-sonnet-4-6 → gpt-6-sol".to_string());
+    success.model = Some("gpt-6-sol".to_string());
     success.effort = Some("xhigh".to_string());
     success.generation_duration = Some(Duration::from_secs(4));
     success.generation_initial_output_tokens = 32;

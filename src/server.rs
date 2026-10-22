@@ -22,7 +22,7 @@ use crate::{
             prepare_transcription, transcription_error_response,
         },
     },
-    registry::{Registry, normalize_incoming_model},
+    registry::Registry,
     request_identity::{CLAUDE_AGENT_HEADER, CLAUDE_PARENT_AGENT_HEADER, ConversationIdentity},
     session,
     traffic::{TrafficCaptureOptions, create_traffic_capture},
@@ -339,11 +339,7 @@ struct ModelsQuery {
     before_id: Option<String>,
 }
 
-/// Anthropic-shaped model listing so Claude Code's gateway model discovery
-/// (`CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`) finds the proxy's models.
-/// Claude Code only adds entries whose id starts with `claude` or `anthropic`,
-/// so the Anthropic-style aliases are what surface in its `/model` picker;
-/// raw provider ids are still listed for other Anthropic-compatible clients.
+/// Anthropic-shaped listing of native Codex IDs and local service-tier variants.
 async fn handler_models(
     State(state): State<Arc<AppState>>,
     query: Result<Query<ModelsQuery>, axum::extract::rejection::QueryRejection>,
@@ -967,16 +963,16 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
             return monitor_response_body(response, request_guard);
         }
     };
-    let (requested_model, normalized_model) = match extract_model(&body) {
+    let model = match extract_model(&body) {
         Ok(model) => model,
         Err(error) => return monitor_response_body(error.response(), request_guard),
     };
     let now = current_millis();
     let session_state = session::existing_session(session_id.as_deref(), now);
-    let Some(provider) = state.registry.provider_for_model(&normalized_model) else {
+    let Some(provider) = state.registry.provider_for_model(&model) else {
         let response = OpenAiError::invalid(
             format!(
-                "Invalid model ID \"{normalized_model}\". {}",
+                "Invalid model ID \"{model}\". {}",
                 state.registry.unknown_model_message()
             ),
             Some("model"),
@@ -997,7 +993,7 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
         if let Some(current) = current.as_ref() {
             monitor.session_sequence_resolved(&req_id, current.seq);
         }
-        monitor.provider_selected(&req_id, provider.name(), &normalized_model, effort);
+        monitor.provider_selected(&req_id, provider.name(), &model, effort);
     }
     let traffic = create_traffic_capture(TrafficCaptureOptions {
         req_id: req_id.clone(),
@@ -1018,8 +1014,8 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
                 "sessionSeq": current.as_ref().map(|session| session.seq),
                 "kind": "responses",
                 "provider": provider.name(),
-                "model": &normalized_model,
-                "requestedModel": &requested_model,
+                "model": &model,
+                "requestedModel": &model,
                 "method": method.as_str(),
                 "path": &path,
                 "query": &query,
@@ -1052,7 +1048,7 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
         &req_id,
         "responses",
         provider.name(),
-        Some(&normalized_model),
+        Some(&model),
         response.status(),
         started_at,
     );
@@ -1126,16 +1122,16 @@ async fn handler_chat_completions(
             return monitor_response_body(response, request_guard);
         }
     };
-    let (requested_model, normalized_model) = match extract_model(&body) {
+    let model = match extract_model(&body) {
         Ok(model) => model,
         Err(error) => return monitor_response_body(error.response(), request_guard),
     };
     let now = current_millis();
     let session_state = session::existing_session(session_id.as_deref(), now);
-    let Some(provider) = state.registry.provider_for_model(&normalized_model) else {
+    let Some(provider) = state.registry.provider_for_model(&model) else {
         let response = OpenAiError::invalid(
             format!(
-                "Invalid model ID \"{normalized_model}\". {}",
+                "Invalid model ID \"{model}\". {}",
                 state.registry.unknown_model_message()
             ),
             Some("model"),
@@ -1154,7 +1150,7 @@ async fn handler_chat_completions(
         if let Some(current) = current.as_ref() {
             monitor.session_sequence_resolved(&req_id, current.seq);
         }
-        monitor.provider_selected(&req_id, provider.name(), &normalized_model, effort.clone());
+        monitor.provider_selected(&req_id, provider.name(), &model, effort.clone());
     }
     let traffic = create_traffic_capture(TrafficCaptureOptions {
         req_id: req_id.clone(),
@@ -1175,8 +1171,8 @@ async fn handler_chat_completions(
                 "sessionSeq": current.as_ref().map(|session| session.seq),
                 "kind": "chat_completions",
                 "provider": provider.name(),
-                "model": &normalized_model,
-                "requestedModel": &requested_model,
+                "model": &model,
+                "requestedModel": &model,
                 "effort": &effort,
                 "method": method.as_str(),
                 "path": &path,
@@ -1211,7 +1207,7 @@ async fn handler_chat_completions(
         &req_id,
         "chat_completions",
         provider.name(),
-        Some(&normalized_model),
+        Some(&model),
         response.status(),
         started_at,
     );
@@ -1517,10 +1513,9 @@ async fn dispatch_request(
             }
         };
 
-        let mut normalized_model = normalize_incoming_model(model);
-        body.model = Some(normalized_model.clone());
+        let mut model = model.to_owned();
         let session_state = session::existing_session(session_id.as_deref(), now);
-        let original_provider = state.registry.provider_for_model(&normalized_model);
+        let original_provider = state.registry.provider_for_model(&model);
         let configured_auto_review_model = crate::config::auto_review_model();
         let auto_review_route = original_provider.as_ref().and_then(|_| {
             apply_auto_review_model(
@@ -1530,13 +1525,11 @@ async fn dispatch_request(
             )
         });
         if auto_review_route.is_some() {
-            normalized_model =
-                normalize_incoming_model(body.model.as_deref().expect("override model"));
-            body.model = Some(normalized_model.clone());
+            model = body.model.clone().expect("override model");
         }
 
         let provider = if auto_review_route.is_some() {
-            state.registry.provider_for_model(&normalized_model)
+            state.registry.provider_for_model(&model)
         } else {
             original_provider
         };
@@ -1548,14 +1541,14 @@ async fn dispatch_request(
                     "unknown model",
                     Some(serde_json::Map::from_iter([
                         ("reqId".to_string(), json!(&req_id)),
-                        ("model".to_string(), json!(&normalized_model)),
+                        ("model".to_string(), json!(&model)),
                     ])),
                 );
                 let response = json_error(
                     StatusCode::BAD_REQUEST,
                     "invalid_request_error",
                     format!(
-                        "Invalid model ID \"{normalized_model}\". {}",
+                        "Invalid model ID \"{model}\". {}",
                         state.registry.unknown_model_message()
                     ),
                 );
@@ -1564,7 +1557,7 @@ async fn dispatch_request(
                     RequestLogContext {
                         req_id: &req_id,
                         provider: None,
-                        model: Some(&normalized_model),
+                        model: Some(&model),
                         count_tokens,
                         status: response.status(),
                         started_at,
@@ -1575,7 +1568,7 @@ async fn dispatch_request(
                     FailedResponseLogContext {
                         req_id: &req_id,
                         provider: None,
-                        model: Some(&normalized_model),
+                        model: Some(&model),
                         count_tokens,
                         started_at,
                     },
@@ -1629,7 +1622,7 @@ async fn dispatch_request(
             if let Some(current) = current.as_ref() {
                 monitor.session_sequence_resolved(&req_id, current.seq);
             }
-            monitor.provider_selected(&req_id, provider.name(), &normalized_model, effort);
+            monitor.provider_selected(&req_id, provider.name(), &model, effort);
         }
 
         let traffic = create_traffic_capture(TrafficCaptureOptions {
@@ -1652,7 +1645,7 @@ async fn dispatch_request(
                     "sessionSeq": current.as_ref().map(|s| s.seq),
                     "kind": if count_tokens { "count_tokens" } else { "messages" },
                     "provider": provider.name(),
-                    "model": &normalized_model,
+                    "model": &model,
                     "method": method.as_str(),
                     "path": &path,
                     "query": &query,
@@ -1698,7 +1691,7 @@ async fn dispatch_request(
             RequestLogContext {
                 req_id: &req_id,
                 provider: Some(provider.name()),
-                model: Some(&normalized_model),
+                model: Some(&model),
                 count_tokens,
                 status: response.status(),
                 started_at,
@@ -1714,7 +1707,7 @@ async fn dispatch_request(
             FailedResponseLogContext {
                 req_id: &req_id,
                 provider: Some(provider.name()),
-                model: Some(&normalized_model),
+                model: Some(&model),
                 count_tokens,
                 started_at,
             },

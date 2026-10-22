@@ -21,22 +21,6 @@ pub const FALLBACK_MODELS: &[&str] = &[
     "gpt-6.1-sol",
 ];
 
-pub const MODEL_ALIASES: &[(&str, &str)] = &[
-    ("haiku", "gpt-6-luna"),
-    ("claude-haiku-4-5", "gpt-6-luna"),
-    ("claude-haiku-4-5-20251001", "gpt-6-luna"),
-    ("sonnet", "gpt-6-sol"),
-    ("claude-sonnet-4-6", "gpt-6-sol"),
-    ("claude-sonnet-5", "gpt-6-sol"),
-    ("opus", "gpt-6.1-sol"),
-    ("claude-opus-4-7", "gpt-6.1-sol"),
-    ("claude-opus-4-8", "gpt-6.1-sol"),
-    ("claude-opus-5", "gpt-6.1-sol"),
-    ("claude-opus-5-5", "gpt-6.1-sol"),
-    ("fable", "gpt-6-astra"),
-    ("claude-fable-5", "gpt-6-astra"),
-];
-
 #[derive(Debug, Clone)]
 pub struct ResolvedModel {
     pub model: String,
@@ -311,19 +295,6 @@ pub fn validate_input_modalities(model: &str, input: &serde_json::Value) -> anyh
     Ok(())
 }
 
-fn resolve_tier_model_alias(model: &str) -> ResolvedModel {
-    match split_tier_suffix(model) {
-        Some((base, tier)) => ResolvedModel {
-            model: base.to_string(),
-            service_tier: Some(tier),
-        },
-        None => ResolvedModel {
-            model: model.to_string(),
-            service_tier: None,
-        },
-    }
-}
-
 /// An operator pin may agree with a request, but must never silently redirect it.
 pub fn validate_model_configuration(model: &str, apply_override: bool) -> anyhow::Result<()> {
     let configured = apply_override.then(config::codex_model).flatten();
@@ -346,34 +317,6 @@ fn validate_model_override(model: &str, configured: Option<&str>) -> anyhow::Res
     Ok(())
 }
 
-/// Shared family resolution; never substitutes an explicit native model ID.
-pub fn anthropic_alias_target(model: &str) -> Option<&'static str> {
-    if !is_allowed_model(model) {
-        return None;
-    }
-    let model = model.strip_suffix("[1m]").unwrap_or(model);
-    let model = model
-        .strip_suffix(ULTRAFAST_SUFFIX)
-        .or_else(|| model.strip_suffix(FAST_SUFFIX))
-        .unwrap_or(model);
-    let family = model.strip_prefix("claude-").unwrap_or(model);
-    if family == "fable" || family.starts_with("fable-") {
-        Some("gpt-6-astra")
-    } else if family == "opus" || family.starts_with("opus-") {
-        Some("gpt-6.1-sol")
-    } else if family == "sonnet" || family.starts_with("sonnet-") {
-        Some("gpt-6-sol")
-    } else if family == "haiku" || family.starts_with("haiku-") {
-        Some("gpt-6-luna")
-    } else {
-        None
-    }
-}
-
-pub fn is_anthropic_alias(model: &str) -> bool {
-    anthropic_alias_target(model).is_some()
-}
-
 pub fn resolve_model_request(model: &str) -> ResolvedModel {
     if !is_allowed_model(model) {
         return ResolvedModel {
@@ -381,20 +324,16 @@ pub fn resolve_model_request(model: &str) -> ResolvedModel {
             service_tier: None,
         };
     }
-    let model = model.strip_suffix("[1m]").unwrap_or(model);
-    if let Some(target) = anthropic_alias_target(model) {
-        return ResolvedModel {
-            model: target.to_string(),
-            service_tier: if model.ends_with(ULTRAFAST_SUFFIX) {
-                Some(ServiceTier::Ultrafast)
-            } else if model.ends_with(FAST_SUFFIX) {
-                Some(ServiceTier::Priority)
-            } else {
-                None
-            },
-        };
+    match split_tier_suffix(model) {
+        Some((base, tier)) => ResolvedModel {
+            model: base.to_string(),
+            service_tier: Some(tier),
+        },
+        None => ResolvedModel {
+            model: model.to_string(),
+            service_tier: None,
+        },
     }
-    resolve_tier_model_alias(model)
 }
 
 #[derive(Debug, Clone)]

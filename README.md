@@ -67,27 +67,29 @@ Start Claude Code in another:
 ```sh
 ANTHROPIC_BASE_URL=http://127.0.0.1:18765 \
 ANTHROPIC_AUTH_TOKEN=unused \
-  claude
+ANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-6-luna \
+  claude --model gpt-6.1-sol
 ```
 
-These connection settings apply only to this command; no global settings change
-is needed. Optionally add `ANTHROPIC_MODEL=fable` and
-`ANTHROPIC_SMALL_FAST_MODEL=haiku` to select main and background model families.
+These settings apply only to this command; no global settings change is needed.
+The main session uses an actual Codex model ID, and background requests use
+`gpt-6-luna`.
 
-Switch models inside Claude Code without exiting:
+Switch models inside Claude Code without exiting by entering their full IDs
+(the gateway picker currently filters out raw `gpt-*` IDs):
 
 ```text
-/model fable
-/model opus
-/model sonnet
+/model gpt-6-astra
+/model gpt-6.1-sol
+/model gpt-6-sol
 ```
 
-Fable maps to `gpt-6-astra`, Opus to `gpt-6.1-sol`, Sonnet to `gpt-6-sol`,
-and Haiku to `gpt-6-luna`. Well-formed explicit IDs pass through even when
-absent from discovery; upstream validates access. Remove conflicting proxy-side
-`CCP_CODEX_MODEL` / `codex.model` overrides on the proxy. Errors never cause
-substitution with a different model. `[1m]` cannot increase the upstream context
-window; Claude Code manages client compaction independently.
+Claude-family names are not mapped to Codex models. Well-formed explicit IDs pass
+through even when absent from discovery; upstream validates access. Remove
+conflicting proxy-side `CCP_CODEX_MODEL` / `codex.model` overrides on the proxy.
+Errors never cause substitution with a different model. Model discovery does not
+configure Claude Code's context window or auto-compaction; those remain separate
+client settings.
 
 Optional Codex image generation and editing can reuse the same ChatGPT login:
 
@@ -114,9 +116,9 @@ The catalog supplies menus, default choices, and known effort, verbosity, lane,
 context, and service-tier metadata—not an admission allowlist. Well-formed
 opaque model IDs are forwarded for upstream validation without substitution.
 `-fast` / `-ultrafast` select supported tiers; paid acceleration is not enabled
-merely by an advertised default tier. Stock Claude Code `/fast` is Opus-only
-and may switch to Opus before sending a request; for other families use
-`/model fable-fast`, `/model sonnet-fast`, or `/model haiku-fast` when supported.
+merely by an advertised default tier. Use `/model gpt-6.1-sol-fast` or other
+advertised Codex tier variants. Stock Claude Code `/fast` is Claude-specific and
+may select a Claude model; it is not a speed control for explicit Codex IDs.
 Catalog advertising does not guarantee account entitlement or quota.
 
 Anthropic Messages is enabled by default. Set `CCP_CODEX_RESPONSES_API=1` on the

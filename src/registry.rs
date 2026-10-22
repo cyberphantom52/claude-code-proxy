@@ -8,25 +8,6 @@ use crate::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-pub const ANTHROPIC_STYLE_ALIASES: &[&str] = &[
-    "haiku",
-    "claude-haiku-4-5",
-    "claude-haiku-4-5-20251001",
-    "claude-haiku-5-5",
-    "sonnet",
-    "claude-sonnet-4-6",
-    "claude-sonnet-5",
-    "claude-sonnet-5-5",
-    "opus",
-    "claude-opus-4-7",
-    "claude-opus-4-8",
-    "claude-opus-5",
-    "claude-opus-5-5",
-    "fable",
-    "claude-fable-5",
-    "claude-fable-5-1",
-];
-
 pub struct Registry {
     models: BTreeMap<String, Vec<String>>,
     handlers: BTreeMap<String, Arc<dyn Provider>>,
@@ -61,23 +42,15 @@ impl Registry {
 
     pub fn supported_models_for(&self, provider: &str) -> Vec<String> {
         let mut models = self.models.get(provider).cloned().unwrap_or_default();
-        if provider == "codex" {
-            if let Some(catalog) = model_catalog::scoped_catalog() {
-                if catalog.authoritative {
-                    models.clear();
-                }
-                models.extend(expand_codex_models());
-                models.sort_unstable();
-                models.dedup();
+        if provider == "codex"
+            && let Some(catalog) = model_catalog::scoped_catalog()
+        {
+            if catalog.authoritative {
+                models.clear();
             }
-            for alias in ANTHROPIC_STYLE_ALIASES {
-                let target = model_allowlist::resolve_model_request(alias);
-                if model_catalog::catalog_model(&target.model).is_some()
-                    && !models.iter().any(|value| value == alias)
-                {
-                    models.push((*alias).to_string());
-                }
-            }
+            models.extend(expand_codex_models());
+            models.sort_unstable();
+            models.dedup();
         }
         models.sort_unstable();
         models
@@ -101,13 +74,12 @@ impl Registry {
         out
     }
 
-    pub fn provider_for_model(&self, raw_model: &str) -> Option<Arc<dyn Provider>> {
-        let normalized = normalize_incoming_model(raw_model);
-        if !model_allowlist::is_valid_model_for_codex(&normalized) {
+    pub fn provider_for_model(&self, model: &str) -> Option<Arc<dyn Provider>> {
+        if !model_allowlist::is_valid_model_for_codex(model) {
             return None;
         }
         for (name, models) in &self.models {
-            if models.iter().any(|candidate| candidate == &normalized) {
+            if models.iter().any(|candidate| candidate == model) {
                 return self.handlers.get(name).cloned();
             }
         }
@@ -122,18 +94,6 @@ impl Registry {
         }
         format!("Known models: {}.", parts.join("; "))
     }
-}
-
-pub fn normalize_incoming_model(model: &str) -> String {
-    let suffix = "[1m]";
-    if model.len() >= suffix.len() && model.to_ascii_lowercase().ends_with(suffix) {
-        return model[..model.len() - suffix.len()].to_string();
-    }
-    model.to_string()
-}
-
-pub fn is_anthropic_alias(model: &str) -> bool {
-    model_allowlist::is_anthropic_alias(model)
 }
 
 pub(crate) fn expand_codex_models() -> Vec<String> {

@@ -1,6 +1,7 @@
 use http::StatusCode;
 use serde_json::{Map, Value, json};
 
+use crate::config;
 use crate::providers::codex::translate::{
     model_allowlist::{
         assert_allowed_model, model_parallel_tool_calls, model_reasoning_summary, model_verbosity,
@@ -9,7 +10,6 @@ use crate::providers::codex::translate::{
     },
     request::{Effort, ServiceTier, reasoning_requested, resolve_effort_override, to_codex_effort},
 };
-use crate::{config, registry::normalize_incoming_model};
 
 use super::ChatError;
 
@@ -45,8 +45,7 @@ pub fn translate_request(body: &Value) -> Result<TranslatedRequest, ChatError> {
     reject_unsupported_fields(object)?;
 
     let requested_model = required_string(object, "model")?;
-    let normalized = normalize_incoming_model(requested_model);
-    let resolved = resolve_model_request(&normalized);
+    let resolved = resolve_model_request(requested_model);
     assert_allowed_model(&resolved.model).map_err(|error| {
         ChatError::invalid(error.to_string(), Some("model"), Some("invalid_value"))
     })?;

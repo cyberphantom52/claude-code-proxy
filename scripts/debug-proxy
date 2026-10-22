@@ -127,8 +127,8 @@ PID: $proxy_pid
 
 In another shell, load the proxy endpoint and choose models:
   source "$client_env"
-  export ANTHROPIC_MODEL=fable
-  export ANTHROPIC_SMALL_FAST_MODEL=haiku
+  export ANTHROPIC_MODEL=gpt-6.1-sol
+  export ANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-6-luna
   claude
 
 Live process output:
