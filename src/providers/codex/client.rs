@@ -371,6 +371,7 @@ struct HttpEventStreamState {
     auth_refresh_attempted: bool,
     use_responses_lite: bool,
     retries: u32,
+    model: String,
 }
 
 impl HttpSseDecoder {
@@ -1076,6 +1077,19 @@ impl CodexHttpClient {
         let mut auth_refresh_attempted = false;
         let use_responses_lite = body.client_metadata.is_some();
         let mut retries = 0_u32;
+        let retry_started_at = Instant::now();
+        let log_retry = |error: &CodexError, failed_attempt, delay_ms, stop_reason| {
+            log_http_stream_retry(
+                ctx,
+                &body.model,
+                "startup",
+                retry_started_at,
+                failed_attempt,
+                error,
+                delay_ms,
+                stop_reason,
+            );
+        };
         let (resp, response_headers, started_at) = loop {
             match self
                 .start_http_event_attempt(
@@ -1090,16 +1104,27 @@ impl CodexHttpClient {
                 Ok(attempt) => break attempt,
                 Err(error) if retryable_http_stream_error(&error) => {
                     if retries >= MAX_BUFFERED_TRANSPORT_RETRIES {
+                        log_retry(&error, retries + 1, None, Some("attempts_exhausted"));
                         return Err(error);
                     }
                     let delay = compute_backoff_delay(retries, error.retry_after.as_deref());
                     if delay.exceeds_budget {
+                        log_retry(
+                            &error,
+                            retries + 1,
+                            Some(delay.wait_ms),
+                            Some("delay_budget_exceeded"),
+                        );
                         return Err(error);
                     }
+                    log_retry(&error, retries + 1, Some(delay.wait_ms), None);
                     retries += 1;
                     sleep(delay.wait_ms).await;
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    log_retry(&error, retries + 1, None, Some("not_retryable"));
+                    return Err(error);
+                }
             }
         };
 
@@ -1115,6 +1140,7 @@ impl CodexHttpClient {
                 auth_refresh_attempted,
                 use_responses_lite,
                 retries,
+                model: body.model.clone(),
             },
             ctx.clone(),
         ))
@@ -1228,6 +1254,7 @@ impl CodexHttpClient {
             mut auth_refresh_attempted,
             use_responses_lite,
             mut retries,
+            model,
         } = state;
         let client = self.clone();
         let body_idle_timeout_ms = self.body_idle_timeout_ms;
@@ -1240,6 +1267,19 @@ impl CodexHttpClient {
             let log = create_logger("codex");
             let mut semantic_output_forwarded = false;
             let mut replay_committed = false;
+            let retry_started_at = started_at;
+            let log_retry = |error: &CodexError, failed_attempt, delay_ms, stop_reason| {
+                log_http_stream_retry(
+                    &ctx,
+                    &model,
+                    "reopen",
+                    retry_started_at,
+                    failed_attempt,
+                    error,
+                    delay_ms,
+                    stop_reason,
+                );
+            };
 
             if tx
                 .send(Ok(serde_json::json!({
@@ -1527,22 +1567,36 @@ impl CodexHttpClient {
 
                 loop {
                     if retries >= MAX_BUFFERED_TRANSPORT_RETRIES {
+                        log_retry(&retry_error, retries + 1, None, Some("attempts_exhausted"));
                         let _ = tx.send(Err(retry_error)).await;
                         return;
                     }
                     let delay = compute_backoff_delay(retries, retry_error.retry_after.as_deref());
                     if delay.exceeds_budget {
+                        log_retry(
+                            &retry_error,
+                            retries + 1,
+                            Some(delay.wait_ms),
+                            Some("delay_budget_exceeded"),
+                        );
                         let _ = tx.send(Err(retry_error)).await;
                         return;
                     }
+                    log_retry(&retry_error, retries + 1, Some(delay.wait_ms), None);
                     retries += 1;
                     tokio::select! {
-                        _ = tx.closed() => return,
+                        _ = tx.closed() => {
+                            log_retry(&retry_error, retries, Some(delay.wait_ms), Some("receiver_closed_during_backoff"));
+                            return;
+                        },
                         _ = sleep(delay.wait_ms) => {}
                     }
 
                     let next_attempt = tokio::select! {
-                        _ = tx.closed() => return,
+                        _ = tx.closed() => {
+                            log_retry(&retry_error, retries, Some(delay.wait_ms), Some("receiver_closed_during_reopen"));
+                            return;
+                        },
                         result = client.start_http_event_attempt(
                             &mut auth,
                             &body_json,
@@ -1564,6 +1618,7 @@ impl CodexHttpClient {
                             retry_error = error;
                         }
                         Err(error) => {
+                            log_retry(&error, retries + 1, None, Some("not_retryable"));
                             let _ = tx.send(Err(error)).await;
                             return;
                         }
@@ -2951,6 +3006,71 @@ fn retryable_http_stream_error(error: &CodexError) -> bool {
     let message = error.message.to_ascii_lowercase();
     message.contains("ended before a terminal response event")
         || message.contains("ended with an incomplete frame")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn log_http_stream_retry(
+    ctx: &RequestContext,
+    model: &str,
+    phase: &'static str,
+    started_at: Instant,
+    failed_attempt: u32,
+    error: &CodexError,
+    delay_ms: Option<u64>,
+    stop_reason: Option<&'static str>,
+) {
+    // Classify locally: error messages/details may contain upstream payloads.
+    let reason = if error.usage_limit.is_some() {
+        "usage_limit"
+    } else if error.origin == CodexErrorOrigin::Auth {
+        "auth_error"
+    } else {
+        match error.detail.as_deref() {
+            Some(HTTP_RESPONSE_HEADERS_DETAIL) => "http_response_headers",
+            Some("http_response_body") => "http_response_body",
+            Some("http_response_sse") => "http_response_sse",
+            _ if error.status != 0 => "upstream_status",
+            Some(_) => "upstream_event_or_stream_error",
+            None => "transport_error",
+        }
+    };
+    let mut fields = serde_json::Map::from_iter([
+        ("reqId".into(), serde_json::json!(ctx.req_id)),
+        ("transport".into(), serde_json::json!("http")),
+        ("model".into(), serde_json::json!(model)),
+        ("phase".into(), serde_json::json!(phase)),
+        ("failedAttempt".into(), serde_json::json!(failed_attempt)),
+        (
+            "maxAttempts".into(),
+            serde_json::json!(MAX_BUFFERED_TRANSPORT_ATTEMPTS),
+        ),
+        ("status".into(), serde_json::json!(error.status)),
+        (
+            "origin".into(),
+            serde_json::json!(codex_error_origin_name(error.origin)),
+        ),
+        ("reason".into(), serde_json::json!(reason)),
+        (
+            "ms".into(),
+            serde_json::json!(started_at.elapsed().as_millis()),
+        ),
+    ]);
+    if let Some(delay_ms) = delay_ms {
+        fields.insert("delayMs".into(), serde_json::json!(delay_ms));
+    }
+    let event = if let Some(stop_reason) = stop_reason {
+        fields.insert("stopReason".into(), serde_json::json!(stop_reason));
+        "codex_http_stream_retry_stopped"
+    } else {
+        fields.insert("nextAttempt".into(), serde_json::json!(failed_attempt + 1));
+        "codex_http_stream_retry"
+    };
+    let log = create_logger("codex");
+    if error.usage_limit.is_some() {
+        log.info(event, Some(fields));
+    } else {
+        log.warn(event, Some(fields));
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

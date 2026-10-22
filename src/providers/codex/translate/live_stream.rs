@@ -203,6 +203,7 @@ pub struct LiveStreamTranslator {
     deferred_text: Vec<(usize, String)>,
     deferred_text_bytes: usize,
     semantic_output_started: bool,
+    current_generation_semantic_output_started: bool,
     text_output_started: bool,
     // Seeds Claude Code's live subagent counter until the provider returns
     // authoritative usage in the terminal message_delta.
@@ -236,6 +237,7 @@ impl LiveStreamTranslator {
             deferred_text: Vec::new(),
             deferred_text_bytes: 0,
             semantic_output_started: false,
+            current_generation_semantic_output_started: false,
             text_output_started: false,
             estimated_input_tokens,
             finished: false,
@@ -334,6 +336,10 @@ impl LiveStreamTranslator {
         self.semantic_output_started
     }
 
+    pub fn has_current_generation_semantic_output(&self) -> bool {
+        self.current_generation_semantic_output_started
+    }
+
     /// Only thinking has been exposed. Text and tool blocks cannot be replayed
     /// safely because the consumer may already have acted on them.
     pub fn can_reconnect(&self) -> bool {
@@ -350,6 +356,7 @@ impl LiveStreamTranslator {
         self.reasoning_by_output_index.clear();
         self.item_id_to_output_index.clear();
         self.service_tier = None;
+        self.current_generation_semantic_output_started = false;
         // Preserve message_started and anthropic_index: one downstream message,
         // with fresh block indices for the replacement generation.
         out
@@ -570,6 +577,7 @@ impl LiveStreamTranslator {
             return;
         }
         self.semantic_output_started = true;
+        self.current_generation_semantic_output_started = true;
         if self.thinking.map(|thinking| thinking.output_index) != Some(output_index) {
             self.close_thinking(traffic, out);
             let index = self.anthropic_index;
@@ -641,6 +649,7 @@ impl LiveStreamTranslator {
         }
         self.close_thinking(traffic, out);
         self.semantic_output_started = true;
+        self.current_generation_semantic_output_started = true;
         self.text_output_started = true;
 
         if !self.blocks_by_output_index.contains_key(&output_index) {
@@ -714,6 +723,7 @@ impl LiveStreamTranslator {
             return Ok(());
         }
         self.semantic_output_started = true;
+        self.current_generation_semantic_output_started = true;
         let Some(LiveBlock::Tool {
             index,
             name,
@@ -807,6 +817,7 @@ impl LiveStreamTranslator {
         {
             self.close_thinking(traffic, out);
             self.semantic_output_started = true;
+            self.current_generation_semantic_output_started = true;
             let item = &payload["item"];
             let index = self.anthropic_index;
             self.anthropic_index += 1;
@@ -888,6 +899,7 @@ impl LiveStreamTranslator {
                     .as_ref()
                     .expect("validated tool completion");
                 self.semantic_output_started = true;
+                self.current_generation_semantic_output_started = true;
                 if !*emitted_args {
                     *args_accum =
                         sanitize_read_args(name, &completed.arguments, Some(call_id.as_str()));
@@ -931,6 +943,7 @@ impl LiveStreamTranslator {
         self.close_thinking(traffic, out);
         self.saw_tool_use = true;
         self.semantic_output_started = true;
+        self.current_generation_semantic_output_started = true;
         let index = self.anthropic_index;
         self.anthropic_index += 1;
         self.ensure_message_start(traffic, out);
@@ -1244,6 +1257,7 @@ impl LiveStreamTranslator {
             return;
         };
         self.semantic_output_started = true;
+        self.current_generation_semantic_output_started = true;
         let index = self.anthropic_index;
         self.anthropic_index += 1;
         self.ensure_message_start(traffic, out);

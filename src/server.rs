@@ -284,6 +284,12 @@ async fn discover_models(
     request: Request<Body>,
     next: axum::middleware::Next,
 ) -> Response {
+    if matches!(
+        request.uri().path(),
+        "/v1/messages" | "/v1/messages/count_tokens"
+    ) {
+        return next.run(request).await;
+    }
     let context = state.discovery.prepare_model_context().await;
     models::with_model_context(context, next.run(request)).await
 }
@@ -1409,280 +1415,330 @@ async fn dispatch_request(
         }
     };
 
-    if let Some(project) = project::name_from_request(
-        body.extra.get("system"),
-        body.messages.iter().rev().map(|message| &message.content),
-    ) && let Some(monitor) = state.monitor.as_ref()
+    if body
+        .extra
+        .get("thread")
+        .is_some_and(|thread| !thread.is_null())
+        || headers
+            .get_all("anthropic-beta")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|value| value.split(','))
+            .any(|beta| beta.trim() == "message-threads-2026-08-12")
     {
-        monitor.project_resolved(&req_id, project);
-    }
-
-    let model = match body.model.as_deref() {
-        Some(model) => model,
-        None => {
-            let response = json_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                format!(
-                    "Missing \"model\" in request body. {}",
-                    state.registry.unknown_model_message()
-                ),
-            );
-            log_request_completed(
-                &log,
-                RequestLogContext {
-                    req_id: &req_id,
-                    provider: None,
-                    model: None,
-                    count_tokens,
-                    status: response.status(),
-                    started_at,
-                },
-            );
-            let (response, details) = record_failed_response(
-                &log,
-                FailedResponseLogContext {
-                    req_id: &req_id,
-                    provider: None,
-                    model: None,
-                    count_tokens,
-                    started_at,
-                },
-                response,
-            )
-            .await;
-            monitor_failed(
-                state.monitor.as_ref(),
-                &req_id,
-                Some(response.status()),
-                details
-                    .as_ref()
-                    .map(|details| details.message.as_str())
-                    .unwrap_or("Missing model"),
-            );
-            return with_request_id(response, &req_id);
-        }
-    };
-
-    let mut normalized_model = normalize_incoming_model(model);
-    body.model = Some(normalized_model.clone());
-    let session_state = session::existing_session(session_id.as_deref(), now);
-    let original_provider = state.registry.provider_for_model(&normalized_model);
-    let configured_auto_review_model = crate::config::auto_review_model();
-    let auto_review_route = original_provider.as_ref().and_then(|_| {
-        apply_auto_review_model(
-            &mut body,
-            count_tokens,
-            configured_auto_review_model.as_deref(),
+        let message = "capability_rejected: beta_header:message-threads-2026-08-12";
+        let response = json_error(StatusCode::BAD_REQUEST, "invalid_request_error", message);
+        log_request_completed(
+            &log,
+            RequestLogContext {
+                req_id: &req_id,
+                provider: None,
+                model: None,
+                count_tokens,
+                status: response.status(),
+                started_at,
+            },
+        );
+        let (response, _) = record_failed_response(
+            &log,
+            FailedResponseLogContext {
+                req_id: &req_id,
+                provider: None,
+                model: None,
+                count_tokens,
+                started_at,
+            },
+            response,
         )
-    });
-    if auto_review_route.is_some() {
-        normalized_model = normalize_incoming_model(body.model.as_deref().expect("override model"));
-        body.model = Some(normalized_model.clone());
+        .await;
+        monitor_failed(
+            state.monitor.as_ref(),
+            &req_id,
+            Some(response.status()),
+            message,
+        );
+        return with_request_id(response, &req_id);
     }
 
-    let provider = if auto_review_route.is_some() {
-        state.registry.provider_for_model(&normalized_model)
-    } else {
-        original_provider
-    };
+    let context = state.discovery.prepare_model_context().await;
+    models::with_model_context(context, async {
+        if let Some(project) = project::name_from_request(
+            body.extra.get("system"),
+            body.messages.iter().rev().map(|message| &message.content),
+        ) && let Some(monitor) = state.monitor.as_ref()
+        {
+            monitor.project_resolved(&req_id, project);
+        }
 
-    let provider = match provider {
-        Some(provider) => provider,
-        None => {
-            log.warn(
-                "unknown model",
-                Some(serde_json::Map::from_iter([
+        let model = match body.model.as_deref() {
+            Some(model) => model,
+            None => {
+                let response = json_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    format!(
+                        "Missing \"model\" in request body. {}",
+                        state.registry.unknown_model_message()
+                    ),
+                );
+                log_request_completed(
+                    &log,
+                    RequestLogContext {
+                        req_id: &req_id,
+                        provider: None,
+                        model: None,
+                        count_tokens,
+                        status: response.status(),
+                        started_at,
+                    },
+                );
+                let (response, details) = record_failed_response(
+                    &log,
+                    FailedResponseLogContext {
+                        req_id: &req_id,
+                        provider: None,
+                        model: None,
+                        count_tokens,
+                        started_at,
+                    },
+                    response,
+                )
+                .await;
+                monitor_failed(
+                    state.monitor.as_ref(),
+                    &req_id,
+                    Some(response.status()),
+                    details
+                        .as_ref()
+                        .map(|details| details.message.as_str())
+                        .unwrap_or("Missing model"),
+                );
+                return with_request_id(response, &req_id);
+            }
+        };
+
+        let mut normalized_model = normalize_incoming_model(model);
+        body.model = Some(normalized_model.clone());
+        let session_state = session::existing_session(session_id.as_deref(), now);
+        let original_provider = state.registry.provider_for_model(&normalized_model);
+        let configured_auto_review_model = crate::config::auto_review_model();
+        let auto_review_route = original_provider.as_ref().and_then(|_| {
+            apply_auto_review_model(
+                &mut body,
+                count_tokens,
+                configured_auto_review_model.as_deref(),
+            )
+        });
+        if auto_review_route.is_some() {
+            normalized_model =
+                normalize_incoming_model(body.model.as_deref().expect("override model"));
+            body.model = Some(normalized_model.clone());
+        }
+
+        let provider = if auto_review_route.is_some() {
+            state.registry.provider_for_model(&normalized_model)
+        } else {
+            original_provider
+        };
+
+        let provider = match provider {
+            Some(provider) => provider,
+            None => {
+                log.warn(
+                    "unknown model",
+                    Some(serde_json::Map::from_iter([
+                        ("reqId".to_string(), json!(&req_id)),
+                        ("model".to_string(), json!(&normalized_model)),
+                    ])),
+                );
+                let response = json_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    format!(
+                        "Invalid model ID \"{normalized_model}\". {}",
+                        state.registry.unknown_model_message()
+                    ),
+                );
+                log_request_completed(
+                    &log,
+                    RequestLogContext {
+                        req_id: &req_id,
+                        provider: None,
+                        model: Some(&normalized_model),
+                        count_tokens,
+                        status: response.status(),
+                        started_at,
+                    },
+                );
+                let (response, details) = record_failed_response(
+                    &log,
+                    FailedResponseLogContext {
+                        req_id: &req_id,
+                        provider: None,
+                        model: Some(&normalized_model),
+                        count_tokens,
+                        started_at,
+                    },
+                    response,
+                )
+                .await;
+                monitor_failed(
+                    state.monitor.as_ref(),
+                    &req_id,
+                    Some(response.status()),
+                    details
+                        .as_ref()
+                        .map(|details| details.message.as_str())
+                        .unwrap_or("Unknown model"),
+                );
+                return with_request_id(response, &req_id);
+            }
+        };
+
+        body.bypass_provider_model_override = auto_review_route.is_some();
+        if body.bypass_provider_model_override {
+            apply_codex_auto_review_defaults(&mut body, session_id.as_deref());
+        }
+
+        if let Some(route) = auto_review_route.as_ref() {
+            log.info(
+                "auto-review route selected",
+                Some(Map::from_iter([
                     ("reqId".to_string(), json!(&req_id)),
-                    ("model".to_string(), json!(&normalized_model)),
+                    ("requestedModel".to_string(), json!(&route.requested_model)),
+                    ("overrideModel".to_string(), json!(&route.override_model)),
+                    ("provider".to_string(), json!(provider.name())),
                 ])),
             );
-            let response = json_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                format!(
-                    "Invalid model ID \"{normalized_model}\". {}",
-                    state.registry.unknown_model_message()
-                ),
+        }
+
+        let effort = body
+            .extra
+            .get("output_config")
+            .and_then(|config| config.get("effort"))
+            .and_then(Value::as_str)
+            .filter(|effort| {
+                !effort.is_empty()
+                    && effort.len() <= 256
+                    && !effort.chars().any(|c| c.is_whitespace() || c.is_control())
+            })
+            .map(str::to_string);
+        let current =
+            session::record_session_request(session_id.as_deref(), session_state.as_ref(), now);
+        if let Some(monitor) = state.monitor.as_ref() {
+            if let Some(current) = current.as_ref() {
+                monitor.session_sequence_resolved(&req_id, current.seq);
+            }
+            monitor.provider_selected(&req_id, provider.name(), &normalized_model, effort);
+        }
+
+        let traffic = create_traffic_capture(TrafficCaptureOptions {
+            req_id: req_id.clone(),
+            session_id: session_id.clone(),
+            session_seq: current.as_ref().map(|s| s.seq),
+            provider: Some(provider.name().to_string()),
+        })
+        .map(Arc::new);
+
+        if let Some(capture) = traffic.as_ref() {
+            if let Some(monitor) = state.monitor.as_ref() {
+                monitor.traffic_capture_path(&req_id, capture.root().to_path_buf());
+            }
+            capture.write_json(
+                "000-metadata",
+                &json!({
+                    "reqId": &req_id,
+                    "sessionId": &session_id,
+                    "sessionSeq": current.as_ref().map(|s| s.seq),
+                    "kind": if count_tokens { "count_tokens" } else { "messages" },
+                    "provider": provider.name(),
+                    "model": &normalized_model,
+                    "method": method.as_str(),
+                    "path": &path,
+                    "query": &query,
+                    "headers": headers_to_record(&headers),
+                }),
             );
-            log_request_completed(
-                &log,
-                RequestLogContext {
-                    req_id: &req_id,
-                    provider: None,
-                    model: Some(&normalized_model),
-                    count_tokens,
-                    status: response.status(),
-                    started_at,
-                },
+            capture.write_json(
+                "010-anthropic-request",
+                &serde_json::to_value(&body).unwrap_or_else(|_| json!({})),
             );
-            let (response, details) = record_failed_response(
-                &log,
-                FailedResponseLogContext {
-                    req_id: &req_id,
-                    provider: None,
-                    model: Some(&normalized_model),
-                    count_tokens,
-                    started_at,
-                },
-                response,
-            )
-            .await;
+        }
+
+        let context = RequestContext {
+            notification_id: headers
+                .get("x-clodex-notification-id")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned),
+            req_id: req_id.clone(),
+            session_id,
+            session_seq: current.map(|s| s.seq),
+            provider: provider.name().to_string(),
+            traffic,
+            monitor: state.monitor.clone(),
+        };
+
+        let response = if count_tokens {
+            provider.handle_count_tokens(body, context).await
+        } else {
+            provider
+                .handle_messages_with_conversation_identity(
+                    body,
+                    context,
+                    if auto_review_route.is_some() {
+                        None
+                    } else {
+                        conversation_identity
+                    },
+                )
+                .await
+        };
+        log_request_completed(
+            &log,
+            RequestLogContext {
+                req_id: &req_id,
+                provider: Some(provider.name()),
+                model: Some(&normalized_model),
+                count_tokens,
+                status: response.status(),
+                started_at,
+            },
+        );
+        let status = response.status();
+        if status.is_success() {
+            return monitor_response_body(response, request_guard);
+        }
+
+        let (response, details) = record_failed_response(
+            &log,
+            FailedResponseLogContext {
+                req_id: &req_id,
+                provider: Some(provider.name()),
+                model: Some(&normalized_model),
+                count_tokens,
+                started_at,
+            },
+            response,
+        )
+        .await;
+        if let Some(details) = details.as_ref() {
             monitor_failed(
                 state.monitor.as_ref(),
                 &req_id,
-                Some(response.status()),
-                details
-                    .as_ref()
-                    .map(|details| details.message.as_str())
-                    .unwrap_or("Unknown model"),
+                Some(status),
+                details.message.as_str(),
             );
-            return with_request_id(response, &req_id);
+        } else {
+            monitor_failed(
+                state.monitor.as_ref(),
+                &req_id,
+                Some(status),
+                format!("HTTP {}", status.as_u16()),
+            );
         }
-    };
-
-    body.bypass_provider_model_override = auto_review_route.is_some();
-    if body.bypass_provider_model_override {
-        apply_codex_auto_review_defaults(&mut body, session_id.as_deref());
-    }
-
-    if let Some(route) = auto_review_route.as_ref() {
-        log.info(
-            "auto-review route selected",
-            Some(Map::from_iter([
-                ("reqId".to_string(), json!(&req_id)),
-                ("requestedModel".to_string(), json!(&route.requested_model)),
-                ("overrideModel".to_string(), json!(&route.override_model)),
-                ("provider".to_string(), json!(provider.name())),
-            ])),
-        );
-    }
-
-    let effort = body
-        .extra
-        .get("output_config")
-        .and_then(|config| config.get("effort"))
-        .and_then(Value::as_str)
-        .filter(|effort| {
-            !effort.is_empty()
-                && effort.len() <= 256
-                && !effort.chars().any(|c| c.is_whitespace() || c.is_control())
-        })
-        .map(str::to_string);
-    let current =
-        session::record_session_request(session_id.as_deref(), session_state.as_ref(), now);
-    if let Some(monitor) = state.monitor.as_ref() {
-        if let Some(current) = current.as_ref() {
-            monitor.session_sequence_resolved(&req_id, current.seq);
-        }
-        monitor.provider_selected(&req_id, provider.name(), &normalized_model, effort);
-    }
-
-    let traffic = create_traffic_capture(TrafficCaptureOptions {
-        req_id: req_id.clone(),
-        session_id: session_id.clone(),
-        session_seq: current.as_ref().map(|s| s.seq),
-        provider: Some(provider.name().to_string()),
+        with_request_id(response, &req_id)
     })
-    .map(Arc::new);
-
-    if let Some(capture) = traffic.as_ref() {
-        if let Some(monitor) = state.monitor.as_ref() {
-            monitor.traffic_capture_path(&req_id, capture.root().to_path_buf());
-        }
-        capture.write_json(
-            "000-metadata",
-            &json!({
-                "reqId": &req_id,
-                "sessionId": &session_id,
-                "sessionSeq": current.as_ref().map(|s| s.seq),
-                "kind": if count_tokens { "count_tokens" } else { "messages" },
-                "provider": provider.name(),
-                "model": &normalized_model,
-                "method": method.as_str(),
-                "path": &path,
-                "query": &query,
-                "headers": headers_to_record(&headers),
-            }),
-        );
-        capture.write_json(
-            "010-anthropic-request",
-            &serde_json::to_value(&body).unwrap_or_else(|_| json!({})),
-        );
-    }
-
-    let context = RequestContext {
-        notification_id: headers
-            .get("x-clodex-notification-id")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned),
-        req_id: req_id.clone(),
-        session_id,
-        session_seq: current.map(|s| s.seq),
-        provider: provider.name().to_string(),
-        traffic,
-        monitor: state.monitor.clone(),
-    };
-
-    let response = if count_tokens {
-        provider.handle_count_tokens(body, context).await
-    } else {
-        provider
-            .handle_messages_with_conversation_identity(
-                body,
-                context,
-                if auto_review_route.is_some() {
-                    None
-                } else {
-                    conversation_identity
-                },
-            )
-            .await
-    };
-    log_request_completed(
-        &log,
-        RequestLogContext {
-            req_id: &req_id,
-            provider: Some(provider.name()),
-            model: Some(&normalized_model),
-            count_tokens,
-            status: response.status(),
-            started_at,
-        },
-    );
-    let status = response.status();
-    if status.is_success() {
-        return monitor_response_body(response, request_guard);
-    }
-
-    let (response, details) = record_failed_response(
-        &log,
-        FailedResponseLogContext {
-            req_id: &req_id,
-            provider: Some(provider.name()),
-            model: Some(&normalized_model),
-            count_tokens,
-            started_at,
-        },
-        response,
-    )
-    .await;
-    if let Some(details) = details.as_ref() {
-        monitor_failed(
-            state.monitor.as_ref(),
-            &req_id,
-            Some(status),
-            details.message.as_str(),
-        );
-    } else {
-        monitor_failed(
-            state.monitor.as_ref(),
-            &req_id,
-            Some(status),
-            format!("HTTP {}", status.as_u16()),
-        );
-    }
-    with_request_id(response, &req_id)
+    .await
 }
 
 /// Header Claude Code reads to populate the `requestId` field it writes into
@@ -1732,6 +1788,14 @@ fn monitor_response_body(response: Response, guard: RequestMonitorGuard) -> Resp
                 None => {
                     if let Some(message) = outcome.as_ref().and_then(NativeResponseOutcome::failure)
                     {
+                        create_logger("server").error(
+                            "request_stream_failed",
+                            Some(Map::from_iter([
+                                ("reqId".to_string(), json!(&guard.req_id)),
+                                ("actualHTTPstatus".to_string(), json!(status.as_u16())),
+                                ("message".to_string(), json!(&message)),
+                            ])),
+                        );
                         guard.failed(status, message);
                     } else if status.is_success() {
                         guard.completed(status);

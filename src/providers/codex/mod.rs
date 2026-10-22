@@ -54,6 +54,7 @@ use self::continuation::{
     record_continuation_for_owner,
 };
 use self::count_tokens::count_translated_tokens;
+use self::native::NativeResponseOutcome;
 use self::translate::accumulate::accumulate_response_with_traffic;
 use self::translate::live_stream::LiveStreamTranslator;
 use self::translate::model_allowlist::{
@@ -1374,6 +1375,14 @@ fn translate_live_stream_payload(
     payload: &serde_json::Value,
     traffic: Option<&crate::traffic::TrafficCapture>,
 ) -> Result<(Vec<u8>, bool), String> {
+    if events::event_is_success_terminal(payload)
+        && translator.has_semantic_output()
+        && !translator.has_current_generation_semantic_output()
+    {
+        return Err(
+            "Codex replacement completed without producing output after reconnect".to_string(),
+        );
+    }
     let chunk = translator.accept(payload, traffic)?;
     let terminal = events::event_is_terminal(payload) || translator.is_finished();
     Ok((chunk, terminal))
@@ -1439,13 +1448,17 @@ fn record_live_stream_progress(ctx: &RequestContext, chunk: &[u8]) {
 }
 
 fn single_live_stream_response(chunk: Vec<u8>) -> Response {
-    event_stream_response(futures_util::stream::once(async move {
-        Ok::<Bytes, std::io::Error>(Bytes::from(chunk))
-    }))
+    event_stream_response(
+        futures_util::stream::once(async move { Ok::<Bytes, std::io::Error>(Bytes::from(chunk)) }),
+        NativeResponseOutcome::default(),
+    )
 }
 
 fn empty_live_stream_response() -> Response {
-    event_stream_response(futures_util::stream::empty::<Result<Bytes, std::io::Error>>())
+    event_stream_response(
+        futures_util::stream::empty::<Result<Bytes, std::io::Error>>(),
+        NativeResponseOutcome::default(),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1463,6 +1476,8 @@ fn remaining_live_stream_response(
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     let model_context = models::current_model_context();
     let telemetry = rate_limits::current();
+    let outcome = NativeResponseOutcome::default();
+    let response_outcome = outcome.clone();
     let worker = async move {
         let mut cleanup =
             LiveRequestStateCleanup::new(request_continuation.clone(), compaction.attempt);
@@ -1585,6 +1600,7 @@ fn remaining_live_stream_response(
                             let error_message = failure
                                 .as_ref()
                                 .map_or(message.as_str(), |failure| failure.message.as_str());
+                            outcome.fail(error_message.to_string());
                             let chunk = translator.error_chunk(
                                 error_message,
                                 error_type,
@@ -1715,6 +1731,7 @@ fn remaining_live_stream_response(
                     recovery::notify(&ctx, "failed", reconnects, explanation);
                     let error_message = format!("{} — {explanation}", codex_error_message(&err));
                     let error_type = codex_stream_error_type(&err);
+                    outcome.fail(error_message.clone());
                     let chunk =
                         translator.error_chunk(&error_message, error_type, ctx.traffic.as_deref());
                     if !chunk.is_empty() {
@@ -1737,7 +1754,7 @@ fn remaining_live_stream_response(
     let stream = futures_util::stream::unfold(rx, |mut rx| async {
         rx.recv().await.map(|item| (item, rx))
     });
-    event_stream_response(stream)
+    event_stream_response(stream, response_outcome)
 }
 
 fn exhausted_recovery_response(
@@ -1817,7 +1834,7 @@ fn record_rate_limit_telemetry(payload: &serde_json::Value) {
     }
 }
 
-fn event_stream_response<S>(stream: S) -> Response
+fn event_stream_response<S>(stream: S, outcome: NativeResponseOutcome) -> Response
 where
     S: futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
 {
@@ -1826,7 +1843,9 @@ where
         (http::header::CACHE_CONTROL, "no-cache"),
         (http::header::CONNECTION, "keep-alive"),
     ];
-    (headers, Body::from_stream(stream)).into_response()
+    let mut response = (headers, Body::from_stream(stream)).into_response();
+    response.extensions_mut().insert(outcome);
+    response
 }
 
 fn empty_buffered_completion_error() -> client::CodexError {
