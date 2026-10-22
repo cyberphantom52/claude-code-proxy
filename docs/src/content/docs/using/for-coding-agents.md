@@ -18,11 +18,10 @@ The installed CLI and running server are authoritative for the active build:
 
 ```sh
 claude-code-proxy models
-claude-code-proxy models --full
 curl -s http://127.0.0.1:18765/v1/models
 ```
 
-Use the compact CLI output for a provider overview. Use `--full` when a Cursor model alias must be resolved. Do not maintain an exhaustive model list in agent memory because provider catalogs and account access change.
+Use the live Codex catalog rather than maintaining an exhaustive model list in agent memory. Model metadata and ChatGPT account access can change. Claude-style aliases still target Codex, not Anthropic; OpenAI-compatible schemas do not imply Platform API access.
 
 ## Minimal environment contract
 
@@ -55,7 +54,7 @@ For a source checkout, implementation and tests are the final authority when doc
 
 1. Check liveness with `curl http://127.0.0.1:18765/healthz`.
 2. Check the selected model with `claude-code-proxy models`.
-3. Check stored provider credentials with `<provider> auth status`. For OpenCode Go, inspect whether its API-key environment variable or config key is configured without printing the secret.
+3. Check the proxy's ChatGPT OAuth credential with `claude-code-proxy codex auth status`. Platform API keys and native Codex CLI credentials are not used.
 4. Read the monitor request detail and structured `proxy.log`.
 5. Read the redacted payload under `errors/` for a failed response.
 6. Enable verbose logging or traffic capture only for a focused reproduction.

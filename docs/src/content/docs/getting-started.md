@@ -3,7 +3,7 @@ title: Getting started
 description: Install claude-code-proxy, authenticate with Codex, start the server, and open one working Claude Code session.
 ---
 
-This path gets one Codex-backed Claude Code session working. See [Choosing a provider](/providers/choosing-a-provider/) for Kimi, Grok, OpenCode Go, and Cursor Agent.
+This path connects the Claude Code client to the sole upstream backend, Codex, using proxy-owned ChatGPT OAuth. For this branch's changes, use the [source build guide](/using/chatgpt-integration/); existing releases may differ.
 
 ## 1. Install
 
@@ -29,7 +29,7 @@ Use a **ChatGPT Plus or Pro account**, not an OpenAI API account:
 claude-code-proxy codex auth login
 ```
 
-For SSH or another headless environment, use `claude-code-proxy codex auth device` instead.
+The proxy stores and refreshes its own tokens; it does not use Platform API keys or native Codex CLI credentials. For SSH or another headless environment, use `claude-code-proxy codex auth device` instead.
 
 ## 3. Start the proxy
 
@@ -60,4 +60,4 @@ Send a prompt. The request appears in the monitor and the response streams into 
 
 The `[1m]` suffix is a Claude Code compaction hint. The proxy removes it before the upstream request. The explicit 272,000 token auto-compact window keeps the local threshold within the ChatGPT context limit used by these models.
 
-For persistent settings, provider switching, and model discovery, continue to [Configure Claude Code](/using/configure-claude-code/) and [Models and routing](/using/models-and-routing/).
+For persistent settings and model discovery, continue to [Configure Claude Code](/using/configure-claude-code/) and [Models and routing](/using/models-and-routing/).

@@ -1,88 +1,47 @@
 ---
 title: Models and routing
-description: Understand provider model patterns, aliases, Codex fast mode, context hints, small models, model listing, and Claude Code gateway discovery.
+description: Select Codex models, Claude-style aliases, fast tiers, context hints, and gateway discovery.
 ---
 
-The model ID in each request selects its provider. One proxy listener can serve every provider through Anthropic Messages and the enabled OpenAI-compatible routes.
+Every accepted model resolves to Codex. Claude-style names are compatibility aliases, not access to Anthropic models.
 
-## Routing patterns
-
-| Pattern | Provider |
-| --- | --- |
-| Registered `gpt-*` IDs and their `-fast` and `-ultrafast` forms | Codex |
-| `kimi-for-coding`, `kimi-k2.6`, `k2.6` | Kimi |
-| `grok-composer-2.5-fast`, `grok-4.5`, `grok-4.6` | Grok |
-| Non-conflicting registered OpenCode Go IDs and every `opencode-go/<model-id>` | OpenCode Go |
-| `cursor`, Cursor legacy aliases, `cursor:<id>`, `cursor-plan:<id>`, `cursor-ask:<id>` | Cursor Agent |
-| Anthropic-style aliases such as `haiku`, `sonnet`, `opus`, `fable`, and registered `claude-*` aliases | The `aliasProvider`, Codex by default |
-
-An unknown ID returns HTTP 400 with the supported provider catalog. There is no implicit fallback for arbitrary model names.
-
-## Prefer the live catalog
-
-The model list changes faster than documentation. Ask the installed CLI:
+## Discover models
 
 ```sh
 claude-code-proxy models
-claude-code-proxy models --full
-```
-
-The compact command abbreviates Cursor's dynamic aliases. `--full` prints every alias discovered through the installed Cursor Agent catalog.
-
-The HTTP equivalent is:
-
-```sh
 curl http://127.0.0.1:18765/v1/models
 ```
 
-## Codex fast mode
+The registry combines built-in models with API-supported entries in `$CODEX_HOME/models_cache.json` (default `~/.codex/models_cache.json`). Hidden catalog models can be requested explicitly. This reads metadata only, not native Codex credentials. Unknown IDs return HTTP 400 with the supported catalog; registration does not guarantee ChatGPT account access.
 
-Every registered Codex model also has a local `-fast` form. The proxy removes `-fast` from the upstream model and requests the priority service tier.
+## Claude-style aliases
 
-Models that offer the ultrafast tier also have a local `-ultrafast` form, which requests the ultrafast service tier. Today those are `gpt-6-astra-ultrafast` and `gpt-6.1-sol-ultrafast`. An `-ultrafast` name on any other model is not a registered ID.
+| Alias family | Codex model |
+| --- | --- |
+| `haiku`, `claude-haiku-*` | `gpt-6-luna` |
+| `sonnet`, `claude-sonnet-*` | `gpt-5.6-terra` |
+| `opus`, `fable`, `claude-opus-*`, `claude-fable-*` | `gpt-6-sol` |
 
-For Claude Code requests on `/v1/messages`, a configured `codex.serviceTier` or `CCP_CODEX_SERVICE_TIER` override wins over both suffixes. When the forced tier is `ultrafast` and the model does not offer it, the proxy requests priority instead.
+Use concrete Codex IDs when you want explicit model selection.
 
-## The `[1m]` hint
+## Fast tiers
 
-A trailing `[1m]` affects Claude Code's local compaction policy. The proxy strips it before matching and forwarding the model. Use it only when the upstream model and account can accept the resulting context, and set a safe `CLAUDE_CODE_AUTO_COMPACT_WINDOW` when the real limit is below one million tokens.
+Every registered Codex model has a `-fast` form, which removes the suffix upstream and requests `service_tier: "priority"`. Models offering ultrafast also have `-ultrafast` forms: currently `gpt-6-astra-ultrafast` and `gpt-6.1-sol-ultrafast`.
 
-## Main and small models
+On `/v1/messages`, `codex.serviceTier` or `CCP_CODEX_SERVICE_TIER` overrides these suffixes. Forced ultrafast falls back to priority for models without that tier. OpenAI-compatible routes use the suffix or, on `/v1/responses`, the request's own `service_tier`.
 
-Set both model variables to routable IDs:
+## Context and small models
 
 ```sh
 ANTHROPIC_MODEL=gpt-6-sol[1m]
 ANTHROPIC_SMALL_FAST_MODEL=gpt-6-luna[1m]
+CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000
 ```
 
-Claude Code sends background work to its small/fast model. Its built-in Haiku ID can route through `aliasProvider`, but a concrete provider ID keeps the behavior explicit.
+`[1m]` is a Claude Code context hint; the proxy strips it before model matching. It does not enlarge Codex context. Set a safe compaction threshold for your model and subscription or omit the hint. The small/fast model handles background requests independently of the main model.
 
-## Claude Code `/model`
+## Switching and gateway discovery
 
-When `ANTHROPIC_BASE_URL` already points to the proxy, these can change the request model:
+With `ANTHROPIC_BASE_URL` pointing to the proxy, use `claude --model <id>`, `/model <id>`, or `ANTHROPIC_MODEL` to select another Codex model. This does not switch upstream backends or change the client's base URL.
 
-- `claude --model <id>` at launch
-- Claude Code's `/model` command in a session
-- `ANTHROPIC_MODEL` for a new process
-
-A model change can switch upstream providers because routing is per request. It does not change `ANTHROPIC_BASE_URL` or move the process back to direct Anthropic.
-
-## Gateway model discovery
-
-Enable Claude Code discovery at process start:
-
-```sh
-CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 \
-ANTHROPIC_BASE_URL=http://127.0.0.1:18765 \
-ANTHROPIC_AUTH_TOKEN=unused \
-ANTHROPIC_MODEL=gpt-6-sol[1m] \
-ANTHROPIC_SMALL_FAST_MODEL=gpt-6-luna[1m] \
-  claude
-```
-
-`/v1/models` includes raw provider IDs and Anthropic-style aliases. Claude Code's gateway picker filters for IDs beginning with `claude` or `anthropic`, so configured aliases are the entries most likely to appear. Raw IDs remain usable through `--model`, `/model`, and environment variables.
-
-## Alias routing
-
-`CCP_ALIAS_PROVIDER=kimi` or `"aliasProvider": "kimi"` routes recognized Anthropic-style aliases to Kimi. Accepted values are `codex` and `kimi`. Explicit provider IDs always use their provider.
+Set `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` before starting Claude Code to enable its gateway picker. `/v1/models` includes Codex IDs and Claude-style aliases; the picker filters for IDs beginning with `claude` or `anthropic`, so aliases are most likely to appear. Raw Codex IDs remain usable directly.

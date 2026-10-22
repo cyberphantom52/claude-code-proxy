@@ -1,6 +1,6 @@
 ---
 title: Troubleshooting
-description: Diagnose listener, authentication, model routing, streaming, context, Cursor bundle, rate-limit, logging, and traffic-capture problems.
+description: Diagnose listener, ChatGPT authentication, Codex model selection, streaming, context, transport, rate-limit, and diagnostic problems.
 ---
 
 ## Proxy is unreachable
@@ -15,19 +15,14 @@ A healthy listener returns `{"ok":true}`. Confirm `ANTHROPIC_BASE_URL` uses the 
 
 ## Authentication error
 
-Check the provider selected by the model, then inspect its credential:
+Inspect the proxy's ChatGPT OAuth credential:
 
 ```sh
 claude-code-proxy codex auth status
-claude-code-proxy kimi auth status
-claude-code-proxy grok auth status
-claude-code-proxy cursor auth status
+claude-code-proxy codex auth login
 ```
 
-Use that provider's login command when credentials are missing or expired. Codex requires ChatGPT subscription auth, not an OpenAI API key. Each provider uses proxy-owned credentials.
-OpenCode Go has no `auth status` command; configure its API key through
-`CCP_OPENCODE_API_KEY`, `OPENCODE_API_KEY`, or `opencode.apiKey` in
-`config.json`.
+For a headless host, use `codex auth device`. Codex requires ChatGPT subscription auth, not a Platform API key. Native Codex CLI login is independent of the proxy's credentials.
 
 ## Model returns HTTP 400
 
@@ -35,10 +30,9 @@ Run:
 
 ```sh
 claude-code-proxy models
-claude-code-proxy models --full
 ```
 
-An unknown local ID returns a catalog in the error. A known ID can still be rejected upstream when the account, subscription, or region lacks access. Cursor's prefixed form, such as `cursor:gpt-5.5`, forces Cursor routing and avoids cross-provider collisions.
+An unknown local ID returns a catalog in the error. A known Codex ID can still be rejected upstream when the ChatGPT account, subscription, or region lacks access.
 
 ## Background requests fail
 
@@ -75,18 +69,9 @@ CCP_CODEX_TRANSPORT=http claude-code-proxy serve
 
 `auto` falls back only when WebSocket setup fails before sending the request. It does not replay an in-flight request.
 
-## Cursor bundle cannot be found
-
-Cursor needs the installed Cursor Agent JavaScript bundle for protobuf schemas. Confirm Cursor Agent is installed, then set:
-
-```sh
-CCP_CURSOR_AGENT_BUNDLE=/path/to/cursor-agent/index.js \
-  claude-code-proxy serve
-```
-
 ## Rate limited
 
-Upstream limits are shared with other clients on the same account. Codex limit responses and Kimi HTTP 429 responses surface as HTTP 429 with `retry-after`. Wait for the indicated interval or reduce concurrent traffic.
+Codex limits are shared with other clients on the same ChatGPT account. Limit responses surface as HTTP 429 with `retry-after`. Wait for the indicated interval or reduce concurrent traffic.
 
 ## Find the complete error
 

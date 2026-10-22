@@ -21,9 +21,10 @@ cargo build --release --locked
 ./target/release/claude-code-proxy serve
 ```
 
-Sign in using your ChatGPT account. The proxy stores its own OAuth credentials;
-an OpenAI Platform API key is not required for this backend. For a headless
-login, use `codex auth device` in place of `codex auth login`.
+Sign in using your ChatGPT account. Codex is the only upstream backend. The
+proxy stores its own OAuth credentials; it does not use OpenAI Platform API
+keys or native Codex CLI credentials. For a headless login, use
+`codex auth device` in place of `codex auth login`.
 
 ### Use this build instead of Homebrew
 
@@ -74,6 +75,12 @@ Optional features remain explicit:
 - Set `CCP_CODEX_FULL_LANE=1` on the proxy for parallel tool calls with
   `gpt-5.6-sol` and `gpt-5.6-terra`. It does not force other models off Lite.
 - Server compaction remains opt-in; see [Codex](/providers/codex/#server-compaction).
+
+## Historical integration record
+
+The PR selections and validation results below describe the initial integration,
+before the Codex-only cutover. Test counts and references to other providers
+are historical provenance, not current supported features.
 
 ## Included pull requests
 

@@ -1,6 +1,6 @@
 ---
 title: Files and storage
-description: Canonical claude-code-proxy configuration, credential, device ID, log, error, traffic-capture, and service-log paths on macOS, Linux, and Windows.
+description: Configuration, ChatGPT OAuth credential, log, error, traffic-capture, and service-log paths on macOS, Linux, and Windows.
 ---
 
 claude-code-proxy separates configuration and credentials from runtime state.
@@ -21,29 +21,14 @@ Windows falls back to `%USERPROFILE%/AppData/Roaming` and `%USERPROFILE%/AppData
 
 `config.json` lives directly under the configuration root. See [Configuration](/reference/configuration/) for its schema and precedence.
 
-## Provider credentials
+## ChatGPT OAuth credentials
 
-On macOS, Codex and Cursor use Keychain services:
+On macOS, Codex uses the Keychain service `claude-code-proxy.codex`.
+On Linux and Windows, credentials use `<configuration-root>/codex/auth.json`, written with restrictive permissions where supported.
 
-- `claude-code-proxy.codex`
-- `claude-code-proxy.cursor`
+When `CCP_CONFIG_DIR` is set, credentials use `<CCP_CONFIG_DIR>/codex/auth.json` on every platform, including macOS.
 
-Kimi and Grok use `<configuration-root>/<provider>/auth.json` on every platform. Codex and Cursor use the same file layout on Linux and Windows. File-backed credentials are written with restrictive permissions where supported.
-
-When `CCP_CONFIG_DIR` is set, file-backed provider credentials use
-`<CCP_CONFIG_DIR>/<provider>/auth.json`, including Codex and Cursor on macOS.
-`CCP_CURSOR_AUTH_TOKEN` bypasses Cursor's local credential store for that
-process.
-
-OpenCode Go is the exception: it reads its API key from
-`CCP_OPENCODE_API_KEY`, `OPENCODE_API_KEY`, or `opencode.apiKey` in
-`config.json` and does not create a provider auth store.
-
-The proxy owns these credentials independently of native Codex, Grok, and Cursor Agent stores.
-
-## Kimi device ID
-
-Kimi stores a persistent UUID at `<configuration-root>/kimi/device_id` for file-backed setups. It is bound into the Kimi token and must remain paired with that login.
+The proxy owns these tokens independently of native Codex CLI credentials. No OpenAI Platform API key is used.
 
 ## Structured log
 

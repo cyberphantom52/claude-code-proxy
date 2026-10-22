@@ -1,13 +1,10 @@
 # claude-code-proxy
 
-Claude Code, powered by **OpenAI Codex**, **Kimi**, **Grok**, **OpenCode Go**,
-or **Cursor Agent**.
+Claude Code, powered by **OpenAI Codex through your ChatGPT subscription**.
 
 Docs: <https://claude-code-proxy.raine.dev>
 
 LLM docs: <https://claude-code-proxy.raine.dev/llms.txt>
-
-<img src="meta/claude-code-screenshot-2026-07.webp" alt="Claude Code running through claude-code-proxy" />
 
 <a href="https://aventasks.dev/">
   <picture>
@@ -24,10 +21,11 @@ agents.</sub>
 
 Claude Code remains an excellent coding harness, with strong tools, skills,
 hooks, subagents, and editor integrations. claude-code-proxy keeps that client
-experience while translating its Anthropic API traffic for subscription-backed
-provider services.
+experience while translating its Anthropic API traffic to the ChatGPT Codex
+backend. Codex is the only upstream backend; Claude Code is the client harness.
+OpenAI-compatible routes describe local request schemas, not Platform API access.
 
-One local process handles provider authentication, model-based routing,
+One local process handles proxy-owned ChatGPT OAuth, model selection,
 protocol translation, streaming responses, and diagnostics. The built-in
 monitor shows sessions, active and recent requests, errors, token usage, and
 throughput.
@@ -57,6 +55,9 @@ Sign in with a **ChatGPT Plus or Pro account**, not an OpenAI API account:
 ```sh
 claude-code-proxy codex auth login
 ```
+
+The proxy stores and refreshes its own OAuth tokens. It does not use OpenAI
+Platform API keys or native Codex CLI credentials.
 
 Start the proxy in one terminal:
 
@@ -95,30 +96,26 @@ curl http://127.0.0.1:18765/v1/images/generations \
 
 The opt-in Images API returns base64 image data and consumes the signed-in account's image quota. Image prompts and payloads are excluded from traffic captures. See the [HTTP API](https://claude-code-proxy.raine.dev/reference/http-api/) for generation and edit schemas.
 
-## Providers
+## Codex models and APIs
 
-| Provider     | Account                        | Model selection                                 |
-| ------------ | ------------------------------ | ----------------------------------------------- |
-| Codex        | ChatGPT Plus or Pro            | Registered `gpt-*` models, `-fast`/`-ultrafast` |
-| Kimi         | kimi.com with Kimi Code access | `kimi-for-coding` and aliases                   |
-| Grok         | grok.com                       | Registered Grok models                          |
-| OpenCode Go  | OpenCode Go subscription       | Non-conflicting IDs and `opencode-go/<model-id>` |
-| Cursor Agent | Cursor account                 | Cursor aliases and `cursor:<model-id>` prefixes |
+Run `claude-code-proxy models` for the current Codex catalog. Registered models
+support `-fast`; models offering the ultrafast tier also support `-ultrafast`.
+Account access and quota come from your ChatGPT subscription.
 
-Run `claude-code-proxy models` for the current catalog or
-`claude-code-proxy models --full` for every dynamic Cursor alias.
+Anthropic Messages is enabled by default. Set `CCP_CODEX_RESPONSES_API=1` on the
+proxy to enable native Codex Responses and text-only Chat Completions compatibility.
+Images have their separate opt-in gate shown above.
 
 > [!WARNING]
 > The proxy accepts local requests without client authentication. It binds to
 > `127.0.0.1` by default. Protect any non-loopback listener with a firewall or
-> authenticating reverse proxy. Provider subscriptions, model access, terms,
-> and account enforcement remain under each provider's control. Unofficial
-> clients may carry account risk.
+> authenticating reverse proxy. Subscription terms, model access, quotas, and
+> account enforcement remain under OpenAI's control.
 
 ## Documentation
 
 - [What is claude-code-proxy?](https://claude-code-proxy.raine.dev/)
-- [Choosing a provider](https://claude-code-proxy.raine.dev/providers/choosing-a-provider/)
+- [Codex backend](https://claude-code-proxy.raine.dev/providers/codex/)
 - [Configure Claude Code](https://claude-code-proxy.raine.dev/using/configure-claude-code/)
 - [Models and routing](https://claude-code-proxy.raine.dev/using/models-and-routing/)
 - [Monitor TUI](https://claude-code-proxy.raine.dev/using/monitor-tui/)

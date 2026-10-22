@@ -1,6 +1,6 @@
 ---
 title: Monitor TUI
-description: Use the claude-code-proxy monitor to inspect sessions, active and recent requests, providers, errors, token usage, throughput, and setup.
+description: Inspect sessions, Codex requests, errors, token usage, throughput, and setup in the monitor.
 ---
 
 `claude-code-proxy serve` opens the monitor when stdout is an interactive terminal. The same process runs the HTTP listener.
@@ -19,12 +19,10 @@ Use `claude-code-proxy monitor --url http://127.0.0.1:19999` for a different por
 
 In an attached dashboard, `q` and `Ctrl-C` detach immediately and leave the service running. Multiple dashboards can attach independently. If the service becomes unavailable, the dashboard marks its last snapshot as stale and reconnects automatically. Network polling runs outside the terminal event loop.
 
-![claude-code-proxy monitor showing sessions, active requests, recent requests, and events](/monitor-tui.webp)
-
 ## What the monitor shows
 
 - Sessions grouped by Claude Code session ID and project
-- Active request lifecycle and selected provider or model
+- Active request lifecycle and selected Codex model
 - Recent requests, HTTP status, elapsed time, and errors
 - Input and output token totals
 - Output throughput based on matched upstream timing and cumulative usage samples
@@ -66,7 +64,7 @@ Explore the full interface without binding a port or using provider credentials:
 claude-code-proxy demo
 ```
 
-The deterministic simulation covers active, successful, and failed requests across providers, projects, throughput states, and responsive layouts.
+The deterministic simulation covers active, successful, and failed Codex requests across projects, throughput states, and responsive layouts.
 
 ## Background service
 

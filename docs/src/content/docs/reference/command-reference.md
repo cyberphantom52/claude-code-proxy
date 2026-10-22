@@ -51,38 +51,23 @@ Opens the monitor with deterministic simulated traffic. It does not bind a netwo
 ## `models`
 
 ```sh
-claude-code-proxy models [--full]
+claude-code-proxy models
 ```
 
-Prints supported IDs grouped by provider. The default output compacts Cursor's runtime catalog. `--full` prints every Cursor alias.
+Prints the supported Codex model catalog. Claude-style aliases resolve to Codex, not Anthropic models.
 
-## Provider authentication
-
-The command shape is:
-
-```text
-claude-code-proxy <provider> auth <action>
-```
-
-| Provider | `login` | `device` | `status` | `logout` |
-| --- | --- | --- | --- | --- |
-| `codex` | Browser PKCE | Device code | Account, expiry, storage | Delete proxy credential |
-| `kimi` | Device code | Unsupported | User, expiry, scope, storage | Delete proxy credential |
-| `grok` | Browser PKCE | Device code | Expiry and storage | Delete proxy credential |
-| `cursor` | Browser polling flow | Unsupported | Source, claims, expiry | Delete proxy credential |
-
-Examples:
+## ChatGPT OAuth authentication
 
 ```sh
 claude-code-proxy codex auth login
-claude-code-proxy grok auth device
-claude-code-proxy kimi auth status
-claude-code-proxy cursor auth logout
+claude-code-proxy codex auth device
+claude-code-proxy codex auth status
+claude-code-proxy codex auth logout
 ```
 
-A missing credential makes `auth status` exit with status 1. Other provider command failures exit with status 2. Successful commands exit with status 0.
+`login` uses browser PKCE; `device` uses a headless device-code flow. `status` reports account, expiry, and storage. Authenticate with a ChatGPT Plus or Pro subscription, not a Platform API key. Credentials belong to the proxy, not the native Codex CLI.
 
-Logout removes the local proxy-owned credential. It does not call the provider to revoke a refresh token.
+Missing credentials make `auth status` exit with status 1; other auth failures exit with status 2. Successful commands exit with status 0. Logout deletes the local proxy credential without revoking the upstream refresh token.
 
 ## Development commands
 

@@ -21,7 +21,7 @@ CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
 | --- | --- |
 | `ANTHROPIC_BASE_URL` | Sends Anthropic API requests to the local proxy. |
 | `ANTHROPIC_AUTH_TOKEN` | Satisfies Claude Code's client credential requirement. The proxy does not use it for upstream auth. |
-| `ANTHROPIC_MODEL` | Selects the main request model and therefore the provider. |
+| `ANTHROPIC_MODEL` | Selects the main Codex model. |
 | `ANTHROPIC_SMALL_FAST_MODEL` | Selects the model for title generation, token-related background work, and other small requests. Use a model the proxy routes. |
 | `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` | Reduces background traffic sent to the subscription provider. |
 | `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1` | Prevents Claude Code from retrying a partially completed stream as non-streaming, which can duplicate tool calls. |
@@ -43,9 +43,7 @@ sets the ChatGPT context limit to 272K tokens. Set
 `CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000` with `gpt-5.6-sol[1m]` so Claude Code
 compacts before the upstream limit.
 
-Grok 4.5 and Grok 4.6 are 500,000 tokens. Set `CLAUDE_CODE_MAX_CONTEXT_TOKENS=500000` and omit `[1m]`.
-
-For a provider and model with a different real context limit, choose a safe value or omit the override. `DISABLE_AUTO_COMPACT=1` disables automatic compaction while preserving manual `/compact`, but the session can then hit the upstream limit.
+For a Codex model with a different real context limit, choose a safe value or omit the override. `DISABLE_AUTO_COMPACT=1` disables automatic compaction while preserving manual `/compact`, but the session can then hit the upstream limit.
 
 ## Persistent Claude Code settings
 
@@ -65,7 +63,7 @@ If every Claude Code session should use the proxy, put client variables in `~/.c
 }
 ```
 
-Use process-level variables or a wrapper when you also launch Claude Code directly against Anthropic. See [Switching models and backends](/using/switching-models-and-backends/).
+Client connection settings apply at process start. Use a new Claude Code process when changing its base URL. See [Switching models](/using/switching-models/) for model changes within a proxy session.
 
 ## Proxy settings are separate
 

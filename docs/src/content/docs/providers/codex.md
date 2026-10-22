@@ -3,7 +3,7 @@ title: Codex
 description: Configure ChatGPT Codex authentication, models, reasoning, tools, images, transports, continuation, compaction, and OpenAI-compatible APIs.
 ---
 
-Codex uses the ChatGPT subscription Responses endpoint at `https://chatgpt.com/backend-api/codex/responses`.
+Codex is the only upstream backend. It uses the ChatGPT subscription Responses endpoint at `https://chatgpt.com/backend-api/codex/responses`. Claude Code is the client harness; OpenAI-compatible routes are local schema adapters, not OpenAI Platform API access or the native Codex CLI.
 
 OpenAI's Thibault Sottiaux has publicly welcomed using Codex through other coding
 harnesses:
@@ -117,7 +117,7 @@ Detected auto-review classifier subrequests are intentionally stateless even whe
 
 ## Server compaction
 
-Claude Code normally compacts a long conversation by asking the active model to write a portable text summary. Later turns contain that summary instead of the original transcript. This works across providers, but a prose summary can flatten details from a long, tool-heavy Codex session.
+Claude Code normally compacts a long conversation by asking the active model to write a portable text summary. Later turns contain that summary instead of the original transcript. A prose summary can flatten details from a long, tool-heavy Codex session.
 
 Codex server compaction preserves the same boundary in a model-native form. Codex returns an opaque encrypted `compaction` item representing the earlier Responses history. On later turns, the proxy gives that item back to Codex together with selected recent messages and everything added after the boundary. Claude Code still receives its normal portable summary, so the session has a safe fallback.
 
@@ -153,13 +153,13 @@ CCP_CODEX_SERVER_COMPACTION=1 claude-code-proxy serve
 
 ### Fallbacks and visibility
 
-Replay requires the same Claude Code session and Codex model with append-only history. A branch, proxy restart, provider or model change, malformed response, upstream failure, memory limit, or 30 minutes without matching activity discards the native state and uses Claude Code's portable summary instead.
+Replay requires the same Claude Code session and Codex model with append-only history. A branch, proxy restart, model change, malformed response, upstream failure, memory limit, or 30 minutes without matching activity discards the native state and uses Claude Code's portable summary instead.
 
 While the native request is active, the monitor shows `compacting`. Structured log events named `server_compaction_triggered`, `server_compaction_completed`, and `server_compaction_failed` report each attempt and outcome.
 
 ## OpenAI-compatible APIs
 
-`CCP_CODEX_RESPONSES_API=1` enables both `POST /v1/responses` and `POST /v1/chat/completions`. The setting is under Codex configuration, but the routes also accept Kimi, Grok, OpenCode Go, and Cursor models.
+`CCP_CODEX_RESPONSES_API=1` enables both `POST /v1/responses` and `POST /v1/chat/completions`, backed only by Codex with the proxy's stored ChatGPT OAuth credential.
 
 The Responses route preserves native JSON or SSE response bodies for registered Codex models. The Chat Completions route translates standard text messages, reasoning effort, JSON object or JSON Schema output, and buffered or streaming responses. Its omitted reasoning effort defaults to `medium`; the proxy-wide Codex effort override still takes precedence.
 

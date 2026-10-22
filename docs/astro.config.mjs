@@ -5,10 +5,14 @@ import starlightLlmsTxt from 'starlight-llms-txt';
 
 export default defineConfig({
   site: 'https://claude-code-proxy.raine.dev',
+  redirects: {
+    '/using/switching-models-and-backends/': '/using/switching-models/',
+    '/providers/choosing-a-provider/': '/providers/codex/',
+  },
   integrations: [
     starlight({
       title: 'claude-code-proxy',
-      description: 'Run Claude Code with Codex, Kimi, Grok, OpenCode Go, or Cursor Agent.',
+      description: 'Run Claude Code with Codex through your ChatGPT subscription.',
       plugins: [starlightLlmsTxt()],
       favicon: '/favicon.svg',
       head: [
@@ -41,14 +45,10 @@ export default defineConfig({
           ],
         },
         {
-          label: 'Providers',
+          label: 'Codex backend',
           items: [
-            { label: 'Choosing a provider', slug: 'providers/choosing-a-provider' },
-            { label: 'Codex', slug: 'providers/codex' },
-            { label: 'Kimi', slug: 'providers/kimi' },
-            { label: 'Grok', slug: 'providers/grok' },
-            { label: 'OpenCode Go', slug: 'providers/opencode-go' },
-            { label: 'Cursor Agent', slug: 'providers/cursor-agent' },
+            { label: 'Codex and ChatGPT login', slug: 'providers/codex' },
+            { label: 'Source build and integration', slug: 'using/chatgpt-integration' },
           ],
         },
         {
@@ -56,7 +56,7 @@ export default defineConfig({
           items: [
             { label: 'Configure Claude Code', slug: 'using/configure-claude-code' },
             { label: 'Models and routing', slug: 'using/models-and-routing' },
-            { label: 'Switching models and backends', slug: 'using/switching-models-and-backends' },
+            { label: 'Switching models', slug: 'using/switching-models' },
             { label: 'Monitor TUI', slug: 'using/monitor-tui' },
             { label: 'For coding agents', slug: 'using/for-coding-agents' },
             { label: 'Troubleshooting', slug: 'using/troubleshooting' },
