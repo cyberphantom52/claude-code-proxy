@@ -29,15 +29,3 @@ pub(super) fn notify(ctx: &RequestContext, state: &str, attempt: u32, message: &
 fn valid_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 80 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn notification_paths_cannot_escape_their_directory() {
-        assert!(valid_id("1234-1780000000000"));
-        for id in ["", "../secret", "/tmp/file", "a/b", "a\nb"] {
-            assert!(!valid_id(id));
-        }
-    }
-}

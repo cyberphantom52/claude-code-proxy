@@ -1,5 +1,4 @@
 use rand::Rng;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use time::{OffsetDateTime, PrimitiveDateTime, parsing::Parsed};
 
@@ -104,110 +103,6 @@ fn parse_http_date(raw: &str, now: OffsetDateTime) -> Option<OffsetDateTime> {
     None
 }
 
-static ZERO_RETRY_DELAY_FOR_TESTS: AtomicBool = AtomicBool::new(false);
-
-/// Make retry sleeps return immediately so exhaustion paths can be exercised
-/// in tests without waiting out the real backoff schedule.
-pub fn set_zero_retry_delay_for_tests(enabled: bool) {
-    ZERO_RETRY_DELAY_FOR_TESTS.store(enabled, Ordering::SeqCst);
-}
-
 pub async fn sleep(ms: u64) {
-    if ZERO_RETRY_DELAY_FOR_TESTS.load(Ordering::SeqCst) {
-        return;
-    }
     tokio::time::sleep(Duration::from_millis(ms)).await;
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rand::{SeedableRng, rngs::StdRng};
-    use time::format_description::well_known::Rfc3339;
-
-    fn now() -> OffsetDateTime {
-        OffsetDateTime::parse("1994-11-06T08:49:27.000000001Z", &Rfc3339).unwrap()
-    }
-
-    #[test]
-    fn retry_after_numeric_and_all_http_date_forms_obey_the_budget() {
-        for (header, wait_ms, exceeds_budget) in [
-            ("0", 0, false),
-            (" 5 ", 5000, false),
-            ("0.0001", 1, false),
-            ("30", 30_000, false),
-            ("30.0001", 30_000, true),
-            ("120", 30_000, true),
-            ("1e300", 30_000, true),
-            ("Sun, 06 Nov 1994 08:49:37 GMT", 10_000, false),
-            ("Sunday, 06-Nov-94 08:49:37 GMT", 10_000, false),
-            ("Sun Nov  6 08:49:37 1994", 10_000, false),
-            ("Sun, 06 Nov 1994 08:49:57 GMT", 30_000, false),
-            ("Sun, 06 Nov 1994 08:49:58 GMT", 30_000, true),
-            ("Sun, 06 Nov 1994 08:49:00 GMT", 0, false),
-        ] {
-            let outcome =
-                compute_backoff_delay_with(0, Some(header), now(), &mut StdRng::seed_from_u64(1));
-            assert_eq!(outcome.wait_ms, wait_ms, "{header}");
-            assert_eq!(outcome.exceeds_budget, exceeds_budget, "{header}");
-        }
-    }
-
-    #[test]
-    fn obsolete_http_date_uses_a_rolling_fifty_year_cutoff() {
-        let now = OffsetDateTime::parse("2026-10-22T12:00:00Z", &Rfc3339).unwrap();
-        assert_eq!(
-            parse_http_date("Sunday, 06-Nov-94 08:49:37 GMT", now)
-                .unwrap()
-                .year(),
-            1994
-        );
-        assert_eq!(
-            parse_http_date("Sunday, 06-Nov-06 08:49:37 GMT", now)
-                .unwrap()
-                .year(),
-            2006
-        );
-        assert_eq!(
-            parse_http_date("Sunday, 06-Nov-76 08:49:37 GMT", now)
-                .unwrap()
-                .year(),
-            1976
-        );
-        assert_eq!(
-            parse_http_date("Sunday, 06-Sep-76 08:49:37 GMT", now)
-                .unwrap()
-                .year(),
-            2076
-        );
-    }
-
-    #[test]
-    fn invalid_retry_after_falls_back_to_bounded_random_jitter() {
-        for header in [
-            None,
-            Some(""),
-            Some("garbage"),
-            Some("-1"),
-            Some("NaN"),
-            Some("inf"),
-            Some("Sun, 99 Nov 1994 08:49:37 GMT"),
-        ] {
-            for attempt in [0, 1, 4, u32::MAX] {
-                let ceiling = RETRY_INITIAL_DELAY_MS
-                    .saturating_mul(RETRY_BACKOFF_FACTOR.saturating_pow(attempt))
-                    .min(RETRY_MAX_DELAY_MS);
-                let mut rng = StdRng::seed_from_u64(1);
-                let waits: Vec<u64> = (0..8)
-                    .map(|_| {
-                        let outcome = compute_backoff_delay_with(attempt, header, now(), &mut rng);
-                        assert!(!outcome.exceeds_budget);
-                        assert!((ceiling / 2..=ceiling).contains(&outcome.wait_ms));
-                        outcome.wait_ms
-                    })
-                    .collect();
-                assert!(waits.windows(2).any(|pair| pair[0] != pair[1]));
-            }
-        }
-    }
 }

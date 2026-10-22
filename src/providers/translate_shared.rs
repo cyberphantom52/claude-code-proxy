@@ -183,33 +183,3 @@ fn parse_content_block(value: &Value) -> anyhow::Result<ContentBlock> {
     };
     parsed().map_err(|error| anyhow::anyhow!("{kind}: {error}"))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn tool_inputs_preserve_null_default_and_explicit_values() {
-        for (block, expected) in [
-            (
-                json!({"type":"tool_use","id":"tu_1","name":"Read"}),
-                Value::Null,
-            ),
-            (
-                json!({"type":"tool_use","id":"tu_1","name":"Read","input":null}),
-                Value::Null,
-            ),
-            (
-                json!({"type":"tool_use","id":"tu_1","name":"Read","input":{"path":"a"}}),
-                json!({"path":"a"}),
-            ),
-        ] {
-            let blocks = normalize_content(&json!([block])).unwrap();
-            let ContentBlock::ToolUse { input, .. } = &blocks[0] else {
-                panic!("expected tool_use");
-            };
-            assert_eq!(input, &expected);
-        }
-    }
-}

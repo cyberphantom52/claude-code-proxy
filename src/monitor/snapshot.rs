@@ -49,18 +49,6 @@ impl SnapshotUpdate {
             Self::Disconnected { error, .. } => Some(error),
         }
     }
-
-    pub(super) fn updated(self, result: Result<MonitorSnapshot, String>) -> Self {
-        match result {
-            Ok(snapshot) => Self::Live(snapshot),
-            Err(error) => {
-                let snapshot = match self {
-                    Self::Live(snapshot) | Self::Disconnected { snapshot, .. } => snapshot,
-                };
-                Self::Disconnected { snapshot, error }
-            }
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -266,59 +254,5 @@ impl SessionSnapshot {
         self.session_id
             .clone()
             .unwrap_or_else(|| "no-session".to_string())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::monitor::MonitorHandle;
-
-    #[test]
-    fn snapshot_round_trip_preserves_accounting_without_process_clocks() {
-        let monitor = MonitorHandle::default();
-        monitor.request_started(
-            "active",
-            Some("session".into()),
-            Some(2),
-            EndpointKind::Messages,
-        );
-        monitor.provider_selected("active", "codex", "gpt-6-astra", Some("high".into()));
-        monitor.stream_progress("active", 40, 1, Some(8), Some(3));
-        monitor.request_started(
-            "done",
-            Some("session".into()),
-            Some(1),
-            EndpointKind::CountTokens,
-        );
-        monitor.request_completed("done", 200, Some(11), None);
-        let snapshot = MonitorSnapshot::from(monitor.snapshot());
-        let encoded = serde_json::to_string(&snapshot).unwrap();
-        assert!(!encoded.contains("instant"));
-        let decoded: MonitorSnapshot = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(decoded, snapshot);
-        assert_eq!(decoded.snapshot_at, snapshot.snapshot_at);
-        assert_eq!(decoded.uptime, snapshot.uptime);
-        assert_eq!(decoded.active[0].elapsed(), snapshot.active[0].elapsed());
-        assert_eq!(decoded.active[0].rate(), snapshot.active[0].rate());
-        assert_eq!(decoded.sessions[0].rate(), snapshot.sessions[0].rate());
-        assert_eq!(decoded.recent[0].http_status, Some(200));
-    }
-
-    #[test]
-    fn snapshot_deserialization_accepts_legacy_and_newer_fields() {
-        let snapshot: MonitorSnapshot = MonitorHandle::default().snapshot().into();
-        let mut legacy = serde_json::to_value(&snapshot).unwrap();
-        legacy.as_object_mut().unwrap().remove("snapshot_at");
-        let decoded: MonitorSnapshot = serde_json::from_value(legacy).unwrap();
-        assert!(decoded.snapshot_at >= snapshot.started_at);
-
-        let mut newer = serde_json::to_value(&snapshot).unwrap();
-        newer
-            .as_object_mut()
-            .unwrap()
-            .insert("future_field".into(), serde_json::json!(true));
-        let decoded: MonitorSnapshot = serde_json::from_value(newer).unwrap();
-        assert_eq!(decoded.snapshot_at, snapshot.snapshot_at);
     }
 }

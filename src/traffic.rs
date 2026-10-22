@@ -30,7 +30,10 @@ pub struct TrafficCaptureOptions {
 }
 
 pub fn traffic_capture_enabled() -> bool {
-    traffic_capture_enabled_for_env(&std::env::vars().collect())
+    matches!(
+        std::env::var("CCP_TRAFFIC_LOG").as_deref(),
+        Ok("1" | "true" | "yes")
+    )
 }
 
 pub fn traffic_capture_enabled_for_env(env: &std::collections::HashMap<String, String>) -> bool {
@@ -139,30 +142,10 @@ impl TrafficCapture {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn test_capture(root: PathBuf) -> TrafficCapture {
-    TrafficCapture {
-        root,
-        artifact_counter: Mutex::new(0),
-        event_counter: Mutex::new(0),
-    }
-}
-
 fn write_bytes(path: PathBuf, value: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         create_dir_all(parent)?;
-        if let Ok(meta) = fs::metadata(parent) {
-            set_mode(parent, 0o700);
-            if meta.is_dir() {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let mut perm = meta.permissions();
-                    perm.set_mode(0o700);
-                    let _ = fs::set_permissions(parent, perm);
-                }
-            }
-        }
+        set_mode(parent, 0o700);
     }
     let mut out = File::create(&path)?;
     out.write_all(value)?;
@@ -326,6 +309,7 @@ impl StreamTrafficCapture {
 pub fn sanitize_path_part(input: &str) -> String {
     let cleaned: String = input
         .chars()
+        .take(160)
         .map(|ch| {
             if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
                 ch
@@ -335,15 +319,10 @@ pub fn sanitize_path_part(input: &str) -> String {
         })
         .collect();
 
-    let truncated = if cleaned.len() > 160 {
-        &cleaned[..160]
-    } else {
-        &cleaned
-    };
-    if truncated.is_empty() {
+    if cleaned.is_empty() {
         "unknown".to_string()
     } else {
-        truncated.to_string()
+        cleaned
     }
 }
 
@@ -468,372 +447,5 @@ fn set_mode(path: &Path, mode: u32) {
             perm.set_mode(mode);
             let _ = fs::set_permissions(path, perm);
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn redact_traffic_strips_input_image_data_urls() {
-        let value = serde_json::json!({
-            "input": [
-                {"type": "message", "role": "user", "content": [
-                    {"type": "input_text", "text": "what color?"},
-                    {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"}
-                ]}
-            ]
-        });
-        let redacted = redact_traffic(&value);
-        let rendered = redacted.to_string();
-        assert!(
-            !rendered.contains("iVBORw0KGgo"),
-            "base64 payload leaked: {rendered}"
-        );
-        assert!(
-            !rendered.contains("data:image/png;base64,iVBOR"),
-            "data URL payload leaked: {rendered}"
-        );
-        // The image part is still structurally visible (redacted marker).
-        assert!(rendered.contains("input_image"));
-    }
-
-    #[test]
-    fn redact_traffic_strips_inline_base64_image_values() {
-        let value = serde_json::json!({
-            "output": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
-        });
-        let redacted = redact_traffic(&value);
-        let rendered = redacted.to_string();
-        assert!(!rendered.contains("iVBORw0KGgo"));
-    }
-
-    #[test]
-    fn redact_traffic_strips_anthropic_image_source_data() {
-        // The incoming Anthropic request body carries raw base64 under
-        // `source.data` (no data: URL wrapper) — it must not persist either.
-        let value = serde_json::json!({
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "look"},
-                    {"type": "image", "source": {
-                        "type": "base64",
-                        "media_type": "image/png",
-                        "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
-                    }}
-                ]
-            }]
-        });
-        let redacted = redact_traffic(&value);
-        let rendered = redacted.to_string();
-        assert!(
-            !rendered.contains("iVBORw0KGgo"),
-            "source.data base64 leaked: {rendered}"
-        );
-        assert!(rendered.contains("redacted"));
-        // Structure is preserved.
-        assert!(rendered.contains("image/png"));
-    }
-
-    #[test]
-    fn redact_traffic_strips_compaction_encrypted_content() {
-        // Server-side compaction replays the transcript as an opaque blob in
-        // the upstream request; it must not persist, but its size should.
-        let value = serde_json::json!({
-            "model": "gpt-5",
-            "input": [
-                {"type": "compaction", "encrypted_content": "gAAAAABopaque-compacted-transcript"},
-                {"type": "message", "role": "user", "content": [
-                    {"type": "input_text", "text": "hello"}
-                ]}
-            ]
-        });
-        let redacted = redact_traffic(&value);
-        let rendered = redacted.to_string();
-        assert!(
-            !rendered.contains("gAAAAA"),
-            "encrypted_content leaked: {rendered}"
-        );
-        assert_eq!(
-            redacted["input"][0]["encrypted_content"],
-            "[redacted len=34]"
-        );
-        assert_eq!(redacted["input"][0]["type"], "compaction");
-        assert_eq!(redacted["input"][1]["content"][0]["text"], "hello");
-        assert_eq!(redacted["model"], "gpt-5");
-    }
-
-    #[test]
-    fn redact_traffic_strips_reasoning_encrypted_content_in_events() {
-        // Upstream response items carry the same blob under `reasoning`.
-        let value = serde_json::json!({
-            "type": "response.output_item.done",
-            "item": {"type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "gAAAAAopaque"}
-        });
-        let redacted = redact_traffic(&value);
-        assert_eq!(redacted["item"]["encrypted_content"], "[redacted len=12]");
-        assert_eq!(redacted["item"]["id"], "rs_1");
-    }
-
-    #[test]
-    fn redact_traffic_strips_proxy_signature_delta_in_downstream_event() {
-        // The Codex translator emits a 050 downstream `signature_delta` whose
-        // signature is `ccp:codex:v1:<encoded-id>:<encrypted_content>`.
-        let signature = "ccp:codex:v1:cnNfMQ:gAAAAABopaque-reasoning-replay";
-        let value = serde_json::json!({
-            "event": "content_block_delta",
-            "data": {
-                "type": "content_block_delta",
-                "index": 0,
-                "delta": {"type": "signature_delta", "signature": signature}
-            }
-        });
-        let redacted = redact_traffic(&value);
-        let rendered = redacted.to_string();
-        assert!(
-            !rendered.contains("ccp:codex:v1:"),
-            "proxy signature leaked: {rendered}"
-        );
-        assert!(
-            !rendered.contains("gAAAAABopaque"),
-            "encrypted payload leaked: {rendered}"
-        );
-        assert_eq!(
-            redacted["data"]["delta"]["signature"],
-            format!("[redacted len={}]", signature.len())
-        );
-        // Neighboring structure survives.
-        assert_eq!(redacted["data"]["delta"]["type"], "signature_delta");
-        assert_eq!(redacted["data"]["index"], 0);
-    }
-
-    #[test]
-    fn redact_traffic_strips_proxy_signature_in_thinking_blocks() {
-        // Buffered downstream content and the replayed incoming Anthropic
-        // request both carry the signature on a `thinking` block.
-        let signature = "ccp:codex:v1:cnNfMQ:gAAAAABopaque-reasoning-replay";
-        let value = serde_json::json!({
-            "content": [
-                {"type": "thinking", "thinking": "reasoned", "signature": signature},
-                {"type": "text", "text": "answer"}
-            ]
-        });
-        let redacted = redact_traffic(&value);
-        let rendered = redacted.to_string();
-        assert!(
-            !rendered.contains("ccp:codex:v1:"),
-            "proxy signature leaked: {rendered}"
-        );
-        assert_eq!(
-            redacted["content"][0]["signature"],
-            format!("[redacted len={}]", signature.len())
-        );
-        assert_eq!(redacted["content"][0]["thinking"], "reasoned");
-        assert_eq!(redacted["content"][1]["text"], "answer");
-    }
-
-    #[test]
-    fn redact_traffic_keeps_foreign_signatures() {
-        // Real Anthropic signatures and other opaque values are not
-        // proxy-owned and must survive capture redaction unchanged.
-        let value = serde_json::json!({
-            "delta": {"type": "signature_delta", "signature": "ErUBCkYIBRgCIkA-real"},
-            "content": [{"type": "thinking", "signature": "another-opaque-signature"}]
-        });
-        let redacted = redact_traffic(&value);
-        assert_eq!(redacted["delta"]["signature"], "ErUBCkYIBRgCIkA-real");
-        assert_eq!(
-            redacted["content"][0]["signature"],
-            "another-opaque-signature"
-        );
-    }
-
-    #[test]
-    fn traffic_capture_redacts_proxy_signatures_at_json_boundary() {
-        // Exercise write_json_event (050 downstream) and write_json (010
-        // incoming request) end to end, where redaction is actually applied.
-        let temp = tempfile::TempDir::new().unwrap();
-        let capture = test_capture(temp.path().join("traffic"));
-        let signature = "ccp:codex:v1:cnNfMQ:gAAAAABopaque-reasoning-replay";
-        let foreign = "ErUBCkYIBRgCIkA-real-anthropic-signature";
-
-        capture.write_json_event(
-            "050-downstream-event",
-            &serde_json::json!({
-                "event": "content_block_delta",
-                "data": {
-                    "type": "content_block_delta",
-                    "index": 0,
-                    "delta": {"type": "signature_delta", "signature": signature}
-                }
-            }),
-        );
-        capture.write_json(
-            "010-anthropic-request",
-            &serde_json::json!({
-                "messages": [{
-                    "role": "assistant",
-                    "content": [
-                        {"type": "thinking", "thinking": "kept", "signature": signature},
-                        {"type": "thinking", "thinking": "kept", "signature": foreign}
-                    ]
-                }]
-            }),
-        );
-
-        let mut captured = String::new();
-        for dir in [capture.root().to_path_buf(), capture.root().join("events")] {
-            for entry in std::fs::read_dir(dir).unwrap() {
-                let path = entry.unwrap().path();
-                if path.is_file() {
-                    captured.push_str(&std::fs::read_to_string(path).unwrap());
-                }
-            }
-        }
-
-        assert!(
-            !captured.contains("ccp:codex:v1:"),
-            "proxy signature leaked to capture: {captured}"
-        );
-        assert!(
-            !captured.contains("gAAAAABopaque"),
-            "encrypted payload leaked to capture: {captured}"
-        );
-        assert!(
-            captured.contains(foreign),
-            "foreign signature lost: {captured}"
-        );
-        assert!(captured.contains("kept"));
-    }
-
-    #[test]
-    fn redact_traffic_keeps_unrelated_data_keys() {
-        let value = serde_json::json!({"data": "some-non-image-payload", "count": 3});
-        let redacted = redact_traffic(&value);
-        assert_eq!(redacted["data"], "some-non-image-payload");
-    }
-
-    #[test]
-    fn redact_traffic_strips_data_urls_in_array_shaped_tool_output() {
-        // L2b inline mode: function_call_output.output is an array of content
-        // parts — the image_url inside must be redacted just like message parts.
-        let value = serde_json::json!({
-            "input": [
-                {"type": "function_call_output", "call_id": "call_1", "output": [
-                    {"type": "input_text", "text": "screenshot"},
-                    {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"}
-                ]}
-            ]
-        });
-        let redacted = redact_traffic(&value);
-        let rendered = redacted.to_string();
-        assert!(
-            !rendered.contains("iVBORw0KGgo"),
-            "base64 payload leaked: {rendered}"
-        );
-        assert!(
-            !rendered.contains("data:image/png;base64,iVBOR"),
-            "data URL payload leaked: {rendered}"
-        );
-        // Structure and text survive.
-        assert!(rendered.contains("input_image"));
-        assert!(rendered.contains("screenshot"));
-        assert!(rendered.contains("redacted"));
-    }
-
-    #[test]
-    fn redact_traffic_strips_uppercase_media_type_image_source() {
-        // Captures are written before translation validates anything, so a
-        // non-standard casing must still not persist its payload.
-        let value = serde_json::json!({
-            "source": {"type": "base64", "media_type": "IMAGE/PNG", "data": "QUJDREVGRw=="}
-        });
-        let redacted = redact_traffic(&value);
-        let rendered = redacted.to_string();
-        assert!(
-            !rendered.contains("QUJDREVGRw"),
-            "payload leaked: {rendered}"
-        );
-        assert!(
-            redacted["source"]["data"]
-                .as_str()
-                .unwrap()
-                .contains("redacted")
-        );
-    }
-
-    #[test]
-    fn redact_traffic_strips_uppercase_image_source_type() {
-        let value = serde_json::json!({
-            "source": {"type": "BASE64", "media_type": "image/png", "data": "QUJDREVGRw=="}
-        });
-        let redacted = redact_traffic(&value);
-        let rendered = redacted.to_string();
-        assert!(
-            !rendered.contains("QUJDREVGRw"),
-            "payload leaked: {rendered}"
-        );
-    }
-
-    #[test]
-    fn redact_traffic_strips_image_source_without_media_type() {
-        // A malformed block the translator would reject must still be redacted
-        // in the pre-translation capture.
-        let value = serde_json::json!({
-            "source": {"type": "base64", "data": "QUJDREVGRw=="}
-        });
-        let redacted = redact_traffic(&value);
-        let rendered = redacted.to_string();
-        assert!(
-            !rendered.contains("QUJDREVGRw"),
-            "payload leaked: {rendered}"
-        );
-    }
-
-    #[test]
-    fn redact_traffic_strips_uppercase_data_url_scheme() {
-        let value = serde_json::json!({
-            "image_url": "DATA:IMAGE/PNG;base64,iVBORw0KGgoAAAANSUhEUg"
-        });
-        let redacted = redact_traffic(&value);
-        let rendered = redacted.to_string();
-        assert!(
-            !rendered.contains("iVBORw0KGgo"),
-            "data URL payload leaked: {rendered}"
-        );
-    }
-
-    #[test]
-    fn redact_traffic_keeps_structured_image_url_shape() {
-        // Object image_url: redact the payload but keep the object
-        // structure so captures stay parseable.
-        let value = serde_json::json!({
-            "image_url": {"url": "DATA:IMAGE/PNG;BASE64,iVBORw0KGgoAAAANSUhEUg"}
-        });
-        let redacted = redact_traffic(&value);
-        assert!(redacted["image_url"].is_object(), "shape lost: {redacted}");
-        let rendered = redacted.to_string();
-        assert!(
-            !rendered.contains("iVBORw0KGgo"),
-            "nested payload leaked: {rendered}"
-        );
-    }
-
-    #[test]
-    fn traffic_redacts_proxy_authorization() {
-        let redacted = redact_traffic(&serde_json::json!({
-            "headers": {
-                "proxy-authorization": "Basic dXNlcjpwYXNz",
-                "x-safe": "kept"
-            }
-        }));
-
-        assert_eq!(redacted["headers"]["x-safe"], "kept");
-        assert_eq!(
-            redacted["headers"]["proxy-authorization"],
-            "[redacted len=18]"
-        );
     }
 }

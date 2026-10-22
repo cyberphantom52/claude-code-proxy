@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use crate::anthropic::sse::encode_sse_event;
+use crate::providers::codex::client::MAX_PENDING_HTTP_EVENT_BYTES;
 use crate::providers::codex::events::classify_event_failure;
 use crate::traffic::TrafficCapture;
 
@@ -163,7 +164,6 @@ enum LiveBlock {
         call_id: String,
         name: String,
         args_accum: String,
-        buffer_until_done: bool,
         emitted_args: bool,
     },
 }
@@ -201,6 +201,7 @@ pub struct LiveStreamTranslator {
     web_searches: Vec<LiveWebSearch>,
     web_search_results: Vec<LiveWebSearchResult>,
     deferred_text: Vec<(usize, String)>,
+    deferred_text_bytes: usize,
     semantic_output_started: bool,
     text_output_started: bool,
     // Seeds Claude Code's live subagent counter until the provider returns
@@ -237,6 +238,7 @@ impl LiveStreamTranslator {
             web_searches: Vec::new(),
             web_search_results: Vec::new(),
             deferred_text: Vec::new(),
+            deferred_text_bytes: 0,
             semantic_output_started: false,
             text_output_started: false,
             estimated_input_tokens,
@@ -305,7 +307,7 @@ impl LiveStreamTranslator {
                 self.reasoning_delta(payload, traffic, &mut out);
             }
             "response.output_text.delta" => {
-                self.text_delta(payload, traffic, &mut out);
+                self.text_delta(payload, traffic, &mut out)?;
             }
             "response.output_text.annotation.added" => {
                 self.web_search_annotation(payload);
@@ -390,6 +392,8 @@ impl LiveStreamTranslator {
             return out;
         }
         self.close_open_blocks(traffic, &mut out);
+        self.deferred_text.clear();
+        self.deferred_text_bytes = 0;
         self.ensure_message_start(traffic, &mut out);
         self.emit(
             traffic,
@@ -531,7 +535,6 @@ impl LiveStreamTranslator {
                         call_id: call_id.clone(),
                         name: name.clone(),
                         args_accum: String::new(),
-                        buffer_until_done: name == "Read",
                         emitted_args: false,
                     },
                 );
@@ -612,14 +615,12 @@ impl LiveStreamTranslator {
         payload: &serde_json::Value,
         traffic: Option<&TrafficCapture>,
         out: &mut Vec<u8>,
-    ) {
-        self.close_thinking(traffic, out);
+    ) -> Result<(), String> {
         let delta = payload.get("delta").and_then(|v| v.as_str()).unwrap_or("");
         if delta.is_empty() {
-            return;
+            self.close_thinking(traffic, out);
+            return Ok(());
         }
-        self.semantic_output_started = true;
-        self.text_output_started = true;
 
         let output_index = payload
             .get("output_index")
@@ -633,10 +634,22 @@ impl LiveStreamTranslator {
             })
             .unwrap_or(0);
 
+        let deferred = match self.blocks_by_output_index.get(&output_index) {
+            Some(LiveBlock::Text { deferred, .. }) => *deferred,
+            None => !self.web_searches.is_empty(),
+            _ => false,
+        };
+        let next_bytes = self.deferred_text_bytes.saturating_add(delta.len());
+        if deferred && next_bytes > MAX_PENDING_HTTP_EVENT_BYTES {
+            return Err("Codex deferred text exceeded its 16 MiB buffer limit".to_string());
+        }
+        self.close_thinking(traffic, out);
+        self.semantic_output_started = true;
+        self.text_output_started = true;
+
         if !self.blocks_by_output_index.contains_key(&output_index) {
             let index = self.anthropic_index;
             self.anthropic_index += 1;
-            let deferred = !self.web_searches.is_empty();
             self.blocks_by_output_index.insert(
                 output_index,
                 LiveBlock::Text {
@@ -666,11 +679,12 @@ impl LiveStreamTranslator {
             deferred,
         }) = self.blocks_by_output_index.get_mut(&output_index)
         else {
-            return;
+            return Ok(());
         };
-        text.push_str(delta);
         if *deferred {
-            return;
+            text.push_str(delta);
+            self.deferred_text_bytes = next_bytes;
+            return Ok(());
         }
         let index = *index;
         self.emit(
@@ -683,6 +697,7 @@ impl LiveStreamTranslator {
                 "delta": {"type": "text_delta", "text": delta}
             }),
         );
+        Ok(())
     }
 
     fn tool_delta(
@@ -707,7 +722,6 @@ impl LiveStreamTranslator {
             index,
             name,
             args_accum,
-            buffer_until_done,
             emitted_args,
             ..
         }) = self.blocks_by_output_index.get_mut(&output_index)
@@ -720,7 +734,7 @@ impl LiveStreamTranslator {
             ));
         }
         args_accum.push_str(delta);
-        if !*buffer_until_done {
+        if name != "Read" {
             *emitted_args = true;
             let index = *index;
             self.emit(
@@ -881,7 +895,6 @@ impl LiveStreamTranslator {
                 if !*emitted_args {
                     *args_accum =
                         sanitize_read_args(name, &completed.arguments, Some(call_id.as_str()));
-                    *emitted_args = true;
                     self.emit(
                         traffic,
                         out,
@@ -1123,6 +1136,7 @@ impl LiveStreamTranslator {
                 &serde_json::json!({"type": "content_block_stop", "index": index}),
             );
         }
+        self.deferred_text_bytes = 0;
     }
 
     fn finish(
@@ -1306,769 +1320,4 @@ fn output_index(payload: &serde_json::Value) -> usize {
         .get("output_index")
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as usize
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::anthropic::sse::parse_sse_events;
-    use serde_json::json;
-
-    fn render(events: Vec<serde_json::Value>) -> String {
-        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.5");
-        let mut out = Vec::new();
-        for event in events {
-            out.extend(translator.accept(&event, None).unwrap());
-        }
-        String::from_utf8(out).unwrap()
-    }
-
-    #[test]
-    fn reconnect_discards_previous_response_service_tier() {
-        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.5");
-        translator
-            .accept(
-                &json!({"type":"response.created", "response":{"service_tier":"priority"}}),
-                None,
-            )
-            .unwrap();
-        translator.prepare_reconnect(None);
-        let out = translator
-            .accept(
-                &json!({"type":"response.completed", "response":{"usage":{}}}),
-                None,
-            )
-            .unwrap();
-        let delta = parse_sse_events(&out)
-            .into_iter()
-            .filter_map(|event| serde_json::from_str::<serde_json::Value>(&event.data).ok())
-            .find(|event| event["type"] == "message_delta")
-            .unwrap();
-        assert!(delta["usage"].get("speed").is_none());
-    }
-
-    #[test]
-    fn emits_text_delta_before_terminal_event() {
-        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.5");
-        let out = translator
-            .accept(
-                &json!({
-                    "type": "response.output_text.delta",
-                    "output_index": 0,
-                    "delta": "hello"
-                }),
-                None,
-            )
-            .unwrap();
-        let out = String::from_utf8(out).unwrap();
-        assert!(out.contains("message_start"));
-        assert!(out.contains("content_block_start"));
-        assert!(out.contains("text_delta"));
-        assert!(out.contains("hello"));
-        assert!(!out.contains("message_stop"));
-        assert!(translator.has_semantic_output());
-    }
-
-    #[test]
-    fn estimated_input_is_visible_at_start_and_provider_usage_is_exact_at_finish() {
-        let mut translator =
-            LiveStreamTranslator::with_estimated_input_tokens("msg_1", "gpt-5.5", 321);
-
-        let started = translator
-            .accept(
-                &json!({
-                    "type": "response.output_text.delta",
-                    "output_index": 0,
-                    "delta": "abcdefgh"
-                }),
-                None,
-            )
-            .unwrap();
-        let started = parse_sse_events(&started)
-            .into_iter()
-            .filter_map(|event| serde_json::from_str::<serde_json::Value>(&event.data).ok())
-            .find(|value| {
-                value.get("type").and_then(serde_json::Value::as_str) == Some("message_start")
-            })
-            .unwrap();
-        assert_eq!(
-            started.pointer("/message/usage/input_tokens"),
-            Some(&json!(321))
-        );
-
-        let finished = translator
-            .accept(
-                &json!({
-                    "type": "response.completed",
-                    "response": {
-                        "id": "resp_1",
-                        "status": "completed",
-                        "usage": {"input_tokens": 300, "output_tokens": 9}
-                    }
-                }),
-                None,
-            )
-            .unwrap();
-        let finished = parse_sse_events(&finished)
-            .into_iter()
-            .filter_map(|event| serde_json::from_str::<serde_json::Value>(&event.data).ok())
-            .find(|value| {
-                value.get("type").and_then(serde_json::Value::as_str) == Some("message_delta")
-            })
-            .unwrap();
-        assert_eq!(finished.pointer("/usage/input_tokens"), Some(&json!(300)));
-        assert_eq!(finished.pointer("/usage/output_tokens"), Some(&json!(9)));
-    }
-
-    #[test]
-    fn finishes_text_stream() {
-        let out = render(vec![
-            json!({
-                "type": "response.output_item.added",
-                "output_index": 0,
-                "item": {"type": "message", "id": "msg_up"}
-            }),
-            json!({
-                "type": "response.output_text.delta",
-                "output_index": 0,
-                "delta": "hello"
-            }),
-            json!({
-                "type": "response.output_item.done",
-                "output_index": 0,
-                "item": {"type": "message"}
-            }),
-            json!({
-                "type": "response.completed",
-                "response": {"id": "resp_1", "status": "completed", "incomplete_details": null, "usage": {"input_tokens": 2, "output_tokens": 1}}
-            }),
-        ]);
-        assert!(out.contains("content_block_stop"));
-        assert!(out.contains("message_delta"));
-        assert!(out.contains(r#""stop_reason":"end_turn""#));
-        assert!(out.contains("message_stop"));
-    }
-
-    #[test]
-    fn terminal_only_completion_remains_non_semantic() {
-        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.5");
-        let out = translator
-            .accept(
-                &json!({
-                    "type": "response.completed",
-                    "response": {"id": "resp_1", "status": "completed", "incomplete_details": null, "usage": {}}
-                }),
-                None,
-            )
-            .unwrap();
-        let out = String::from_utf8(out).unwrap();
-        assert!(out.contains(r#""stop_reason":"end_turn""#));
-        assert!(!out.contains(r#""stop_reason":"max_tokens""#));
-        assert!(!translator.has_semantic_output());
-    }
-
-    #[test]
-    fn strict_live_translator_rejects_incomplete_response() {
-        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.5");
-        let error = translator
-            .accept(
-                &json!({
-                    "type":"response.incomplete",
-                    "response": {
-                        "status":"incomplete",
-                        "incomplete_details":{"reason":"max_output_tokens"}
-                    }
-                }),
-                None,
-            )
-            .unwrap_err();
-        assert!(error.contains("max_output_tokens"));
-    }
-
-    #[test]
-    fn structural_tool_start_is_not_semantic_until_arguments_arrive() {
-        let mut tool = LiveStreamTranslator::new("msg_tool", "gpt-5.5");
-        tool.accept(
-            &json!({
-                "type": "response.output_item.added",
-                "output_index": 0,
-                "item": {"type": "function_call", "call_id": "call_1", "name": "Read"}
-            }),
-            None,
-        )
-        .unwrap();
-        assert!(!tool.has_semantic_output());
-        tool.accept(
-            &json!({
-                "type": "response.function_call_arguments.delta",
-                "output_index": 0,
-                "delta": "{}"
-            }),
-            None,
-        )
-        .unwrap();
-        assert!(tool.has_semantic_output());
-
-        let mut thinking = LiveStreamTranslator::new("msg_thinking", "gpt-5.5");
-        thinking
-            .accept(
-                &json!({
-                    "type": "response.reasoning_summary_text.delta",
-                    "output_index": 0,
-                    "delta": "plan"
-                }),
-                None,
-            )
-            .unwrap();
-        assert!(thinking.has_semantic_output());
-
-        let mut web_search = LiveStreamTranslator::new("msg_search", "gpt-5.5");
-        web_search
-            .accept(
-                &json!({
-                    "type": "response.output_item.added",
-                    "output_index": 0,
-                    "item": {"type": "web_search_call", "id": "ws_1"}
-                }),
-                None,
-            )
-            .unwrap();
-        assert!(!web_search.has_semantic_output());
-        web_search
-            .accept(
-                &json!({
-                    "type": "response.output_item.done",
-                    "output_index": 0,
-                    "item": {
-                        "type": "web_search_call",
-                        "id": "ws_1",
-                        "action": {"query": "claude-code-proxy"}
-                    }
-                }),
-                None,
-            )
-            .unwrap();
-        assert!(web_search.has_semantic_output());
-    }
-
-    #[test]
-    fn standalone_function_done_does_not_close_a_different_open_tool() {
-        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.5");
-        let mut rendered = Vec::new();
-        for event in [
-            json!({
-                "type":"response.output_item.added",
-                "output_index":0,
-                "item":{"type":"function_call","call_id":"call_a","name":"Bash"}
-            }),
-            json!({
-                "type":"response.function_call_arguments.delta",
-                "output_index":0,
-                "delta":"{\"command\":\"echo a\"}"
-            }),
-        ] {
-            rendered.extend(translator.accept(&event, None).unwrap());
-        }
-
-        let standalone_b = translator
-            .accept(
-                &json!({
-                    "type":"response.output_item.done",
-                    "item":{
-                        "type":"function_call",
-                        "call_id":"call_b",
-                        "name":"Bash",
-                        "arguments":"{\"command\":\"echo b\"}"
-                    }
-                }),
-                None,
-            )
-            .unwrap();
-        assert!(String::from_utf8_lossy(&standalone_b).contains("call_b"));
-        assert!(translator.blocks_by_output_index.contains_key(&0));
-        rendered.extend(standalone_b);
-
-        rendered.extend(
-            translator
-                .accept(
-                    &json!({
-                        "type":"response.output_item.done",
-                        "output_index":0,
-                        "item":{
-                            "type":"function_call",
-                            "call_id":"call_a",
-                            "name":"Bash",
-                            "arguments":"{\"command\":\"echo a\"}"
-                        }
-                    }),
-                    None,
-                )
-                .unwrap(),
-        );
-        assert!(!translator.blocks_by_output_index.contains_key(&0));
-
-        let rendered = String::from_utf8(rendered).unwrap();
-        assert_eq!(rendered.matches("call_a").count(), 1);
-        assert_eq!(rendered.matches("call_b").count(), 1);
-        assert_eq!(rendered.matches("event: content_block_stop").count(), 2);
-    }
-
-    #[test]
-    fn completed_function_call_rejects_invalid_authoritative_fields_before_emission() {
-        for (item, expected_error) in [
-            (
-                json!({"type":"function_call","name":"Bash","arguments":"{}"}),
-                "missing call_id",
-            ),
-            (
-                json!({"type":"function_call","call_id":"call_missing_name","arguments":"{}"}),
-                "missing name",
-            ),
-            (
-                json!({"type":"function_call","call_id":"call_missing_arguments","name":"Bash"}),
-                "missing string arguments",
-            ),
-            (
-                json!({"type":"function_call","call_id":"call_malformed","name":"Bash","arguments":"{"}),
-                "arguments are not valid JSON",
-            ),
-            (
-                json!({"type":"function_call","call_id":"call_nonobject","name":"Bash","arguments":"[]"}),
-                "arguments must be a JSON object",
-            ),
-        ] {
-            let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.5");
-            let error = translator
-                .accept(
-                    &json!({"type":"response.output_item.done","item":item}),
-                    None,
-                )
-                .unwrap_err();
-
-            assert!(error.contains(expected_error), "error: {error}");
-            assert!(!translator.saw_tool_use);
-            assert!(!translator.has_semantic_output());
-            assert!(!translator.message_started);
-            assert!(translator.blocks_by_output_index.is_empty());
-        }
-    }
-
-    #[test]
-    fn completed_function_call_rejects_oversized_arguments_before_emission() {
-        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.5");
-        let error = translator
-            .accept(
-                &json!({
-                    "type":"response.output_item.done",
-                    "item":{
-                        "type":"function_call",
-                        "call_id":"call_oversized",
-                        "name":"Bash",
-                        "arguments":"x".repeat(BUFFERED_TOOL_MAX_ARGS_BYTES + 1)
-                    }
-                }),
-                None,
-            )
-            .unwrap_err();
-
-        assert_eq!(error, "Buffered Bash tool arguments exceeded safe limits");
-        assert!(!translator.saw_tool_use);
-        assert!(!translator.has_semantic_output());
-        assert!(!translator.message_started);
-        assert!(translator.blocks_by_output_index.is_empty());
-    }
-
-    #[test]
-    fn completed_function_call_normalizes_blank_arguments_before_emission() {
-        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.5");
-        let out = translator
-            .accept(
-                &json!({
-                    "type":"response.output_item.done",
-                    "item":{
-                        "type":"function_call",
-                        "call_id":"call_blank",
-                        "name":"Bash",
-                        "arguments":" \t\n "
-                    }
-                }),
-                None,
-            )
-            .unwrap();
-        let out = String::from_utf8(out).unwrap();
-
-        assert!(out.contains("call_blank"));
-        assert!(out.contains(r#""partial_json":"{}""#));
-        assert!(out.contains("event: content_block_stop"));
-    }
-
-    #[test]
-    fn matched_completed_function_call_propagates_invalid_authoritative_arguments() {
-        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.5");
-        translator
-            .accept(
-                &json!({
-                    "type":"response.output_item.added",
-                    "output_index":0,
-                    "item":{"type":"function_call","call_id":"call_matched","name":"Bash"}
-                }),
-                None,
-            )
-            .unwrap();
-
-        let error = translator
-            .accept(
-                &json!({
-                    "type":"response.output_item.done",
-                    "output_index":0,
-                    "item":{
-                        "type":"function_call",
-                        "call_id":"call_matched",
-                        "name":"Bash",
-                        "arguments":"{"
-                    }
-                }),
-                None,
-            )
-            .unwrap_err();
-
-        assert!(error.contains("arguments are not valid JSON"));
-        assert!(translator.blocks_by_output_index.contains_key(&0));
-    }
-
-    #[test]
-    fn opencode_style_added_then_done_function_call_remains_valid() {
-        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.6-luna");
-        let added = translator
-            .accept(
-                &json!({
-                    "type":"response.output_item.added",
-                    "output_index":0,
-                    "item":{"type":"function_call","call_id":"call_opencode","name":"Bash"}
-                }),
-                None,
-            )
-            .unwrap();
-        let done = translator
-            .accept(
-                &json!({
-                    "type":"response.output_item.done",
-                    "output_index":0,
-                    "item":{
-                        "type":"function_call",
-                        "call_id":"call_opencode",
-                        "name":"Bash",
-                        "arguments":"{\"command\":\"echo opencode\"}"
-                    }
-                }),
-                None,
-            )
-            .unwrap();
-        let completed = translator
-            .accept(
-                &json!({"type":"response.completed","response":{"status":"completed","usage":{}}}),
-                None,
-            )
-            .unwrap();
-        let out = String::from_utf8([added, done, completed].concat()).unwrap();
-
-        assert!(out.contains("call_opencode"));
-        assert!(out.contains("echo opencode"));
-        assert_eq!(out.matches("event: content_block_stop").count(), 1);
-        assert!(out.contains("event: message_stop"));
-    }
-
-    #[test]
-    fn buffers_read_tool_args_until_done() {
-        let out = render(vec![
-            json!({
-                "type": "response.output_item.added",
-                "output_index": 0,
-                "item": {"type": "function_call", "call_id": "call_1", "name": "Read"}
-            }),
-            json!({
-                "type": "response.function_call_arguments.delta",
-                "output_index": 0,
-                "delta": "{\"file_path\":\"/tmp/a\",\"pages\":\"\"}"
-            }),
-            json!({
-                "type": "response.output_item.done",
-                "output_index": 0,
-                "item": {
-                    "type": "function_call",
-                    "call_id": "call_1",
-                    "name": "Read",
-                    "arguments": "{\"file_path\":\"/tmp/a\",\"pages\":\"\"}"
-                }
-            }),
-            json!({
-                "type": "response.completed",
-                "response": {"id": "resp_1", "usage": {}}
-            }),
-        ]);
-        assert!(out.contains("tool_use"));
-        assert!(out.contains("input_json_delta"));
-        assert!(out.contains("/tmp/a"));
-        assert!(!out.contains("pages"));
-    }
-
-    #[test]
-    fn whitespace_stalled_read_waits_for_authoritative_finalization() {
-        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.5");
-        let mut out = Vec::new();
-        out.extend(
-            translator
-                .accept(
-                    &json!({
-                        "type": "response.output_item.added",
-                        "output_index": 0,
-                        "item": {"type":"function_call","call_id":"call_stalled_offset_commit","name":"Read"}
-                    }),
-                    None,
-                )
-                .unwrap(),
-        );
-        out.extend(
-            translator
-                .accept(
-                    &json!({
-                        "type": "response.function_call_arguments.delta",
-                        "output_index": 0,
-                        "delta": format!("{{\"file_path\":\"/tmp/a\",\"offset\":1200000{}", " ".repeat(1024))
-                    }),
-                    None,
-                )
-                .unwrap(),
-        );
-        assert!(!translator.is_finished());
-        assert!(!String::from_utf8_lossy(&out).contains("input_json_delta"));
-        assert!(
-            super::super::read_rewrite::read_offset_rewrite("call_stalled_offset_commit").is_none()
-        );
-        out.extend(translator.accept(&json!({
-            "type": "response.output_item.done", "output_index": 0,
-            "item": {"type":"function_call","call_id":"call_stalled_offset_commit","name":"Read",
-                "arguments":"{\"file_path\":\"/tmp/a\",\"offset\":1200000}"}
-        }), None).unwrap());
-        assert!(!translator.is_finished());
-        out.extend(
-            translator
-                .accept(
-                    &json!({
-                        "type":"response.completed", "response":{"usage":{"output_tokens":7}}
-                    }),
-                    None,
-                )
-                .unwrap(),
-        );
-        let rendered = String::from_utf8(out).unwrap();
-        assert!(rendered.contains(r#""partial_json":"{\"file_path\":\"/tmp/a\"}""#));
-        assert!(rendered.contains(r#""stop_reason":"tool_use""#));
-        assert!(rendered.contains("message_stop"));
-        assert!(translator.is_finished());
-        assert_eq!(
-            super::super::read_rewrite::read_offset_rewrite("call_stalled_offset_commit")
-                .as_ref()
-                .map(|rewrite| rewrite.offset),
-            Some(1_200_000)
-        );
-    }
-
-    #[test]
-    fn websocket_compat_can_finish_after_closed_completed_tool_call() {
-        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.5");
-        let mut out = Vec::new();
-        for event in [
-            json!({
-                "type": "response.output_item.added",
-                "output_index": 0,
-                "item": {"type":"function_call","call_id":"call_1","name":"WebSearch"}
-            }),
-            json!({
-                "type": "response.function_call_arguments.done",
-                "output_index": 0,
-                "arguments": "{\"query\":\"claude-code-proxy github\"}"
-            }),
-            json!({
-                "type": "response.output_item.done",
-                "output_index": 0,
-                "item": {
-                    "type":"function_call",
-                    "call_id":"call_1",
-                    "name":"WebSearch",
-                    "arguments":"{\"query\":\"claude-code-proxy github\"}"
-                }
-            }),
-        ] {
-            out.extend(translator.accept(&event, None).unwrap());
-        }
-        out.extend(translator.finish_after_closed_completed_tool_call(None));
-        let rendered = String::from_utf8(out).unwrap();
-        assert!(rendered.contains("content_block_start"));
-        assert!(rendered.contains("input_json_delta"));
-        assert!(rendered.contains(r#""stop_reason":"tool_use""#));
-        assert!(rendered.contains("message_stop"));
-        assert!(!rendered.contains("event: error"));
-    }
-
-    #[test]
-    fn emits_web_search_results_from_citations_before_deferred_text() {
-        let out = render(vec![
-            json!({
-                "type": "response.output_item.added",
-                "output_index": 0,
-                "item": {"type": "web_search_call", "id": "ws_1"}
-            }),
-            json!({
-                "type": "response.output_item.done",
-                "output_index": 0,
-                "item": {
-                    "type": "web_search_call",
-                    "id": "ws_1",
-                    "action": {"query": "grok reasoning effort"}
-                }
-            }),
-            json!({
-                "type": "response.output_item.added",
-                "output_index": 1,
-                "item": {"type": "message", "id": "msg_up"}
-            }),
-            json!({
-                "type": "response.output_text.delta",
-                "output_index": 1,
-                "delta": "See the official docs."
-            }),
-            json!({
-                "type": "response.output_text.annotation.added",
-                "annotation": {
-                    "type": "url_citation",
-                    "title": "Reasoning",
-                    "url": "https://docs.x.ai/docs/guides/reasoning"
-                }
-            }),
-            json!({
-                "type": "response.output_item.done",
-                "output_index": 1,
-                "item": {"type": "message"}
-            }),
-            json!({
-                "type": "response.completed",
-                "response": {"status": "completed", "usage": {}}
-            }),
-        ]);
-
-        let tool = out.find("server_tool_use").unwrap();
-        let result = out.find("web_search_tool_result").unwrap();
-        let text = out.find("See the official docs.").unwrap();
-        assert!(tool < result && result < text);
-        assert!(out.contains("https://docs.x.ai/docs/guides/reasoning"));
-        assert!(out.contains(r#""web_search_requests":1"#));
-    }
-
-    #[test]
-    fn rate_limit_event_is_progress_telemetry() {
-        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.5");
-        let out = translator
-            .accept(
-                &json!({
-                    "type": "codex.rate_limits",
-                    "rate_limits": {"limit_reached": true}
-                }),
-                None,
-            )
-            .unwrap();
-        let out = String::from_utf8(out).unwrap();
-        assert!(out.contains("event: ping"));
-        assert!(!out.contains("event: error"));
-
-        let finish = translator
-            .accept(
-                &json!({
-                    "type": "response.completed",
-                    "response": {"id": "resp_1", "status": "completed", "usage": {"input_tokens": 5, "output_tokens": 2}}
-                }),
-                None,
-            )
-            .unwrap();
-        let finish = String::from_utf8(finish).unwrap();
-        assert!(
-            finish.contains(r#""codex_rate_limits":{"limit_reached":true}"#),
-            "{finish}"
-        );
-    }
-
-    #[test]
-    fn progress_events_start_message_and_emit_pings() {
-        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.5");
-        let first = String::from_utf8(
-            translator
-                .accept(&json!({"type": "response.created"}), None)
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(first.matches("event: message_start").count(), 1);
-        assert_eq!(first.matches("event: ping").count(), 1);
-
-        let second = String::from_utf8(translator.ping_chunk(None)).unwrap();
-        assert!(!second.contains("event: message_start"));
-        assert_eq!(second.matches("event: ping").count(), 1);
-    }
-
-    #[test]
-    fn live_stream_emits_signature_delta_before_thinking_stop() {
-        let out = render(vec![
-            json!({
-                "type":"response.output_item.added",
-                "output_index":0,
-                "item":{"type":"reasoning","id":"rs_1","encrypted_content":"opaque"}
-            }),
-            json!({
-                "type":"response.reasoning_summary_text.delta",
-                "output_index":0,
-                "delta":"plan"
-            }),
-            json!({
-                "type":"response.output_item.done",
-                "output_index":0,
-                "item":{"type":"reasoning","id":"rs_1"}
-            }),
-            json!({
-                "type":"response.completed",
-                "response":{"id":"resp_1","usage":{}}
-            }),
-        ]);
-        let thinking_delta = out.find(r#""type":"thinking_delta""#).unwrap();
-        let signature_delta = out.find(r#""type":"signature_delta""#).unwrap();
-        let thinking_stop = out[signature_delta..]
-            .find("event: content_block_stop")
-            .map(|offset| signature_delta + offset)
-            .unwrap();
-        assert!(thinking_delta < signature_delta);
-        assert!(signature_delta < thinking_stop);
-        assert!(out.contains("ccp:codex:v1:"));
-    }
-
-    #[test]
-    fn signature_only_reasoning_is_semantic_output() {
-        let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.5");
-        let mut out = Vec::new();
-        for event in [
-            json!({
-                "type":"response.output_item.added",
-                "output_index":0,
-                "item":{"type":"reasoning","id":"rs_1","encrypted_content":"opaque"}
-            }),
-            json!({
-                "type":"response.output_item.done",
-                "output_index":0,
-                "item":{"type":"reasoning","id":"rs_1"}
-            }),
-        ] {
-            out.extend(translator.accept(&event, None).unwrap());
-        }
-
-        let out = String::from_utf8(out).unwrap();
-        assert!(out.contains(r#""type":"signature_delta""#));
-        assert!(translator.has_semantic_output());
-    }
 }

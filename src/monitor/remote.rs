@@ -29,9 +29,8 @@ impl RemoteMonitor {
         let initial = fetch_snapshot(&client, &endpoint)
             .await
             .context("cannot attach to proxy monitor")?;
-        let (sender, updates) = watch::channel(SnapshotUpdate::Live(initial.clone()));
+        let (sender, updates) = watch::channel(SnapshotUpdate::Live(initial));
         let poller = tokio::spawn(async move {
-            let mut current = SnapshotUpdate::Live(initial);
             let mut interval = tokio::time::interval(POLL_INTERVAL);
             interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
             interval.tick().await;
@@ -40,10 +39,15 @@ impl RemoteMonitor {
                 let result = fetch_snapshot(&client, &endpoint)
                     .await
                     .map_err(|error| error.to_string());
-                current = current.updated(result);
-                if sender.send(current.clone()).is_err() {
-                    break;
-                }
+                sender.send_modify(|current| {
+                    *current = match result {
+                        Ok(snapshot) => SnapshotUpdate::Live(snapshot),
+                        Err(error) => SnapshotUpdate::Disconnected {
+                            snapshot: current.snapshot().clone(),
+                            error,
+                        },
+                    };
+                });
             }
         });
         Ok(Self { updates, poller })

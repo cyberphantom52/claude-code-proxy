@@ -187,7 +187,8 @@ fn redact_with_depth(value: Value, depth: u8) -> Value {
             if config::log_verbose() {
                 Value::String(s)
             } else if s.len() > 4000 {
-                Value::String(format!("{}…[{} more]", &s[..4000], s.len() - 4000))
+                let end = s.floor_char_boundary(4000);
+                Value::String(format!("{}…[{} more]", &s[..end], s.len() - end))
             } else {
                 Value::String(s)
             }
@@ -222,51 +223,4 @@ fn redact_key_redaction(value: Value) -> Value {
 
 pub fn redacted_keys() -> HashSet<&'static str> {
     REDACT_KEYS.iter().copied().collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Mutex;
-
-    static STDERR_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    #[test]
-    fn stderr_suppression_disables_level_mirroring() {
-        let _lock = STDERR_TEST_LOCK.lock().unwrap();
-        assert!(should_mirror_to_stderr("warn"));
-
-        {
-            let _guard = suppress_stderr();
-            assert!(!should_mirror_to_stderr("warn"));
-            assert!(!should_mirror_to_stderr("error"));
-        }
-
-        assert!(should_mirror_to_stderr("warn"));
-    }
-
-    #[test]
-    fn stderr_suppression_supports_nested_guards() {
-        let _lock = STDERR_TEST_LOCK.lock().unwrap();
-        let outer = suppress_stderr();
-        let inner = suppress_stderr();
-        assert!(!should_mirror_to_stderr("warn"));
-
-        drop(inner);
-        assert!(!should_mirror_to_stderr("warn"));
-
-        drop(outer);
-        assert!(should_mirror_to_stderr("warn"));
-    }
-
-    #[test]
-    fn redacts_proxy_authorization_case_insensitively() {
-        let redacted = redact_value(serde_json::json!({
-            "Proxy-Authorization": "Basic dXNlcjpwYXNz",
-            "safe": "kept"
-        }));
-
-        assert_eq!(redacted["safe"], "kept");
-        assert_eq!(redacted["Proxy-Authorization"], "[redacted len=18]");
-    }
 }

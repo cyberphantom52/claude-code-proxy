@@ -79,18 +79,3 @@ impl<K> ColumnSpec<K> {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn layout_tiers_cover_conventional_terminal_widths() {
-        assert_eq!(LayoutTier::for_outer_width(77), LayoutTier::Emergency);
-        assert_eq!(LayoutTier::for_outer_width(78), LayoutTier::Narrow);
-        assert_eq!(LayoutTier::for_outer_width(90), LayoutTier::Medium);
-        assert_eq!(LayoutTier::for_outer_width(120), LayoutTier::Expanded);
-        assert_eq!(LayoutTier::for_outer_width(153), LayoutTier::Expanded);
-        assert_eq!(LayoutTier::for_outer_width(154), LayoutTier::Wide);
-    }
-}

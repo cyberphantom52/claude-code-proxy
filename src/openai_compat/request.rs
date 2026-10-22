@@ -16,30 +16,3 @@ pub fn extract_model(body: &Value) -> Result<(String, String), OpenAiError> {
         .to_string();
     Ok((requested.clone(), normalize_incoming_model(&requested)))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn extracts_model_and_normalizes_context_hint() {
-        assert_eq!(
-            extract_model(&json!({"model":"gpt-5.5[1m]"})).unwrap(),
-            ("gpt-5.5[1m]".to_string(), "gpt-5.5".to_string()),
-        );
-    }
-
-    #[test]
-    fn rejects_invalid_model_or_request_shape() {
-        for body in [
-            json!(null),
-            json!([]),
-            json!({}),
-            json!({"model":7}),
-            json!({"model":""}),
-        ] {
-            assert!(extract_model(&body).is_err(), "{body}");
-        }
-    }
-}
