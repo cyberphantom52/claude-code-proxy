@@ -1494,6 +1494,7 @@ async fn models_endpoint_lists_supported_models() {
         assert_eq!(entry["type"], "model");
         assert!(entry["display_name"].as_str().is_some());
     }
+    assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
     assert_eq!(value["has_more"], json!(false));
     assert_eq!(value["first_id"], data[0]["id"]);
     assert_eq!(value["last_id"], data[data.len() - 1]["id"]);
@@ -1533,6 +1534,100 @@ async fn models_endpoint_respects_limit() {
 #[tokio::test]
 async fn models_endpoint_tolerates_unknown_query_params() {
     let app = app(Arc::new(Registry::new()));
-    let (status, _) = get_models(app, "/v1/models?limit=1000&after_id=x").await;
+    let (status, _) = get_models(app, "/v1/models?limit=1000&future_option=x").await;
     assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn models_endpoint_paginates_in_both_directions_without_gaps() {
+    let app = app(Arc::new(Registry::new()));
+    let (_, all) = get_models(app.clone(), "/v1/models").await;
+    let expected = all["data"].as_array().unwrap();
+    let mut forward = Vec::new();
+    let mut uri = "/v1/models?limit=3".to_string();
+    loop {
+        let (status, page) = get_models(app.clone(), &uri).await;
+        assert_eq!(status, StatusCode::OK);
+        let data = page["data"].as_array().unwrap();
+        assert!(!data.is_empty());
+        assert!(data.len() <= 3);
+        assert_eq!(page["first_id"], data[0]["id"]);
+        assert_eq!(page["last_id"], data[data.len() - 1]["id"]);
+        forward.extend(data.iter().cloned());
+        assert!(forward.len() <= expected.len(), "pagination must progress");
+        assert_eq!(page["has_more"], forward.len() < expected.len());
+        if page["has_more"] == false {
+            break;
+        }
+        uri = format!(
+            "/v1/models?limit=3&after_id={}",
+            page["last_id"].as_str().unwrap()
+        );
+    }
+    assert_eq!(&forward, expected);
+
+    let mut backward = vec![expected.last().unwrap().clone()];
+    let mut cursor = all["last_id"].as_str().unwrap().to_string();
+    loop {
+        let (status, page) = get_models(
+            app.clone(),
+            &format!("/v1/models?limit=3&before_id={cursor}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let data = page["data"].as_array().unwrap();
+        assert!(!data.is_empty());
+        assert!(data.len() <= 3);
+        cursor = page["first_id"].as_str().unwrap().to_string();
+        backward.splice(0..0, data.iter().cloned());
+        assert!(backward.len() <= expected.len(), "pagination must progress");
+        assert_eq!(page["has_more"], backward.len() < expected.len());
+        if page["has_more"] == false {
+            break;
+        }
+    }
+    assert_eq!(&backward, expected);
+
+    for (name, cursor) in [
+        ("before_id", &all["first_id"]),
+        ("after_id", &all["last_id"]),
+    ] {
+        let (status, page) = get_models(
+            app.clone(),
+            &format!("/v1/models?{name}={}", cursor.as_str().unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(page["data"], json!([]));
+        assert_eq!(page["has_more"], false);
+        assert_eq!(page["first_id"], Value::Null);
+        assert_eq!(page["last_id"], Value::Null);
+    }
+}
+
+#[tokio::test]
+async fn models_endpoint_rejects_invalid_queries_with_json_errors() {
+    let app = app(Arc::new(Registry::new()));
+    for (query, message) in [
+        ("limit=0", "between 1 and 1000"),
+        ("limit=1001", "between 1 and 1000"),
+        ("limit=-1", "Invalid model listing query"),
+        ("limit=no", "Invalid model listing query"),
+        ("limit=1&limit=2", "Invalid model listing query"),
+        ("after_id=x", "Invalid after_id"),
+        ("before_id=x", "Invalid before_id"),
+        ("after_id=", "Invalid after_id"),
+        ("before_id=", "Invalid before_id"),
+        ("after_id=x&before_id=y", "only one"),
+        ("after_id=x&after_id=y", "Invalid model listing query"),
+    ] {
+        let (status, body) = get_models(app.clone(), &format!("/v1/models?{query}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert!(
+            body["error"]["message"].as_str().unwrap().contains(message),
+            "{query}: {body}"
+        );
+    }
 }

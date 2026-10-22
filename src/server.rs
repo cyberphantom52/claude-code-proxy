@@ -394,6 +394,8 @@ async fn healthz() -> Json<serde_json::Value> {
 #[derive(serde::Deserialize)]
 struct ModelsQuery {
     limit: Option<usize>,
+    after_id: Option<String>,
+    before_id: Option<String>,
 }
 
 /// Anthropic-shaped model listing so Claude Code's gateway model discovery
@@ -403,12 +405,68 @@ struct ModelsQuery {
 /// raw provider ids are still listed for other Anthropic-compatible clients.
 async fn handler_models(
     State(state): State<Arc<AppState>>,
-    Query(query): Query<ModelsQuery>,
-) -> Json<serde_json::Value> {
-    let mut data: Vec<Value> = state
-        .registry
-        .all_supported_models()
-        .into_iter()
+    query: Result<Query<ModelsQuery>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    let query = match query {
+        Ok(Query(query)) => query,
+        Err(error) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                format!("Invalid model listing query: {}", error.body_text()),
+            );
+        }
+    };
+    if query
+        .limit
+        .is_some_and(|limit| !(1..=1000).contains(&limit))
+    {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Model listing limit must be between 1 and 1000",
+        );
+    }
+    if query.after_id.is_some() && query.before_id.is_some() {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Specify only one of after_id or before_id",
+        );
+    }
+
+    let mut models = state.registry.all_supported_models();
+    models.sort_unstable();
+    let mut start = 0;
+    let mut end = models.len();
+    if let Some((name, cursor)) = query
+        .after_id
+        .as_ref()
+        .map(|id| ("after_id", id))
+        .or_else(|| query.before_id.as_ref().map(|id| ("before_id", id)))
+    {
+        let Ok(index) = models.binary_search_by(|(id, _)| id.cmp(cursor)) else {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                format!("Invalid {name}: cursor must name a model in the listing"),
+            );
+        };
+        if query.before_id.is_some() {
+            end = index;
+        } else {
+            start = index + 1;
+        }
+    }
+    let limit = query.limit.unwrap_or(end - start);
+    let has_more = end - start > limit;
+    if query.before_id.is_some() {
+        start = end.saturating_sub(limit);
+    } else {
+        end = end.min(start.saturating_add(limit));
+    }
+    let data: Vec<Value> = models[start..end]
+        .iter()
         .map(|(model, provider)| {
             json!({
                 "type": "model",
@@ -418,10 +476,6 @@ async fn handler_models(
             })
         })
         .collect();
-    let has_more = query.limit.is_some_and(|limit| data.len() > limit);
-    if let Some(limit) = query.limit {
-        data.truncate(limit);
-    }
     Json(json!({
         "object": "list",
         "data": data,
@@ -429,6 +483,7 @@ async fn handler_models(
         "first_id": data.first().and_then(|entry| entry.get("id")).cloned(),
         "last_id": data.last().and_then(|entry| entry.get("id")).cloned(),
     }))
+    .into_response()
 }
 
 async fn handler_messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
