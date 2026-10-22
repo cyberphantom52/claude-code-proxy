@@ -37,7 +37,7 @@ detect_platform() {
 	*)
 		log_error "Unsupported operating system: $(uname -s)"
 		echo ""
-		echo "${BIN_NAME} supports macOS and Linux."
+		echo "This installer supports macOS and Linux."
 		echo "For other platforms, build from source with Rust and Cargo:"
 		echo "  git clone https://github.com/${REPO}"
 		echo "  cd ${BIN_NAME}"
