@@ -1,5 +1,3 @@
-use serde_json::Value;
-
 use super::translate::request::{
     ResponsesContentPart, ResponsesFunctionCallOutput, ResponsesFunctionCallOutputContentPart,
     ResponsesInputItem, ResponsesRequest, ResponsesTool,
@@ -50,15 +48,26 @@ pub struct ToolSummary {
     pub json_bytes: u64,
 }
 
-fn byte_length(s: &str) -> u64 {
-    s.len() as u64
+pub(crate) fn serialized_json_bytes(value: &(impl serde::Serialize + ?Sized)) -> u64 {
+    struct Counter(u64);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len() as u64);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    if serde_json::to_writer(&mut counter, value).is_err() {
+        return u64::MAX;
+    }
+    counter.0
 }
 
-fn json_bytes(value: Option<&Value>) -> u64 {
-    match value {
-        Some(v) => byte_length(&serde_json::to_string(v).unwrap_or_default()),
-        None => 0,
-    }
+fn byte_length(s: &str) -> u64 {
+    s.len() as u64
 }
 
 fn input_image_parts(input: &[ResponsesInputItem]) -> Vec<(usize, usize, &str)> {
@@ -92,7 +101,6 @@ fn input_image_parts(input: &[ResponsesInputItem]) -> Vec<(usize, usize, &str)> 
 }
 
 pub fn summarize_codex_request_size(body: &ResponsesRequest) -> CodexRequestSizeSummary {
-    let body_json = serde_json::to_string(body).unwrap_or_default();
     let image_parts = input_image_parts(&body.input);
 
     let input_type_counts = count_items_by(&body.input, |item| match item {
@@ -134,8 +142,7 @@ pub fn summarize_codex_request_size(body: &ResponsesRequest) -> CodexRequestSize
                         ("compaction_trigger".to_string(), None)
                     }
                 };
-                let json_bytes_val =
-                    json_bytes(Some(&serde_json::to_value(item).unwrap_or_default()));
+                let json_bytes_val = serialized_json_bytes(item);
                 InputItemSummary {
                     index: i,
                     r#type,
@@ -153,10 +160,8 @@ pub fn summarize_codex_request_size(body: &ResponsesRequest) -> CodexRequestSize
         let mut items: Vec<InputImageSummary> = image_parts
             .iter()
             .map(|&(item_idx, part_idx, url)| {
-                let json_bytes_val = json_bytes(Some(&serde_json::json!({
-                    "type": "input_image",
-                    "image_url": url,
-                })));
+                let json_bytes_val = serialized_json_bytes(url)
+                    + b"{\"type\":\"input_image\",\"image_url\":}".len() as u64;
                 InputImageSummary {
                     item_index: item_idx,
                     part_index: part_idx,
@@ -176,11 +181,10 @@ pub fn summarize_codex_request_size(body: &ResponsesRequest) -> CodexRequestSize
         if let Some(ref tools) = body.tools {
             for (i, tool) in tools.iter().enumerate() {
                 let name = match tool {
-                    ResponsesTool::Function(f) => f.name.clone(),
+                    ResponsesTool::Function(f) => f.name.chars().take(128).collect(),
                     ResponsesTool::WebSearch(_) => "web_search".to_string(),
                 };
-                let json_bytes_val =
-                    json_bytes(Some(&serde_json::to_value(tool).unwrap_or_default()));
+                let json_bytes_val = serialized_json_bytes(tool);
                 items.push(ToolSummary {
                     index: i,
                     name,
@@ -194,32 +198,17 @@ pub fn summarize_codex_request_size(body: &ResponsesRequest) -> CodexRequestSize
     };
 
     CodexRequestSizeSummary {
-        body_json_bytes: byte_length(&body_json),
+        body_json_bytes: serialized_json_bytes(body),
         instructions_bytes: body.instructions.as_ref().map_or(0, |s| byte_length(s)),
-        input_json_bytes: json_bytes(Some(&serde_json::to_value(&body.input).unwrap_or_default())),
-        tools_json_bytes: match &body.tools {
-            Some(tools) => json_bytes(Some(&serde_json::to_value(tools).unwrap_or_default())),
-            None => 0,
-        },
-        text_json_bytes: json_bytes(Some(&serde_json::to_value(&body.text).unwrap_or_default())),
-        reasoning_json_bytes: json_bytes(
-            body.reasoning
-                .as_ref()
-                .map(|r| serde_json::to_value(r).unwrap_or_default())
-                .as_ref(),
-        ),
-        include_json_bytes: json_bytes(
-            body.include
-                .as_ref()
-                .map(|i| serde_json::to_value(i).unwrap_or_default())
-                .as_ref(),
-        ),
-        client_metadata_json_bytes: json_bytes(
-            body.client_metadata
-                .as_ref()
-                .map(|m| serde_json::to_value(m).unwrap_or_default())
-                .as_ref(),
-        ),
+        input_json_bytes: serialized_json_bytes(&body.input),
+        tools_json_bytes: body.tools.as_ref().map_or(0, serialized_json_bytes),
+        text_json_bytes: serialized_json_bytes(&body.text),
+        reasoning_json_bytes: body.reasoning.as_ref().map_or(0, serialized_json_bytes),
+        include_json_bytes: body.include.as_ref().map_or(0, serialized_json_bytes),
+        client_metadata_json_bytes: body
+            .client_metadata
+            .as_ref()
+            .map_or(0, serialized_json_bytes),
         input_item_count: body.input.len(),
         tool_count: body.tools.as_ref().map_or(0, |t| t.len()),
         input_image_part_count: image_parts.len(),
@@ -282,6 +271,14 @@ mod tests {
             reasoning: None,
         };
         let summary = summarize_codex_request_size(&req);
+        assert_eq!(
+            summary.body_json_bytes,
+            serde_json::to_vec(&req).unwrap().len() as u64
+        );
+        assert_eq!(
+            summary.input_json_bytes,
+            serde_json::to_vec(&req.input).unwrap().len() as u64
+        );
         assert_eq!(summary.input_item_count, 1);
         assert_eq!(summary.tool_count, 0);
         assert!(summary.body_json_bytes > 0);

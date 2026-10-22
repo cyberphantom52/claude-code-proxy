@@ -3,9 +3,11 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use super::models::OperationProvenance;
 use crate::anthropic::sse::parse_sse_events;
 use crate::provider::RequestContext;
 use crate::providers::codex::client::{CodexError, CodexHttpClient};
+use crate::request_identity::ConversationIdentity;
 
 use super::translate::request::{
     ResponsesContentPart, ResponsesInputItem, ResponsesRequest, is_compact_message_text,
@@ -39,7 +41,14 @@ enum CompactionPhase {
     Anchored { portable_summary: String },
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct CompactionScope {
+    pub(crate) owner: ConversationIdentity,
+    pub(crate) provenance: OperationProvenance,
+}
+
 struct CompactionState {
+    scope: CompactionScope,
     attempt: CompactionAttempt,
     model: String,
     native_history: Vec<ResponsesInputItem>,
@@ -57,7 +66,7 @@ pub struct CompactionReplay {
 
 #[derive(Default)]
 struct CompactionRegistry {
-    states: HashMap<String, CompactionState>,
+    states: HashMap<ConversationIdentity, CompactionState>,
     total_bytes: usize,
 }
 
@@ -86,13 +95,21 @@ pub async fn request_compaction(
         .post_codex_for_owner(&compaction_request, ctx, None)
         .await
         .map_err(CompactionError::Upstream)?;
+    if response.provenance != super::models::current_operation_provenance()
+        || response.provenance.is_none()
+    {
+        return Err(CompactionError::InvalidResponse(
+            "compaction operation provenance changed".into(),
+        ));
+    }
     let compaction = parse_compaction_response(&response.body)?;
     Ok(build_compacted_history(&conversation, compaction))
 }
 
-pub fn begin_compaction(session_id: &str, model: &str) -> CompactionAttempt {
+pub(crate) fn begin_compaction_scoped(scope: &CompactionScope, model: &str) -> CompactionAttempt {
     let attempt = CompactionAttempt(NEXT_ATTEMPT_ID.fetch_add(1, Ordering::Relaxed));
     let state = CompactionState {
+        scope: scope.clone(),
         attempt,
         model: model.to_string(),
         native_history: Vec::new(),
@@ -103,13 +120,13 @@ pub fn begin_compaction(session_id: &str, model: &str) -> CompactionAttempt {
     let mut guard = REGISTRY.lock().unwrap();
     let registry = guard.get_or_insert_with(CompactionRegistry::default);
     evict_states(registry, now);
-    registry.states.insert(session_id.to_string(), state);
+    registry.states.insert(scope.owner.clone(), state);
     evict_states(registry, now);
     attempt
 }
 
-pub fn store_compaction(
-    session_id: &str,
+pub(crate) fn store_compaction_scoped(
+    scope: &CompactionScope,
     attempt: CompactionAttempt,
     native_history: Vec<ResponsesInputItem>,
 ) -> bool {
@@ -119,38 +136,41 @@ pub fn store_compaction(
         return false;
     };
     evict_states(registry, now);
-    let Some(state) = registry.states.get_mut(session_id) else {
+    let Some(state) = registry.states.get_mut(&scope.owner) else {
         return false;
     };
-    if state.attempt != attempt || !matches!(state.phase, CompactionPhase::Preparing) {
+    if state.scope != *scope
+        || state.attempt != attempt
+        || !matches!(state.phase, CompactionPhase::Preparing)
+    {
         return false;
     }
     state.native_history = native_history;
     state.phase = CompactionPhase::Unconfirmed;
     state.updated_at = now;
-    if state_size(session_id, state) > MAX_STATE_BYTES {
-        registry.states.remove(session_id);
+    if state_size(&scope.owner, state) > MAX_STATE_BYTES {
+        registry.states.remove(&scope.owner);
         update_total_bytes(registry);
         return false;
     }
     evict_states(registry, now);
     registry
         .states
-        .get(session_id)
-        .is_some_and(|state| state.attempt == attempt)
+        .get(&scope.owner)
+        .is_some_and(|state| state.scope == *scope && state.attempt == attempt)
 }
 
-pub fn activate_compaction(
-    session_id: Option<&str>,
+pub(crate) fn activate_compaction_scoped(
+    scope: Option<&CompactionScope>,
     attempt: Option<CompactionAttempt>,
     model: &str,
     output: &[ResponsesInputItem],
 ) -> bool {
-    let (Some(session_id), Some(attempt)) = (session_id, attempt) else {
+    let (Some(scope), Some(attempt)) = (scope, attempt) else {
         return false;
     };
     let Some(portable_summary) = portable_summary_text(output) else {
-        abort_compaction_attempt(Some(session_id), Some(attempt));
+        abort_compaction_attempt_scoped(Some(scope), Some(attempt));
         return false;
     };
 
@@ -160,43 +180,43 @@ pub fn activate_compaction(
         return false;
     };
     evict_states(registry, now);
-    let Some(state) = registry.states.get_mut(session_id) else {
+    let Some(state) = registry.states.get_mut(&scope.owner) else {
         return false;
     };
-    if state.attempt != attempt {
+    if state.scope != *scope || state.attempt != attempt {
         return false;
     }
     if state.model != model || !matches!(state.phase, CompactionPhase::Unconfirmed) {
-        registry.states.remove(session_id);
+        registry.states.remove(&scope.owner);
         update_total_bytes(registry);
         return false;
     }
     state.phase = CompactionPhase::Anchored { portable_summary };
     state.updated_at = now;
-    if state_size(session_id, state) > MAX_STATE_BYTES {
-        registry.states.remove(session_id);
+    if state_size(&scope.owner, state) > MAX_STATE_BYTES {
+        registry.states.remove(&scope.owner);
         update_total_bytes(registry);
         return false;
     }
     evict_states(registry, now);
-    registry.states.contains_key(session_id)
+    registry.states.contains_key(&scope.owner)
 }
 
-pub fn apply_compaction_replay(
-    session_id: Option<&str>,
+pub(crate) fn apply_compaction_replay_scoped(
+    scope: Option<&CompactionScope>,
     request: &ResponsesRequest,
 ) -> Option<CompactionReplay> {
-    let session_id = session_id?;
+    let scope = scope?;
     let now = now_ms();
     let mut guard = REGISTRY.lock().unwrap();
     let registry = guard.as_mut()?;
     evict_states(registry, now);
-    let state = registry.states.get_mut(session_id)?;
-    if !matches!(state.phase, CompactionPhase::Anchored { .. }) {
+    let state = registry.states.get_mut(&scope.owner)?;
+    if state.scope != *scope || !matches!(state.phase, CompactionPhase::Anchored { .. }) {
         return None;
     }
     if state.model != request.model {
-        registry.states.remove(session_id);
+        registry.states.remove(&scope.owner);
         update_total_bytes(registry);
         return None;
     }
@@ -207,12 +227,12 @@ pub fn apply_compaction_replay(
     let (envelope, conversation) = split_input_envelope(&request.input);
     let summary_item = conversation.first()?;
     let Some(text) = message_text(summary_item) else {
-        registry.states.remove(session_id);
+        registry.states.remove(&scope.owner);
         update_total_bytes(registry);
         return None;
     };
     if text.match_indices(portable_summary).count() != 1 {
-        registry.states.remove(session_id);
+        registry.states.remove(&scope.owner);
         update_total_bytes(registry);
         return None;
     }
@@ -228,7 +248,7 @@ pub fn apply_compaction_replay(
         .chain(conversation[1..].iter().cloned())
         .collect();
     if serialized_size(&replay.input) > MAX_STATE_BYTES {
-        registry.states.remove(session_id);
+        registry.states.remove(&scope.owner);
         update_total_bytes(registry);
         return None;
     }
@@ -239,8 +259,11 @@ pub fn apply_compaction_replay(
     })
 }
 
-pub fn abort_compaction_attempt(session_id: Option<&str>, attempt: Option<CompactionAttempt>) {
-    let (Some(session_id), Some(attempt)) = (session_id, attempt) else {
+pub(crate) fn abort_compaction_attempt_scoped(
+    scope: Option<&CompactionScope>,
+    attempt: Option<CompactionAttempt>,
+) {
+    let (Some(scope), Some(attempt)) = (scope, attempt) else {
         return;
     };
     let mut guard = REGISTRY.lock().unwrap();
@@ -249,18 +272,51 @@ pub fn abort_compaction_attempt(session_id: Option<&str>, attempt: Option<Compac
     };
     if registry
         .states
-        .get(session_id)
-        .is_some_and(|state| state.attempt == attempt)
+        .get(&scope.owner)
+        .is_some_and(|state| state.scope == *scope && state.attempt == attempt)
     {
-        registry.states.remove(session_id);
+        registry.states.remove(&scope.owner);
         update_total_bytes(registry);
     }
 }
 
-pub fn clear_compaction(session_id: &str) {
+// Session-only compatibility calls cannot establish ownership of opaque native state.
+pub fn begin_compaction(_session_id: &str, _model: &str) -> CompactionAttempt {
+    CompactionAttempt(NEXT_ATTEMPT_ID.fetch_add(1, Ordering::Relaxed))
+}
+pub fn store_compaction(
+    _session_id: &str,
+    _attempt: CompactionAttempt,
+    _history: Vec<ResponsesInputItem>,
+) -> bool {
+    false
+}
+pub fn activate_compaction(
+    _session_id: Option<&str>,
+    _attempt: Option<CompactionAttempt>,
+    _model: &str,
+    _output: &[ResponsesInputItem],
+) -> bool {
+    false
+}
+pub fn apply_compaction_replay(
+    _session_id: Option<&str>,
+    _request: &ResponsesRequest,
+) -> Option<CompactionReplay> {
+    None
+}
+pub fn abort_compaction_attempt(_session_id: Option<&str>, _attempt: Option<CompactionAttempt>) {}
+pub fn clear_compaction(_session_id: &str) {}
+
+pub(crate) fn clear_compaction_scoped(scope: &CompactionScope) {
     let mut guard = REGISTRY.lock().unwrap();
-    if let Some(registry) = guard.as_mut() {
-        registry.states.remove(session_id);
+    if let Some(registry) = guard.as_mut()
+        && registry
+            .states
+            .get(&scope.owner)
+            .is_some_and(|state| state.scope == *scope)
+    {
+        registry.states.remove(&scope.owner);
         update_total_bytes(registry);
     }
 }
@@ -461,19 +517,24 @@ fn truncate_message(item: ResponsesInputItem, max_tokens: u64) -> Option<Respons
     let ResponsesInputItem::Message { role, content } = item else {
         return Some(item);
     };
-    let mut remaining_chars = max_tokens.saturating_mul(4) as usize;
+    let mut remaining_tokens = max_tokens;
     let mut truncated = Vec::new();
     for part in content {
         match part {
-            ResponsesContentPart::InputImage { .. } => truncated.push(part),
+            ResponsesContentPart::InputImage { .. } => {
+                if remaining_tokens >= 2_000 {
+                    truncated.push(part);
+                    remaining_tokens -= 2_000;
+                }
+            }
             ResponsesContentPart::InputText { text } => {
-                let text = truncate_text(text, &mut remaining_chars);
+                let text = truncate_text(text, &mut remaining_tokens);
                 if !text.is_empty() {
                     truncated.push(ResponsesContentPart::InputText { text });
                 }
             }
             ResponsesContentPart::OutputText { text } => {
-                let text = truncate_text(text, &mut remaining_chars);
+                let text = truncate_text(text, &mut remaining_tokens);
                 if !text.is_empty() {
                     truncated.push(ResponsesContentPart::OutputText { text });
                 }
@@ -486,31 +547,39 @@ fn truncate_message(item: ResponsesInputItem, max_tokens: u64) -> Option<Respons
     })
 }
 
-fn truncate_text(mut text: String, remaining_chars: &mut usize) -> String {
-    if *remaining_chars == 0 {
+fn truncate_text(mut text: String, remaining_tokens: &mut u64) -> String {
+    if *remaining_tokens == 0 {
         return String::new();
     }
-    if text.len() > *remaining_chars {
-        let mut boundary = *remaining_chars;
+    let remaining_bytes = remaining_tokens.saturating_mul(4).min(usize::MAX as u64) as usize;
+    if text.len() > remaining_bytes {
+        let mut boundary = remaining_bytes;
         while !text.is_char_boundary(boundary) {
             boundary -= 1;
         }
         text.truncate(boundary);
     }
-    *remaining_chars -= text.len();
+    *remaining_tokens -= text.len().div_ceil(4) as u64;
     text
 }
 
 fn serialized_size(items: &[ResponsesInputItem]) -> usize {
-    serde_json::to_vec(items).map_or(usize::MAX, |value| value.len())
+    super::request_summary::serialized_json_bytes(items)
+        .try_into()
+        .unwrap_or(usize::MAX)
 }
 
-fn state_size(session_id: &str, state: &CompactionState) -> usize {
+fn state_size(owner: &ConversationIdentity, state: &CompactionState) -> usize {
     let summary_len = match &state.phase {
         CompactionPhase::Preparing | CompactionPhase::Unconfirmed => 0,
         CompactionPhase::Anchored { portable_summary } => portable_summary.len(),
     };
-    session_id.len() + state.model.len() + summary_len + serialized_size(&state.native_history)
+    (match owner {
+        ConversationIdentity::Main(session) => session.len(),
+        ConversationIdentity::Agent(session, agent) => session.len() + agent.len(),
+    }) + state.model.len()
+        + summary_len
+        + serialized_size(&state.native_history)
 }
 
 fn now_ms() -> u64 {
@@ -560,7 +629,50 @@ mod tests {
         "portable summary with enough detail to identify this compacted conversation";
     const STALE_SUMMARY: &str =
         "stale portable summary from an older overlapping compaction attempt";
-    static TEST_REGISTRY_LOCK: Mutex<()> = Mutex::new(());
+
+    fn scope(session: &str) -> CompactionScope {
+        CompactionScope {
+            owner: ConversationIdentity::Main(session.into()),
+            provenance: super::super::models::operation_provenance(
+                "http://fixture/responses",
+                &super::super::auth::token_store::StoredAuth {
+                    access: "fixture".into(),
+                    refresh: String::new(),
+                    expires: u64::MAX,
+                    account_id: Some("account".into()),
+                },
+                "generation",
+            )
+            .unwrap(),
+        }
+    }
+    fn begin_compaction(session: &str, model: &str) -> CompactionAttempt {
+        begin_compaction_scoped(&scope(session), model)
+    }
+    fn store_compaction(
+        session: &str,
+        attempt: CompactionAttempt,
+        history: Vec<ResponsesInputItem>,
+    ) -> bool {
+        store_compaction_scoped(&scope(session), attempt, history)
+    }
+    fn activate_compaction(
+        session: Option<&str>,
+        attempt: Option<CompactionAttempt>,
+        model: &str,
+        output: &[ResponsesInputItem],
+    ) -> bool {
+        activate_compaction_scoped(session.map(scope).as_ref(), attempt, model, output)
+    }
+    fn apply_compaction_replay(
+        session: Option<&str>,
+        request: &ResponsesRequest,
+    ) -> Option<CompactionReplay> {
+        apply_compaction_replay_scoped(session.map(scope).as_ref(), request)
+    }
+    fn abort_compaction_attempt(session: Option<&str>, attempt: Option<CompactionAttempt>) {
+        abort_compaction_attempt_scoped(session.map(scope).as_ref(), attempt)
+    }
 
     fn request(input: serde_json::Value) -> ResponsesRequest {
         serde_json::from_value(json!({
@@ -622,7 +734,7 @@ mod tests {
 
     #[test]
     fn replay_requires_activation_and_wrapped_summary_anchor() {
-        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        let _guard = super::super::continuation::lock_continuation_registry_for_tests();
         clear_all_compactions_for_tests();
         let attempt = stored_compaction(
             "session",
@@ -665,7 +777,7 @@ mod tests {
 
     #[test]
     fn stale_activation_cannot_anchor_newer_native_history() {
-        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        let _guard = super::super::continuation::lock_continuation_registry_for_tests();
         clear_all_compactions_for_tests();
         let older = stored_compaction(
             "session",
@@ -696,7 +808,7 @@ mod tests {
 
     #[test]
     fn stale_store_cannot_replace_newer_compaction() {
-        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        let _guard = super::super::continuation::lock_continuation_registry_for_tests();
         clear_all_compactions_for_tests();
         let older = begin_compaction("session", "gpt-5.6-sol");
         let newer = stored_compaction(
@@ -735,7 +847,7 @@ mod tests {
 
     #[test]
     fn preparing_compaction_survives_model_mismatched_replay_check() {
-        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        let _guard = super::super::continuation::lock_continuation_registry_for_tests();
         clear_all_compactions_for_tests();
         let attempt = begin_compaction("session", "gpt-5.6-sol");
         let mut mismatched = request(json!([
@@ -755,7 +867,7 @@ mod tests {
 
     #[test]
     fn stale_abort_cannot_clear_newer_compaction() {
-        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        let _guard = super::super::continuation::lock_continuation_registry_for_tests();
         clear_all_compactions_for_tests();
         let older = begin_compaction("session", "gpt-5.6-sol");
         let newer = stored_compaction(
@@ -777,7 +889,7 @@ mod tests {
 
     #[test]
     fn stale_replay_abort_cannot_clear_newer_compaction() {
-        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        let _guard = super::super::continuation::lock_continuation_registry_for_tests();
         clear_all_compactions_for_tests();
         let older = stored_compaction(
             "session",
@@ -828,7 +940,7 @@ mod tests {
 
     #[test]
     fn invalid_stale_summary_cannot_clear_newer_compaction() {
-        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        let _guard = super::super::continuation::lock_continuation_registry_for_tests();
         clear_all_compactions_for_tests();
         let older = begin_compaction("session", "gpt-5.6-sol");
         let newer = stored_compaction(
@@ -854,7 +966,7 @@ mod tests {
 
     #[test]
     fn replay_clears_on_missing_or_duplicate_anchor() {
-        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        let _guard = super::super::continuation::lock_continuation_registry_for_tests();
         for text in [
             "different conversation without the expected summary".to_string(),
             format!("{SUMMARY} and {SUMMARY}"),
@@ -903,7 +1015,7 @@ mod tests {
 
     #[test]
     fn failed_replay_clears_anchored_state() {
-        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        let _guard = super::super::continuation::lock_continuation_registry_for_tests();
         clear_all_compactions_for_tests();
         let attempt = stored_compaction(
             "failed-replay",
@@ -930,7 +1042,7 @@ mod tests {
 
     #[test]
     fn replay_clears_on_model_change() {
-        let _guard = TEST_REGISTRY_LOCK.lock().unwrap();
+        let _guard = super::super::continuation::lock_continuation_registry_for_tests();
         clear_all_compactions_for_tests();
         let attempt = stored_compaction(
             "session",
@@ -950,6 +1062,110 @@ mod tests {
         ]));
         changed.model = "gpt-5.4".to_string();
         assert!(apply_compaction_replay(Some("session"), &changed).is_none());
+    }
+
+    #[test]
+    fn native_history_never_crosses_owner_endpoint_account_or_generation() {
+        let _guard = super::super::continuation::lock_continuation_registry_for_tests();
+        clear_all_compactions_for_tests();
+        let original = scope("shared");
+        let attempt = begin_compaction_scoped(&original, "gpt-5.6-sol");
+        assert!(store_compaction_scoped(
+            &original,
+            attempt,
+            vec![ResponsesInputItem::Compaction {
+                encrypted_content: "secret".into()
+            }]
+        ));
+        assert!(activate_compaction_scoped(
+            Some(&original),
+            Some(attempt),
+            "gpt-5.6-sol",
+            &output(SUMMARY)
+        ));
+        let next = request(json!([
+            {"type":"message","role":"user","content":[{"type":"input_text","text":SUMMARY}]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
+        ]));
+        let auth = super::super::auth::token_store::StoredAuth {
+            access: "fixture".into(),
+            refresh: String::new(),
+            expires: u64::MAX,
+            account_id: Some("account".into()),
+        };
+        let mut variants = vec![CompactionScope {
+            owner: ConversationIdentity::Agent("shared".into(), "agent".into()),
+            ..original.clone()
+        }];
+        for (endpoint, account, access, generation) in [
+            ("http://other/responses", "account", "fixture", "generation"),
+            ("http://fixture/responses", "other", "fixture", "generation"),
+            (
+                "http://fixture/responses",
+                "account",
+                "rotated",
+                "generation",
+            ),
+            ("http://fixture/responses", "account", "fixture", "relogin"),
+        ] {
+            let auth = super::super::auth::token_store::StoredAuth {
+                access: access.into(),
+                account_id: Some(account.into()),
+                ..auth.clone()
+            };
+            variants.push(CompactionScope {
+                owner: original.owner.clone(),
+                provenance: super::super::models::operation_provenance(endpoint, &auth, generation)
+                    .unwrap(),
+            });
+        }
+        for other in variants {
+            assert!(apply_compaction_replay_scoped(Some(&other), &next).is_none());
+            assert!(!activate_compaction_scoped(
+                Some(&other),
+                Some(attempt),
+                "gpt-5.6-sol",
+                &output(SUMMARY)
+            ));
+            abort_compaction_attempt_scoped(Some(&other), Some(attempt));
+            assert!(apply_compaction_replay_scoped(Some(&original), &next).is_some());
+        }
+        assert!(super::apply_compaction_replay(Some("shared"), &next).is_none());
+        let newer = begin_compaction_scoped(&original, "gpt-5.6-sol");
+        assert!(!store_compaction_scoped(&original, attempt, Vec::new()));
+        assert!(!activate_compaction_scoped(
+            Some(&original),
+            Some(attempt),
+            "gpt-5.6-sol",
+            &output(SUMMARY)
+        ));
+        abort_compaction_attempt_scoped(Some(&original), Some(attempt));
+        assert!(store_compaction_scoped(&original, newer, Vec::new()));
+    }
+
+    #[test]
+    fn retained_images_debit_estimated_tokens_and_nonfitting_images_are_omitted() {
+        for content in [
+            json!([{"type":"input_image","image_url":"image"}]),
+            json!([{"type":"input_image","image_url":"one"},{"type":"input_text","text":"abcde"},{"type":"input_image","image_url":"two"}]),
+            json!([{"type":"input_text","text":"abc"},{"type":"input_text","text":"def"},{"type":"input_image","image_url":"image"}]),
+        ] {
+            let input = request(json!([{"type":"message","role":"user","content":content}])).input;
+            for budget in [0, 1, 1_999, 2_000, 2_001, 4_001] {
+                let retained = truncate_retained_messages(input.clone(), budget);
+                assert!(retained.iter().map(message_tokens).sum::<u64>() <= budget);
+                if budget < 2_000 {
+                    assert!(retained.iter().all(|item| match item {
+                        ResponsesInputItem::Message { content, .. } =>
+                            content.iter().all(|part| !matches!(
+                                part,
+                                ResponsesContentPart::InputImage { .. }
+                            )),
+                        _ => false,
+                    }));
+                }
+            }
+        }
     }
 
     #[test]

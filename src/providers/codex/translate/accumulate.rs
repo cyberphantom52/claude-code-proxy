@@ -210,8 +210,12 @@ pub fn accumulate_response_with_traffic(
                 }
             }
             BlockKind::Tool { id, name, args } => {
-                let parsed = serde_json::from_str::<Value>(args)
-                    .unwrap_or_else(|_| Value::String(args.clone()));
+                let completed =
+                    super::live_stream::validate_completed_function_call(&serde_json::json!({
+                        "call_id": id, "name": name, "arguments": args,
+                    }))
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+                let parsed: Value = serde_json::from_str(&completed.arguments)?;
                 indexed_content.push((
                     block.index,
                     serde_json::json!({

@@ -2,13 +2,14 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use super::models::{OperationProvenance, current_operation_provenance};
 use crate::request_identity::ConversationIdentity;
 
 use super::translate::request::{ResponsesInputItem, ResponsesRequest};
 
 const TTL_MS: u64 = 30 * 60 * 1000;
 const MAX_STATES: usize = 10_000;
-const MAX_OWNER_TRANSCRIPT_BYTES: u64 = 2_000_000;
+pub(crate) const MAX_OWNER_TRANSCRIPT_BYTES: u64 = 2_000_000;
 const MAX_TOTAL_TRANSCRIPT_BYTES: u64 = 20_000_000;
 
 #[derive(Clone)]
@@ -22,6 +23,7 @@ struct ContinuationState {
 }
 
 struct OwnerState {
+    provenance: OperationProvenance,
     current_turn: u64,
     continuation: Option<ContinuationState>,
     updated_at: u64,
@@ -64,6 +66,7 @@ pub(crate) struct ContinuationReservation {
     candidate: ContinuationCandidate,
     owner: Option<ConversationIdentity>,
     origin_socket_id: Option<u64>,
+    provenance: Option<OperationProvenance>,
 }
 
 impl ContinuationReservation {
@@ -76,11 +79,14 @@ impl ContinuationReservation {
             candidate,
             owner,
             origin_socket_id,
+            provenance: current_operation_provenance(),
         }
     }
 
     pub(crate) fn from_public_candidate(candidate: &ContinuationCandidate) -> Self {
-        Self::new(candidate.clone(), None, None)
+        let mut reservation = Self::new(candidate.clone(), None, None);
+        reservation.provenance = None;
+        reservation
     }
 
     pub(crate) fn for_owner_turn(
@@ -98,6 +104,10 @@ impl ContinuationReservation {
             owner.cloned(),
             None,
         )
+    }
+
+    pub(crate) fn provenance(&self) -> Option<&OperationProvenance> {
+        self.provenance.as_ref()
     }
 
     pub(crate) fn candidate(&self) -> &ContinuationCandidate {
@@ -125,7 +135,9 @@ impl ContinuationReservation {
         candidate.previous_response_id = None;
         candidate.input_delta = None;
         candidate.disabled_reason = Some("full_context_retry".to_string());
-        Self::new(candidate, self.owner.clone(), None)
+        let mut retry = Self::new(candidate, self.owner.clone(), None);
+        retry.provenance = self.provenance.clone();
+        retry
     }
 }
 
@@ -142,8 +154,18 @@ pub fn continuation_candidate(
     body: &ResponsesRequest,
     enabled: bool,
 ) -> ContinuationCandidate {
-    let owner = session_id.map(|session_id| ConversationIdentity::Main(session_id.to_owned()));
-    continuation_candidate_inner(owner.as_ref(), body, enabled, "missing_session").into_candidate()
+    let _ = enabled;
+    let mut candidate =
+        continuation_candidate_inner(None, body, false, "missing_session", None).into_candidate();
+    candidate.disabled_reason = Some(
+        if session_id.is_none() {
+            "missing_session"
+        } else {
+            "untyped_ownership"
+        }
+        .to_string(),
+    );
+    candidate
 }
 
 pub(crate) fn continuation_candidate_for_owner(
@@ -151,7 +173,24 @@ pub(crate) fn continuation_candidate_for_owner(
     body: &ResponsesRequest,
     enabled: bool,
 ) -> ContinuationReservation {
-    continuation_candidate_inner(owner, body, enabled, "missing_identity")
+    continuation_candidate_with_provenance(owner, body, enabled, current_operation_provenance())
+}
+
+pub(crate) fn continuation_candidate_with_provenance(
+    owner: Option<&ConversationIdentity>,
+    body: &ResponsesRequest,
+    enabled: bool,
+    provenance: Option<OperationProvenance>,
+) -> ContinuationReservation {
+    let mut reservation = continuation_candidate_inner(
+        owner,
+        body,
+        enabled,
+        "missing_identity",
+        provenance.as_ref(),
+    );
+    reservation.provenance = provenance;
+    reservation
 }
 
 fn continuation_candidate_inner(
@@ -159,6 +198,7 @@ fn continuation_candidate_inner(
     body: &ResponsesRequest,
     enabled: bool,
     missing_owner_reason: &str,
+    provenance: Option<&OperationProvenance>,
 ) -> ContinuationReservation {
     if !enabled {
         return ContinuationReservation::new(
@@ -188,13 +228,23 @@ fn continuation_candidate_inner(
         );
     };
 
+    let Some(provenance) = provenance else {
+        let mut reservation =
+            continuation_candidate_inner(Some(owner), body, false, missing_owner_reason, None);
+        reservation.candidate.disabled_reason = Some("missing_provenance".to_string());
+        return reservation;
+    };
+
     let turn_id = NEXT_TURN_ID.fetch_add(1, Ordering::Relaxed);
     let now = now_ms();
-    let (state, superseded_turn) = {
+    let (state, superseded_turn, provenance_changed) = {
         let mut guard = REGISTRY.lock().unwrap();
         let registry = guard.get_or_insert_with(ContinuationRegistry::default);
         let existing = registry.owners.remove(owner);
         let superseded_turn = existing.is_some();
+        let provenance_changed = existing
+            .as_ref()
+            .is_some_and(|state| state.provenance != *provenance);
         let state = existing.and_then(|owner| owner.continuation);
         if let Some(state) = &state {
             registry.total_transcript_bytes = registry
@@ -204,16 +254,26 @@ fn continuation_candidate_inner(
         registry.owners.insert(
             owner.clone(),
             OwnerState {
+                provenance: provenance.clone(),
                 current_turn: turn_id,
                 continuation: None,
                 updated_at: now,
             },
         );
         evict_oldest(registry);
-        (state, superseded_turn)
+        (
+            if provenance_changed { None } else { state },
+            superseded_turn,
+            provenance_changed,
+        )
     };
 
-    continuation_candidate_from_state(owner, turn_id, body, state, superseded_turn, now)
+    let mut reservation =
+        continuation_candidate_from_state(owner, turn_id, body, state, superseded_turn, now);
+    if provenance_changed {
+        reservation.candidate.disabled_reason = Some("provenance_changed".to_string());
+    }
+    reservation
 }
 
 fn continuation_candidate_from_state(
@@ -309,7 +369,8 @@ pub fn record_continuation(
     response_id: Option<&str>,
     output_items: &[ResponsesInputItem],
 ) {
-    let owner = session_id.map(|session_id| ConversationIdentity::Main(session_id.to_owned()));
+    let _ = session_id;
+    let owner: Option<ConversationIdentity> = None;
     let reservation = ContinuationReservation::new(
         ContinuationCandidate {
             turn_id,
@@ -331,8 +392,12 @@ pub(crate) fn record_continuation_for_owner(
     socket_id: Option<u64>,
     output_items: &[ResponsesInputItem],
 ) {
-    let (owner, turn_id) = match (reservation.owner(), reservation.turn_id()) {
-        (Some(owner), Some(turn_id)) => (owner, turn_id),
+    let (owner, turn_id, provenance) = match (
+        reservation.owner(),
+        reservation.turn_id(),
+        reservation.provenance(),
+    ) {
+        (Some(owner), Some(turn_id), Some(provenance)) => (owner, turn_id, provenance),
         _ => return,
     };
 
@@ -345,11 +410,16 @@ pub(crate) fn record_continuation_for_owner(
             return;
         }
     };
+    let input_bytes = super::request_summary::serialized_json_bytes(&request_body.input);
+    let output_bytes = super::request_summary::serialized_json_bytes(output_items);
+    if input_bytes.saturating_add(output_bytes) > MAX_OWNER_TRANSCRIPT_BYTES {
+        abort_continuation_inner(Some(owner), Some(turn_id));
+        return;
+    }
     let mut transcript: Vec<ResponsesInputItem> = request_body.input.clone();
     transcript.extend_from_slice(output_items);
 
-    let transcript_json = serde_json::to_string(&transcript).unwrap_or_default();
-    let transcript_bytes = transcript_json.len() as u64;
+    let transcript_bytes = super::request_summary::serialized_json_bytes(&transcript);
 
     if transcript_bytes > MAX_OWNER_TRANSCRIPT_BYTES {
         abort_continuation_inner(Some(owner), Some(turn_id));
@@ -372,7 +442,7 @@ pub(crate) fn record_continuation_for_owner(
     let Some(owner_state) = registry.owners.get_mut(owner) else {
         return;
     };
-    if owner_state.current_turn != turn_id {
+    if owner_state.current_turn != turn_id || owner_state.provenance != *provenance {
         return;
     }
     if let Some(existing) = owner_state.continuation.replace(state) {
@@ -386,7 +456,8 @@ pub(crate) fn record_continuation_for_owner(
 
 #[deprecated(note = "use the owner-aware provider flow for typed conversation ownership")]
 pub fn abort_continuation(session_id: Option<&str>, turn_id: Option<u64>) {
-    let owner = session_id.map(|session_id| ConversationIdentity::Main(session_id.to_owned()));
+    let _ = session_id;
+    let owner: Option<ConversationIdentity> = None;
     abort_continuation_inner(owner.as_ref(), turn_id);
 }
 
@@ -421,7 +492,8 @@ pub fn if_current_turn<T>(
     turn_id: Option<u64>,
     action: impl FnOnce() -> T,
 ) -> Option<T> {
-    let owner = session_id.map(|session_id| ConversationIdentity::Main(session_id.to_owned()));
+    let _ = session_id;
+    let owner: Option<ConversationIdentity> = None;
     if_current_turn_inner(owner.as_ref(), turn_id, action)
 }
 
@@ -454,7 +526,8 @@ pub fn with_current_turn(
     turn_id: Option<u64>,
     action: impl FnOnce(),
 ) -> bool {
-    let owner = session_id.map(|session_id| ConversationIdentity::Main(session_id.to_owned()));
+    let _ = session_id;
+    let owner: Option<ConversationIdentity> = None;
     if_current_turn_inner(owner.as_ref(), turn_id, action).is_some()
 }
 
@@ -467,7 +540,8 @@ pub(crate) fn with_current_turn_for_owner(
 
 #[deprecated(note = "use the owner-aware provider flow for typed conversation ownership")]
 pub fn is_current_turn(session_id: Option<&str>, turn_id: Option<u64>) -> bool {
-    let owner = session_id.map(|session_id| ConversationIdentity::Main(session_id.to_owned()));
+    let _ = session_id;
+    let owner: Option<ConversationIdentity> = None;
     is_current_turn_inner(owner.as_ref(), turn_id)
 }
 
@@ -489,7 +563,8 @@ fn is_current_turn_inner(owner: Option<&ConversationIdentity>, turn_id: Option<u
 
 #[deprecated(note = "use the owner-aware provider flow for typed conversation ownership")]
 pub fn clear_continuation(session_id: Option<&str>) {
-    let owner = session_id.map(|session_id| ConversationIdentity::Main(session_id.to_owned()));
+    let _ = session_id;
+    let owner: Option<ConversationIdentity> = None;
     clear_continuation_for_owner(owner.as_ref());
 }
 
@@ -665,6 +740,28 @@ mod tests {
         guard
     }
 
+    fn provenance() -> OperationProvenance {
+        super::super::models::operation_provenance(
+            "http://fixture/responses",
+            &super::super::auth::token_store::StoredAuth {
+                access: "fixture".into(),
+                refresh: String::new(),
+                expires: u64::MAX,
+                account_id: Some("account".into()),
+            },
+            "generation",
+        )
+        .unwrap()
+    }
+
+    fn continuation_candidate_for_owner(
+        owner: Option<&ConversationIdentity>,
+        body: &ResponsesRequest,
+        enabled: bool,
+    ) -> ContinuationReservation {
+        continuation_candidate_with_provenance(owner, body, enabled, Some(provenance()))
+    }
+
     fn main_owner(session_id: &str) -> ConversationIdentity {
         ConversationIdentity::Main(session_id.to_string())
     }
@@ -744,6 +841,57 @@ mod tests {
             legacy_missing.disabled_reason.as_deref(),
             Some("missing_session")
         );
+    }
+
+    #[test]
+    fn missing_or_changed_provenance_never_reuses_or_publishes_stale_turns() {
+        let _registry_guard = lock_registry();
+        let owner = main_owner("scope");
+        let request = request_with_input(vec![input("one")], None);
+        let missing = continuation_candidate_with_provenance(Some(&owner), &request, true, None);
+        assert_eq!(missing.turn_id(), None);
+        assert_eq!(
+            missing.candidate().disabled_reason.as_deref(),
+            Some("missing_provenance")
+        );
+        let auth = super::super::auth::token_store::StoredAuth {
+            access: "fixture".into(),
+            refresh: String::new(),
+            expires: u64::MAX,
+            account_id: Some("account".into()),
+        };
+        for (endpoint, account, generation) in [
+            ("http://other/responses", "account", "generation"),
+            ("http://fixture/responses", "other", "generation"),
+            ("http://fixture/responses", "account", "relogin"),
+        ] {
+            clear_all_continuations_for_tests();
+            let old = continuation_candidate_for_owner(Some(&owner), &request, true);
+            record_continuation_for_owner(&old, &request, Some("old"), Some(1), &[]);
+            let auth = super::super::auth::token_store::StoredAuth {
+                account_id: Some(account.into()),
+                ..auth.clone()
+            };
+            let changed =
+                super::super::models::operation_provenance(endpoint, &auth, generation).unwrap();
+            let next_request = request_with_input(vec![input("one"), input("two")], None);
+            let current = continuation_candidate_with_provenance(
+                Some(&owner),
+                &next_request,
+                true,
+                Some(changed),
+            );
+            assert_eq!(current.candidate().previous_response_id, None);
+            assert_eq!(
+                current.candidate().disabled_reason.as_deref(),
+                Some("provenance_changed")
+            );
+            record_continuation_for_owner(&old, &request, Some("late-old"), Some(1), &[]);
+            abort_continuation_for_owner(&old);
+            assert!(!has_continuation_for_owner_for_tests(&owner));
+            record_continuation_for_owner(&current, &next_request, Some("new"), Some(2), &[]);
+            assert!(has_continuation_for_owner_for_tests(&owner));
+        }
     }
 
     #[test]

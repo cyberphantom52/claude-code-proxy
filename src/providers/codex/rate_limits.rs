@@ -1,21 +1,18 @@
 //! Codex quota telemetry, re-exposed to the local client.
 //!
-//! Codex reports how much of a ChatGPT subscription is spent in two places: the
-//! `x-codex-*` headers on an HTTP response, and the `codex.rate_limits` event on
-//! the WebSocket transport. Neither reaches the client, because the proxy
-//! answers in Anthropic's format and that format has no equivalent field. A tool
-//! placed in front of the proxy — a rotating multi-account gateway, a quota
-//! readout — therefore has no way to see the limit it is about to hit.
+//! Codex reports subscription quota in `x-codex-*` HTTP response headers and
+//! `codex.rate_limits` events. These are re-exposed under Codex's header names;
+//! private protocol/continuation headers are not quotas.
 //!
-//! The newest snapshot is kept here and stamped onto every Codex response under
-//! the header names Codex itself uses, so a client that already reads them needs
-//! no second format. Codex sends the event ahead of the first generated output
-//! on both transports, and the response head is built from that output, so a
-//! response normally carries the numbers of the request it answers. A response
-//! that arrives before any telemetry has — an early error, the first request of
-//! a run that failed upstream — carries the previous snapshot, or none.
+//! Messages responses use a request-local scope; native Responses and Chat use
+//! their own HTTP response headers. Missing telemetry stays absent, never borrowed
+//! from another request/account. Telemetry arriving after the downstream response
+//! head has been emitted cannot update that head.
 
-use std::sync::{LazyLock, RwLock};
+use std::{
+    future::Future,
+    sync::{Arc, Mutex},
+};
 
 use axum::response::Response;
 use http::{HeaderMap, HeaderName, HeaderValue};
@@ -34,8 +31,32 @@ const WINDOW_SUFFIXES: [&str; 6] = [
 /// Whole header names that describe the subscription rather than a window.
 const PLAN_HEADERS: [&str; 2] = ["x-codex-plan-type", "x-codex-active-limit"];
 
-static SNAPSHOT: LazyLock<RwLock<Vec<(HeaderName, HeaderValue)>>> =
-    LazyLock::new(|| RwLock::new(Vec::new()));
+#[derive(Clone, Default)]
+pub struct Telemetry(Arc<Mutex<Vec<(HeaderName, HeaderValue)>>>);
+
+tokio::task_local! {
+    static SNAPSHOT: Telemetry;
+}
+
+/// Capture before spawning a worker that observes this operation's telemetry.
+pub fn current() -> Option<Telemetry> {
+    SNAPSHOT.try_with(Clone::clone).ok()
+}
+
+pub async fn with_telemetry<F: Future>(telemetry: Option<Telemetry>, future: F) -> F::Output {
+    match telemetry {
+        Some(telemetry) => SNAPSHOT.scope(telemetry, future).await,
+        None => future.await,
+    }
+}
+
+/// Scope one Messages operation, stamping only telemetry observed by its tasks.
+pub async fn with_response_telemetry(future: impl Future<Output = Response>) -> Response {
+    with_telemetry(Some(Telemetry::default()), async {
+        stamp_response(future.await)
+    })
+    .await
+}
 
 /// True for a header that reports quota rather than protocol state. Codex sends
 /// several limit families (`x-codex-*`, `x-codex-<limit id>-*`) and a few opaque
@@ -89,29 +110,29 @@ pub fn event_headers(payload: &Value) -> Vec<(HeaderName, HeaderValue)> {
     headers
 }
 
-/// Keeps a snapshot as the newest one. An empty snapshot is ignored: a response
-/// that carried no telemetry says nothing about the quota, so the previous
-/// answer stands.
-pub fn record(headers: Vec<(HeaderName, HeaderValue)>) {
-    if headers.is_empty() {
-        return;
-    }
-    if let Ok(mut snapshot) = SNAPSHOT.write() {
-        *snapshot = headers;
-    }
+/// Replace this operation's telemetry. Empty clears the preceding attempt's
+/// numbers; outside a request scope nothing is retained.
+pub fn record(mut headers: Vec<(HeaderName, HeaderValue)>) {
+    headers.retain(|(name, _)| is_quota_header(name.as_str()));
+    let _ = SNAPSHOT.try_with(|snapshot| {
+        if let Ok(mut snapshot) = snapshot.0.lock() {
+            *snapshot = headers;
+        }
+    });
 }
 
-/// Adds the newest snapshot to an outgoing response, leaving any header the
-/// response already set alone.
+/// Adds this operation's quota headers without replacing explicit response headers.
 pub fn stamp(target: &mut HeaderMap) {
-    let Ok(snapshot) = SNAPSHOT.read() else {
-        return;
-    };
-    for (name, value) in snapshot.iter() {
-        if !target.contains_key(name) {
-            target.insert(name.clone(), value.clone());
+    let _ = SNAPSHOT.try_with(|snapshot| {
+        let Ok(snapshot) = snapshot.0.lock() else {
+            return;
+        };
+        for (name, value) in snapshot.iter() {
+            if !target.contains_key(name) {
+                target.insert(name.clone(), value.clone());
+            }
         }
-    }
+    });
 }
 
 /// Stamps an outgoing Codex response, whatever shape it took.
@@ -263,55 +284,78 @@ mod tests {
         assert!(event_headers(&payload).is_empty());
     }
 
-    // The snapshot is one process-wide value, so tests that touch it record the
-    // same one: they run in parallel, and each `record` replaces the last.
-    fn record_sample() {
-        record(vec![
-            (
-                HeaderName::from_static("x-codex-primary-used-percent"),
-                HeaderValue::from_static("42"),
-            ),
-            (
-                HeaderName::from_static("x-codex-primary-window-minutes"),
-                HeaderValue::from_static("10080"),
-            ),
-        ]);
+    #[tokio::test]
+    async fn interleaved_accounts_and_telemetry_free_responses_are_isolated() {
+        let (first_ready, ready) = tokio::sync::oneshot::channel();
+        let (second_done, done) = tokio::sync::oneshot::channel();
+        let first = with_response_telemetry(async {
+            record(telemetry_headers(&header_map(&[(
+                "x-codex-plan-type",
+                "pro",
+            )])));
+            first_ready.send(()).unwrap();
+            done.await.unwrap();
+            Response::new(axum::body::Body::empty())
+        });
+        let second = with_response_telemetry(async {
+            ready.await.unwrap();
+            record(telemetry_headers(&header_map(&[(
+                "x-codex-plan-type",
+                "plus",
+            )])));
+            second_done.send(()).unwrap();
+            Response::new(axum::body::Body::empty())
+        });
+        let (first, second) = tokio::join!(first, second);
+        assert_eq!(first.headers()["x-codex-plan-type"], "pro");
+        assert_eq!(second.headers()["x-codex-plan-type"], "plus");
+        let empty =
+            with_response_telemetry(async { Response::new(axum::body::Body::empty()) }).await;
+        assert!(empty.headers().get("x-codex-plan-type").is_none());
+        let retry = with_response_telemetry(async {
+            record(telemetry_headers(&header_map(&[(
+                "x-codex-plan-type",
+                "pro",
+            )])));
+            record(Vec::new());
+            Response::new(axum::body::Body::empty())
+        })
+        .await;
+        assert!(retry.headers().get("x-codex-plan-type").is_none());
+    }
+
+    #[tokio::test]
+    async fn explicit_scope_reaches_spawned_transport_workers() {
+        let response = with_response_telemetry(async {
+            let telemetry = current();
+            tokio::spawn(with_telemetry(telemetry, async {
+                record(
+                    header_map(&[
+                        ("x-codex-plan-type", "pro"),
+                        ("x-codex-turn-state", "private"),
+                    ])
+                    .into_iter()
+                    .map(|(name, value)| (name.unwrap(), value))
+                    .collect(),
+                );
+            }))
+            .await
+            .unwrap();
+            Response::new(axum::body::Body::empty())
+        })
+        .await;
+        assert_eq!(response.headers()["x-codex-plan-type"], "pro");
+        assert!(!response.headers().contains_key("x-codex-turn-state"));
     }
 
     #[test]
-    fn stamps_the_newest_snapshot_onto_a_response() {
-        record_sample();
-
-        let mut response = HeaderMap::new();
-        stamp(&mut response);
-
-        assert_eq!(
-            response
-                .get("x-codex-primary-used-percent")
-                .and_then(|value| value.to_str().ok()),
-            Some("42")
-        );
-    }
-
-    // A streaming response is stamped on its head, before any of the body is
-    // written, so a client reading headers never has to wait for the stream.
-    #[test]
-    fn stamps_a_streaming_response_before_its_body() {
-        record_sample();
-
-        let response = stamp_response(
-            Response::builder()
-                .header("content-type", "text/event-stream")
-                .body(axum::body::Body::from("event: message_start\n"))
-                .unwrap(),
-        );
-
-        assert_eq!(
-            response
-                .headers()
-                .get("x-codex-primary-window-minutes")
-                .and_then(|value| value.to_str().ok()),
-            Some("10080")
-        );
+    fn recording_outside_a_request_does_not_cache_quotas() {
+        record(telemetry_headers(&header_map(&[(
+            "x-codex-plan-type",
+            "pro",
+        )])));
+        let mut headers = HeaderMap::new();
+        stamp(&mut headers);
+        assert!(headers.is_empty());
     }
 }

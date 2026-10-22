@@ -42,8 +42,12 @@ use self::auth::manager::CodexAuthManager;
 use self::auth::token_store::file_store;
 use self::client::CodexHttpClient;
 use self::compaction::{
-    CompactionAttempt, CompactionError, abort_compaction_attempt, activate_compaction,
-    apply_compaction_replay, begin_compaction, request_compaction, store_compaction,
+    CompactionAttempt, CompactionError, CompactionScope,
+    abort_compaction_attempt_scoped as abort_compaction_attempt,
+    activate_compaction_scoped as activate_compaction,
+    apply_compaction_replay_scoped as apply_compaction_replay,
+    begin_compaction_scoped as begin_compaction, request_compaction,
+    store_compaction_scoped as store_compaction,
 };
 use self::continuation::{
     ContinuationReservation, abort_continuation_for_owner, continuation_candidate_for_owner,
@@ -244,18 +248,31 @@ impl CodexProvider {
             }
         };
 
+        let mut portable_request = None;
         let compact_boundary = is_compact_messages_request(&body);
         let server_compaction_enabled = config::codex_server_compaction();
+        let scope = conversation_identity
+            .as_ref()
+            .zip(models::current_operation_provenance())
+            .map(|(owner, provenance)| CompactionScope {
+                owner: owner.clone(),
+                provenance,
+            });
         let mut compaction_attempt = None;
-        if !server_compaction_enabled && let Some(session_id) = ctx.session_id.as_deref() {
-            compaction::clear_compaction(session_id);
+        if !server_compaction_enabled && let Some(scope) = scope.as_ref() {
+            compaction::clear_compaction_scoped(scope);
         }
         if server_compaction_enabled
             && compact_boundary
-            && let Some(session_id) = ctx.session_id.as_deref()
+            && let Some(scope) = scope.as_ref()
         {
-            let attempt = begin_compaction(session_id, &translated.model);
+            let attempt = begin_compaction(scope, &translated.model);
             compaction_attempt = Some(attempt);
+            let mut preparing_cleanup = LiveRequestStateCleanup::new(
+                ContinuationReservation::for_owner_turn(conversation_identity.as_ref(), None),
+                ctx.session_id.clone(),
+                Some(attempt),
+            );
             log_compaction_event(
                 "server_compaction_triggered",
                 &ctx,
@@ -269,7 +286,7 @@ impl CodexProvider {
             compaction_ctx.monitor = None;
             match request_compaction(self.client.as_ref(), &translated, &compaction_ctx).await {
                 Ok(native_history) => {
-                    if store_compaction(session_id, attempt, native_history) {
+                    if store_compaction(scope, attempt, native_history) {
                         log_compaction_event(
                             "server_compaction_completed",
                             &ctx,
@@ -277,6 +294,7 @@ impl CodexProvider {
                             None,
                         );
                     } else {
+                        compaction_attempt = None;
                         log_compaction_event(
                             "server_compaction_failed",
                             &ctx,
@@ -286,7 +304,7 @@ impl CodexProvider {
                     }
                 }
                 Err(CompactionError::Upstream(error)) if error.usage_limit.is_some() => {
-                    abort_compaction_attempt(Some(session_id), Some(attempt));
+                    abort_compaction_attempt(Some(scope), Some(attempt));
                     log_compaction_event(
                         "server_compaction_failed",
                         &ctx,
@@ -296,7 +314,8 @@ impl CodexProvider {
                     return map_codex_error_to_response(&error);
                 }
                 Err(error) => {
-                    abort_compaction_attempt(Some(session_id), Some(attempt));
+                    abort_compaction_attempt(Some(scope), Some(attempt));
+                    compaction_attempt = None;
                     log_compaction_event(
                         "server_compaction_failed",
                         &ctx,
@@ -305,10 +324,12 @@ impl CodexProvider {
                     );
                 }
             }
+            preparing_cleanup.disarm();
         } else if server_compaction_enabled
             && !compact_boundary
-            && let Some(replay) = apply_compaction_replay(ctx.session_id.as_deref(), &translated)
+            && let Some(replay) = apply_compaction_replay(scope.as_ref(), &translated)
         {
+            portable_request = Some(translated);
             translated = replay.request;
             compaction_attempt = Some(replay.attempt);
         }
@@ -321,6 +342,11 @@ impl CodexProvider {
             previous_response_id_enabled,
         );
         let turn_id = continuation.turn_id();
+        let mut request_cleanup = LiveRequestStateCleanup::new(
+            continuation.clone(),
+            ctx.session_id.clone(),
+            compaction_attempt,
+        );
         let configured_transport =
             transport_for_request(config::codex_transport(), compact_boundary);
         let transport = configured_transport.as_str();
@@ -351,6 +377,10 @@ impl CodexProvider {
                     serde_json::json!(continuation.candidate().input_delta.as_ref().map(Vec::len)),
                 ),
                 ("turnId".to_string(), serde_json::json!(turn_id)),
+                (
+                    "continuationDisabledReason".to_string(),
+                    serde_json::json!(continuation.candidate().disabled_reason),
+                ),
             ])),
         );
 
@@ -371,6 +401,7 @@ impl CodexProvider {
                 LiveStreamCompaction {
                     compact_boundary,
                     attempt: compaction_attempt,
+                    portable_request,
                 },
                 configured_transport,
             )
@@ -390,10 +421,11 @@ impl CodexProvider {
                     ),
                 ])),
             );
+            request_cleanup.disarm();
             return response;
         }
 
-        let request_continuation = continuation.clone();
+        let mut request_continuation = continuation.clone();
         let mut continuation = Some(continuation);
         let mut attempt = 0_u32;
         let upstream = loop {
@@ -407,13 +439,24 @@ impl CodexProvider {
                 Ok(result) => result,
                 Err(()) => {
                     log_empty_completion_retry(&ctx, attempt, upstream_started_at.elapsed(), None);
-                    abort_compaction_attempt(ctx.session_id.as_deref(), compaction_attempt);
+                    abort_compaction_attempt(scope.as_ref(), compaction_attempt);
                     abort_continuation_for_owner(&request_continuation);
                     return map_codex_error_to_response(&empty_buffered_completion_error());
                 }
             };
             let response = match result {
                 Ok(r) => r,
+                Err(e)
+                    if e.detail.as_deref() == Some("operation_provenance_changed")
+                        && portable_request.is_some() =>
+                {
+                    abort_compaction_attempt(scope.as_ref(), compaction_attempt.take());
+                    abort_continuation_for_owner(&request_continuation);
+                    translated = portable_request.take().expect("portable fallback checked");
+                    request_continuation = ContinuationReservation::for_owner_turn(None, None);
+                    continuation = None;
+                    continue;
+                }
                 Err(e) => {
                     log.warn(
                         "codex_upstream_request_failed",
@@ -432,7 +475,7 @@ impl CodexProvider {
                             ),
                         ])),
                     );
-                    abort_compaction_attempt(ctx.session_id.as_deref(), compaction_attempt);
+                    abort_compaction_attempt(scope.as_ref(), compaction_attempt);
                     abort_continuation_for_owner(&request_continuation);
                     return map_codex_error_to_response(&e);
                 }
@@ -444,15 +487,16 @@ impl CodexProvider {
             // an empty end_turn; retry with full context instead.
             let error = empty_buffered_completion_error();
             drop_live_continuation_for_retry(&mut continuation);
-            if !allow_empty_completion_retry(attempt, upstream_started_at.elapsed()) {
+            let delay = compute_backoff_delay(attempt, None);
+            if !allow_empty_completion_retry(attempt, upstream_started_at.elapsed(), delay.wait_ms)
+            {
                 log_empty_completion_retry(&ctx, attempt, upstream_started_at.elapsed(), None);
-                abort_compaction_attempt(ctx.session_id.as_deref(), compaction_attempt);
+                abort_compaction_attempt(scope.as_ref(), compaction_attempt);
                 abort_continuation_for_owner(&request_continuation);
                 return map_codex_error_to_response(&error);
             }
-            let delay = compute_backoff_delay(attempt, None);
             if delay.exceeds_budget {
-                abort_compaction_attempt(ctx.session_id.as_deref(), compaction_attempt);
+                abort_compaction_attempt(scope.as_ref(), compaction_attempt);
                 abort_continuation_for_owner(&request_continuation);
                 return map_codex_error_to_response(&error);
             }
@@ -466,7 +510,7 @@ impl CodexProvider {
             sleep(delay.wait_ms).await;
         };
         if let Some(failure) = events::first_event_failure(&upstream.body) {
-            abort_compaction_attempt(ctx.session_id.as_deref(), compaction_attempt);
+            abort_compaction_attempt(scope.as_ref(), compaction_attempt);
             abort_continuation_for_owner(&request_continuation);
             return map_codex_event_failure_to_response(&failure);
         }
@@ -474,7 +518,14 @@ impl CodexProvider {
             "codex_upstream_response_received",
             Some(serde_json::Map::from_iter([
                 ("reqId".to_string(), serde_json::json!(&req_id)),
-                ("transport".to_string(), serde_json::json!(transport)),
+                (
+                    "transport".to_string(),
+                    serde_json::json!(format!("{:?}", upstream.transport)),
+                ),
+                (
+                    "hasReusableSocket".to_string(),
+                    serde_json::json!(upstream.socket_id.is_some()),
+                ),
                 ("status".to_string(), serde_json::json!(upstream.status)),
                 (
                     "bodyBytes".to_string(),
@@ -503,18 +554,20 @@ impl CodexProvider {
                     );
                 }
                 update_continuation_from_upstream(
-                    ctx.session_id.as_deref(),
+                    compaction_scope(&request_continuation).as_ref(),
                     &request_continuation,
                     compaction_attempt,
                     &translated,
                     &upstream.body,
                     upstream.socket_id,
+                    upstream.provenance.as_ref(),
                     compact_boundary,
                 );
+                request_cleanup.disarm();
                 (StatusCode::OK, Json(json)).into_response()
             }
             Err(e) => {
-                abort_compaction_attempt(ctx.session_id.as_deref(), compaction_attempt);
+                abort_compaction_attempt(scope.as_ref(), compaction_attempt);
                 abort_continuation_for_owner(&request_continuation);
                 map_codex_failure_to_response(&format!("Accumulation error: {e}"))
             }
@@ -547,13 +600,15 @@ impl Provider for CodexProvider {
         ctx: RequestContext,
         conversation_identity: Option<ConversationIdentity>,
     ) -> Response {
-        let context = self.client.prepare_model_context().await;
-        let response = models::with_model_context(
-            context,
-            self.handle_messages_inner(body, ctx, conversation_identity),
-        )
-        .await;
-        rate_limits::stamp_response(response)
+        rate_limits::with_response_telemetry(async {
+            let context = self.client.prepare_model_context().await;
+            models::with_model_context(
+                context,
+                Box::pin(self.handle_messages_inner(body, ctx, conversation_identity)),
+            )
+            .await
+        })
+        .await
     }
 
     async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
@@ -667,18 +722,25 @@ fn log_compaction_event(
     }
 }
 
+fn compaction_scope(continuation: &ContinuationReservation) -> Option<CompactionScope> {
+    Some(CompactionScope {
+        owner: continuation.owner()?.clone(),
+        provenance: continuation.provenance()?.clone(),
+    })
+}
+
 fn abort_request_state(
-    session_id: Option<&str>,
+    scope: Option<&CompactionScope>,
     continuation: &ContinuationReservation,
     compaction_attempt: Option<CompactionAttempt>,
 ) {
-    abort_compaction_attempt(session_id, compaction_attempt);
+    abort_compaction_attempt(scope, compaction_attempt);
     abort_continuation_for_owner(continuation);
 }
 
 struct LiveRequestStateCleanup {
     continuation: ContinuationReservation,
-    session_id: Option<String>,
+    scope: Option<CompactionScope>,
     compaction_attempt: Option<CompactionAttempt>,
     armed: bool,
 }
@@ -686,12 +748,12 @@ struct LiveRequestStateCleanup {
 impl LiveRequestStateCleanup {
     fn new(
         continuation: ContinuationReservation,
-        session_id: Option<String>,
+        _session_id: Option<String>,
         compaction_attempt: Option<CompactionAttempt>,
     ) -> Self {
         Self {
+            scope: compaction_scope(&continuation),
             continuation,
-            session_id,
             compaction_attempt,
             armed: true,
         }
@@ -700,7 +762,7 @@ impl LiveRequestStateCleanup {
     fn abort(&mut self) {
         if self.armed {
             abort_request_state(
-                self.session_id.as_deref(),
+                self.scope.as_ref(),
                 &self.continuation,
                 self.compaction_attempt,
             );
@@ -717,7 +779,7 @@ impl Drop for LiveRequestStateCleanup {
     fn drop(&mut self) {
         if self.armed {
             abort_request_state(
-                self.session_id.as_deref(),
+                self.scope.as_ref(),
                 &self.continuation,
                 self.compaction_attempt,
             );
@@ -733,10 +795,11 @@ enum LiveStreamStart {
     },
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct LiveStreamCompaction {
     compact_boundary: bool,
     attempt: Option<CompactionAttempt>,
+    portable_request: Option<translate::request::ResponsesRequest>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -745,13 +808,13 @@ async fn live_stream_response(
     message_id: String,
     model: &str,
     ctx: RequestContext,
-    request_body: translate::request::ResponsesRequest,
+    mut request_body: translate::request::ResponsesRequest,
     continuation: ContinuationReservation,
-    compaction: LiveStreamCompaction,
+    mut compaction: LiveStreamCompaction,
     transport: config::CodexTransport,
 ) -> Response {
     let model = model.to_string();
-    let request_continuation = continuation.clone();
+    let mut request_continuation = continuation.clone();
     let mut cleanup = LiveRequestStateCleanup::new(
         request_continuation.clone(),
         ctx.session_id.clone(),
@@ -764,6 +827,7 @@ async fn live_stream_response(
     let mut continuation = Some(continuation);
 
     loop {
+        rate_limits::record(Vec::new());
         let open_stream = async {
             match transport {
                 config::CodexTransport::Http => {
@@ -823,6 +887,20 @@ async fn live_stream_response(
         };
         let upstream_events = match upstream_events {
             Ok(events) => events,
+            Err(err)
+                if err.detail.as_deref() == Some("operation_provenance_changed")
+                    && compaction.portable_request.is_some() =>
+            {
+                cleanup.abort();
+                request_body = compaction
+                    .portable_request
+                    .take()
+                    .expect("portable fallback checked");
+                compaction.attempt = None;
+                request_continuation = ContinuationReservation::for_owner_turn(None, None);
+                continuation = None;
+                continue;
+            }
             Err(err) if err.origin == client::CodexErrorOrigin::Http => {
                 cleanup.abort();
                 return map_codex_error_to_response(&err);
@@ -833,8 +911,14 @@ async fn live_stream_response(
                     attempt += 1;
                     continue;
                 }
+                let delay = compute_backoff_delay(attempt, err.retry_after.as_deref());
                 if attempt >= MAX_RETRYABLE_LIVE_STREAM_RETRIES
-                    || (empty_retry && !allow_empty_completion_retry(attempt, started_at.elapsed()))
+                    || (empty_retry
+                        && !allow_empty_completion_retry(
+                            attempt,
+                            started_at.elapsed(),
+                            delay.wait_ms,
+                        ))
                 {
                     cleanup.abort();
                     if empty_retry {
@@ -843,7 +927,6 @@ async fn live_stream_response(
                     }
                     return exhausted_recovery_response(&ctx, attempt, &err);
                 }
-                let delay = compute_backoff_delay(attempt, err.retry_after.as_deref());
                 if delay.exceeds_budget {
                     cleanup.abort();
                     return exhausted_recovery_response(&ctx, attempt, &err);
@@ -880,7 +963,7 @@ async fn live_stream_response(
             ctx.clone(),
             request_continuation.clone(),
             request_body.clone(),
-            compaction,
+            compaction.clone(),
         );
         let started = match await_empty_retry(
             start_stream,
@@ -937,6 +1020,19 @@ async fn live_stream_response(
                 error,
                 full_context_retry_attempted,
             } => {
+                if error.detail.as_deref() == Some("operation_provenance_changed")
+                    && compaction.portable_request.is_some()
+                {
+                    cleanup.abort();
+                    request_body = compaction
+                        .portable_request
+                        .take()
+                        .expect("portable fallback checked");
+                    compaction.attempt = None;
+                    request_continuation = ContinuationReservation::for_owner_turn(None, None);
+                    continuation = None;
+                    continue;
+                }
                 // The incremental HTTP reader performs its own bounded
                 // pre-semantic retries so it can stop immediately when the
                 // consumer disappears. Do not multiply that exhausted retry
@@ -956,8 +1052,14 @@ async fn live_stream_response(
                 }
                 let empty = error.detail.as_deref() == Some(EMPTY_CODEX_COMPLETION_DETAIL);
                 empty_retry |= empty;
+                let delay = compute_backoff_delay(attempt, error.retry_after.as_deref());
                 if attempt >= MAX_RETRYABLE_LIVE_STREAM_RETRIES
-                    || (empty_retry && !allow_empty_completion_retry(attempt, started_at.elapsed()))
+                    || (empty_retry
+                        && !allow_empty_completion_retry(
+                            attempt,
+                            started_at.elapsed(),
+                            delay.wait_ms,
+                        ))
                 {
                     if empty_retry {
                         log_empty_completion_retry(&ctx, attempt, started_at.elapsed(), None);
@@ -967,7 +1069,6 @@ async fn live_stream_response(
                     cleanup.abort();
                     return exhausted_recovery_response(&ctx, attempt, &error);
                 }
-                let delay = compute_backoff_delay(attempt, error.retry_after.as_deref());
                 if delay.exceeds_budget {
                     cleanup.abort();
                     return exhausted_recovery_response(&ctx, attempt, &error);
@@ -1016,10 +1117,9 @@ async fn await_empty_retry<T>(
 
 // Do not restart a long generation after its retry allowance is already spent.
 // The initial attempt is not timed out: legitimate reasoning may take time.
-fn allow_empty_completion_retry(attempt: u32, elapsed: Duration) -> bool {
+fn allow_empty_completion_retry(attempt: u32, elapsed: Duration, wait_ms: u64) -> bool {
     attempt < MAX_EMPTY_COMPLETION_RETRIES
-        && elapsed + Duration::from_millis(compute_backoff_delay(attempt, None).wait_ms)
-            < EMPTY_COMPLETION_RETRY_BUDGET
+        && elapsed + Duration::from_millis(wait_ms) < EMPTY_COMPLETION_RETRY_BUDGET
 }
 
 fn log_empty_completion_retry(
@@ -1083,7 +1183,8 @@ async fn live_stream_response_once(
         model.to_string(),
         estimated_input_tokens,
     );
-    let mut upstream_sse_body = Vec::new();
+    let mut upstream_sse_body =
+        (request_continuation.turn_id().is_some() || compaction.attempt.is_some()).then(Vec::new);
     // Keep protocol framing private until real output makes a transparent retry unsafe.
     // Every branch that consumes pending_chunk returns, so it is never flushed twice.
     let mut pending_chunk = Vec::new();
@@ -1093,9 +1194,12 @@ async fn live_stream_response_once(
         let payload = match item {
             Ok(payload) => payload,
             Err(err) => {
+                if err.detail.as_deref() == Some("operation_provenance_changed") {
+                    return provider_retry(&upstream_events, err);
+                }
                 if err.origin == client::CodexErrorOrigin::Http {
                     abort_request_state(
-                        ctx.session_id.as_deref(),
+                        compaction_scope(&request_continuation).as_ref(),
                         &request_continuation,
                         compaction.attempt,
                     );
@@ -1105,7 +1209,7 @@ async fn live_stream_response_once(
                     return provider_retry(&upstream_events, err);
                 }
                 abort_request_state(
-                    ctx.session_id.as_deref(),
+                    compaction_scope(&request_continuation).as_ref(),
                     &request_continuation,
                     compaction.attempt,
                 );
@@ -1118,7 +1222,13 @@ async fn live_stream_response_once(
             }
             generation_started = true;
         }
-        append_upstream_sse_payload(&mut upstream_sse_body, &payload);
+        append_upstream_sse_payload(
+            &mut upstream_sse_body,
+            &payload,
+            &ctx,
+            &request_continuation,
+            compaction.attempt,
+        );
         record_rate_limit_telemetry(&payload);
         let (chunk, terminal) = match translate_live_stream_payload(&mut translator, &payload, None)
         {
@@ -1129,7 +1239,7 @@ async fn live_stream_response_once(
                 // Report it once, with the reset clock upstream supplied.
                 if let Some(limit) = events::usage_limit_from_event(&payload) {
                     abort_request_state(
-                        ctx.session_id.as_deref(),
+                        compaction_scope(&request_continuation).as_ref(),
                         &request_continuation,
                         compaction.attempt,
                     );
@@ -1146,7 +1256,7 @@ async fn live_stream_response_once(
                         );
                     }
                     abort_request_state(
-                        ctx.session_id.as_deref(),
+                        compaction_scope(&request_continuation).as_ref(),
                         &request_continuation,
                         compaction.attempt,
                     );
@@ -1155,7 +1265,7 @@ async fn live_stream_response_once(
                     ));
                 }
                 abort_request_state(
-                    ctx.session_id.as_deref(),
+                    compaction_scope(&request_continuation).as_ref(),
                     &request_continuation,
                     compaction.attempt,
                 );
@@ -1199,13 +1309,15 @@ async fn live_stream_response_once(
             record_live_stream_downstream_capture(&ctx, &pending_chunk);
             record_live_stream_progress(&ctx, &pending_chunk);
             if terminal {
+                log_live_stream_completion(&ctx, &upstream_events, &request_continuation);
                 update_continuation_from_upstream(
-                    ctx.session_id.as_deref(),
+                    compaction_scope(&request_continuation).as_ref(),
                     &request_continuation,
                     compaction.attempt,
                     &request_body,
-                    &upstream_sse_body,
+                    upstream_sse_body.as_deref().unwrap_or_default(),
                     upstream_events.socket_id(),
+                    upstream_events.provenance().as_ref(),
                     compaction.compact_boundary,
                 );
                 return LiveStreamStart::Response(single_live_stream_response(pending_chunk));
@@ -1223,13 +1335,15 @@ async fn live_stream_response_once(
             ));
         }
         if terminal {
+            log_live_stream_completion(&ctx, &upstream_events, &request_continuation);
             update_continuation_from_upstream(
-                ctx.session_id.as_deref(),
+                compaction_scope(&request_continuation).as_ref(),
                 &request_continuation,
                 compaction.attempt,
                 &request_body,
-                &upstream_sse_body,
+                upstream_sse_body.as_deref().unwrap_or_default(),
                 upstream_events.socket_id(),
+                upstream_events.provenance().as_ref(),
                 compaction.compact_boundary,
             );
             if pending_chunk.is_empty() {
@@ -1282,6 +1396,34 @@ fn translate_live_stream_payload(
     Ok((chunk, terminal))
 }
 
+fn log_live_stream_completion(
+    ctx: &RequestContext,
+    events: &websocket::CodexWebSocketEventStream,
+    continuation: &ContinuationReservation,
+) {
+    create_logger("codex").info(
+        "codex_upstream_response_received",
+        Some(serde_json::Map::from_iter([
+            ("reqId".into(), serde_json::json!(ctx.req_id)),
+            (
+                "hasReusableSocket".into(),
+                serde_json::json!(events.socket_id().is_some()),
+            ),
+            (
+                "continuationSocketReused".into(),
+                serde_json::json!(
+                    continuation.origin_socket_id().is_some()
+                        && continuation.origin_socket_id() == events.socket_id()
+                ),
+            ),
+            (
+                "fullContextRetry".into(),
+                serde_json::json!(events.used_full_context_retry()),
+            ),
+        ])),
+    );
+}
+
 fn record_live_stream_downstream_capture(ctx: &RequestContext, chunk: &[u8]) {
     let Some(traffic) = ctx.traffic.as_ref() else {
         return;
@@ -1332,15 +1474,21 @@ fn remaining_live_stream_response(
     ctx: RequestContext,
     request_continuation: ContinuationReservation,
     request_body: translate::request::ResponsesRequest,
-    mut upstream_sse_body: Vec<u8>,
+    mut upstream_sse_body: Option<Vec<u8>>,
     compaction: LiveStreamCompaction,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     let model_context = models::current_model_context();
+    let telemetry = rate_limits::current();
     let worker = async move {
+        let mut cleanup = LiveRequestStateCleanup::new(
+            request_continuation.clone(),
+            ctx.session_id.clone(),
+            compaction.attempt,
+        );
         if tx.send(Ok(Bytes::from(first_chunk))).await.is_err() {
             abort_request_state(
-                ctx.session_id.as_deref(),
+                compaction_scope(&request_continuation).as_ref(),
                 &request_continuation,
                 compaction.attempt,
             );
@@ -1374,7 +1522,7 @@ fn remaining_live_stream_response(
                 biased;
                 _ = tx.closed() => {
                     abort_request_state(
-                        ctx.session_id.as_deref(),
+                        compaction_scope(&request_continuation).as_ref(),
                         &request_continuation,
                         compaction.attempt,
                     );
@@ -1390,7 +1538,7 @@ fn remaining_live_stream_response(
                         record_live_stream_progress(&ctx, &chunk);
                         if tx.send(Ok(Bytes::from(chunk))).await.is_err() {
                             abort_request_state(
-                                ctx.session_id.as_deref(),
+                                compaction_scope(&request_continuation).as_ref(),
                                 &request_continuation,
                                 compaction.attempt,
                             );
@@ -1430,7 +1578,13 @@ fn remaining_live_stream_response(
                         );
                         restored_pending = false;
                     }
-                    append_upstream_sse_payload(&mut upstream_sse_body, &payload);
+                    append_upstream_sse_payload(
+                        &mut upstream_sse_body,
+                        &payload,
+                        &ctx,
+                        &request_continuation,
+                        compaction.attempt,
+                    );
                     record_rate_limit_telemetry(&payload);
                     let (chunk, terminal) = match translate_live_stream_payload(
                         &mut translator,
@@ -1440,7 +1594,7 @@ fn remaining_live_stream_response(
                         Ok(result) => result,
                         Err(message) => {
                             abort_request_state(
-                                ctx.session_id.as_deref(),
+                                compaction_scope(&request_continuation).as_ref(),
                                 &request_continuation,
                                 compaction.attempt,
                             );
@@ -1467,7 +1621,7 @@ fn remaining_live_stream_response(
                         record_live_stream_progress(&ctx, &chunk);
                         if tx.send(Ok(Bytes::from(chunk))).await.is_err() {
                             abort_request_state(
-                                ctx.session_id.as_deref(),
+                                compaction_scope(&request_continuation).as_ref(),
                                 &request_continuation,
                                 compaction.attempt,
                             );
@@ -1475,15 +1629,18 @@ fn remaining_live_stream_response(
                         }
                     }
                     if terminal {
+                        log_live_stream_completion(&ctx, &upstream_events, &request_continuation);
                         update_continuation_from_upstream(
-                            ctx.session_id.as_deref(),
+                            compaction_scope(&request_continuation).as_ref(),
                             &request_continuation,
                             compaction.attempt,
                             &request_body,
-                            &upstream_sse_body,
+                            upstream_sse_body.as_deref().unwrap_or_default(),
                             upstream_events.socket_id(),
+                            upstream_events.provenance().as_ref(),
                             compaction.compact_boundary,
                         );
+                        cleanup.disarm();
                         return;
                     }
                 }
@@ -1499,7 +1656,7 @@ fn remaining_live_stream_response(
                         let chunk = translator.prepare_reconnect(ctx.traffic.as_deref());
                         if !chunk.is_empty() && tx.send(Ok(Bytes::from(chunk))).await.is_err() {
                             abort_request_state(
-                                ctx.session_id.as_deref(),
+                                compaction_scope(&request_continuation).as_ref(),
                                 &request_continuation,
                                 compaction.attempt,
                             );
@@ -1516,6 +1673,7 @@ fn remaining_live_stream_response(
                                 "Connection interrupted during thinking; reconnecting",
                             );
                             let retry_continuation = request_continuation.full_context_retry();
+                            rate_limits::record(Vec::new());
                             let open_connection = async {
                                 sleep(compute_backoff_delay(reconnects - 1, None).wait_ms).await;
                                 reconnect
@@ -1530,7 +1688,7 @@ fn remaining_live_stream_response(
                             let result = tokio::select! {
                                 biased;
                                 _ = tx.closed() => {
-                                    abort_request_state(ctx.session_id.as_deref(), &request_continuation, compaction.attempt);
+                                    abort_request_state(compaction_scope(&request_continuation).as_ref(), &request_continuation, compaction.attempt);
                                     return;
                                 }
                                 result = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), open_connection) => result,
@@ -1538,7 +1696,9 @@ fn remaining_live_stream_response(
                             match result {
                                 Ok(Ok(events)) => {
                                     upstream_events = events;
-                                    upstream_sse_body.clear();
+                                    if let Some(body) = upstream_sse_body.as_mut() {
+                                        body.clear();
+                                    }
                                     restored_pending = true;
                                     continue 'events;
                                 }
@@ -1548,7 +1708,7 @@ fn remaining_live_stream_response(
                         }
                     }
                     abort_request_state(
-                        ctx.session_id.as_deref(),
+                        compaction_scope(&request_continuation).as_ref(),
                         &request_continuation,
                         compaction.attempt,
                     );
@@ -1586,13 +1746,13 @@ fn remaining_live_stream_response(
             }
         }
     };
-    tokio::spawn(async move {
+    tokio::spawn(rate_limits::with_telemetry(telemetry, async move {
         if let Some(context) = model_context {
             models::with_model_context(context, worker).await;
         } else {
             worker.await;
         }
-    });
+    }));
 
     let stream = futures_util::stream::unfold(rx, |mut rx| async {
         rx.recv().await.map(|item| (item, rx))
@@ -1629,14 +1789,45 @@ fn connection_reset_error(message: &str) -> client::CodexError {
     }
 }
 
-fn append_upstream_sse_payload(buffer: &mut Vec<u8>, payload: &serde_json::Value) {
-    let text = payload.to_string();
-    for line in text.lines() {
-        buffer.extend_from_slice(b"data: ");
-        buffer.extend_from_slice(line.as_bytes());
-        buffer.push(b'\n');
+fn append_upstream_sse_payload(
+    buffer: &mut Option<Vec<u8>>,
+    payload: &serde_json::Value,
+    ctx: &RequestContext,
+    continuation: &ContinuationReservation,
+    attempt: Option<CompactionAttempt>,
+) {
+    let Some(body) = buffer.as_mut() else {
+        return;
+    };
+    if matches!(
+        payload.get("type").and_then(|value| value.as_str()),
+        Some("keepalive" | "codex.rate_limits")
+    ) {
+        return;
     }
-    buffer.push(b'\n');
+    let bytes = request_summary::serialized_json_bytes(payload);
+    // Native metadata is optional. Never let its retention limit cut the answer.
+    if bytes.saturating_add(8)
+        > continuation::MAX_OWNER_TRANSCRIPT_BYTES.saturating_sub(body.len() as u64)
+    {
+        *buffer = None;
+        abort_request_state(
+            compaction_scope(continuation).as_ref(),
+            continuation,
+            attempt,
+        );
+        create_logger("codex").warn(
+            "codex_native_metadata_disabled",
+            Some(serde_json::Map::from_iter([
+                ("reqId".into(), serde_json::json!(ctx.req_id)),
+                ("reason".into(), serde_json::json!("transcript_overflow")),
+            ])),
+        );
+        return;
+    }
+    body.extend_from_slice(b"data: ");
+    serde_json::to_writer(&mut *body, payload).expect("JSON value serializes to a byte buffer");
+    body.extend_from_slice(b"\n\n");
 }
 
 /// Records quota telemetry from `codex.rate_limits` events.
@@ -1786,19 +1977,24 @@ fn codex_stream_error_type(err: &client::CodexError) -> &'static str {
 
 #[allow(clippy::too_many_arguments)]
 fn update_continuation_from_upstream(
-    session_id: Option<&str>,
+    scope: Option<&CompactionScope>,
     continuation: &ContinuationReservation,
     compaction_attempt: Option<CompactionAttempt>,
     request_body: &translate::request::ResponsesRequest,
     upstream_body: &[u8],
     socket_id: Option<u64>,
+    actual_provenance: Option<&models::OperationProvenance>,
     compact_boundary: bool,
 ) {
+    if actual_provenance.is_none() || actual_provenance != continuation.provenance() {
+        abort_request_state(scope, continuation, compaction_attempt);
+        return;
+    }
     match finish_metadata_from_upstream(upstream_body) {
         Ok(Some(finish)) if finish.continuation_eligible => {
             if compact_boundary {
                 activate_compaction(
-                    session_id,
+                    scope,
                     compaction_attempt,
                     &request_body.model,
                     &finish.output_items,
@@ -1813,7 +2009,7 @@ fn update_continuation_from_upstream(
             );
         }
         _ => {
-            abort_compaction_attempt(session_id, compaction_attempt);
+            abort_compaction_attempt(scope, compaction_attempt);
             abort_continuation_for_owner(continuation);
         }
     }
@@ -2095,6 +2291,253 @@ mod tests {
 
     use super::*;
 
+    fn fixture_provenance() -> models::OperationProvenance {
+        models::operation_provenance(
+            "http://fixture/responses",
+            &auth::token_store::StoredAuth {
+                access: "fixture".into(),
+                refresh: String::new(),
+                expires: u64::MAX,
+                account_id: Some("account".into()),
+            },
+            "generation",
+        )
+        .unwrap()
+    }
+    fn fixture_scope(session: &str) -> CompactionScope {
+        CompactionScope {
+            owner: ConversationIdentity::Main(session.into()),
+            provenance: fixture_provenance(),
+        }
+    }
+    fn continuation_candidate_for_owner(
+        owner: Option<&ConversationIdentity>,
+        request: &translate::request::ResponsesRequest,
+        enabled: bool,
+    ) -> ContinuationReservation {
+        continuation::continuation_candidate_with_provenance(
+            owner,
+            request,
+            enabled,
+            Some(fixture_provenance()),
+        )
+    }
+    fn begin_compaction(session: &str, model: &str) -> CompactionAttempt {
+        compaction::begin_compaction_scoped(&fixture_scope(session), model)
+    }
+    fn store_compaction(
+        session: &str,
+        attempt: CompactionAttempt,
+        history: Vec<translate::request::ResponsesInputItem>,
+    ) -> bool {
+        compaction::store_compaction_scoped(&fixture_scope(session), attempt, history)
+    }
+    fn abort_request_state(
+        session: Option<&str>,
+        continuation: &ContinuationReservation,
+        attempt: Option<CompactionAttempt>,
+    ) {
+        super::abort_request_state(session.map(fixture_scope).as_ref(), continuation, attempt)
+    }
+
+    #[tokio::test]
+    async fn native_transcript_overflow_aborts_reservations_without_truncating_answer() {
+        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
+        let owner = ConversationIdentity::Main("overflow".into());
+        let request = live_test_request("one");
+        let reservation = continuation_candidate_for_owner(Some(&owner), &request, true);
+        let attempt = begin_compaction("overflow", &request.model);
+        let text = "x".repeat(continuation::MAX_OWNER_TRANSCRIPT_BYTES as usize + 1);
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(Ok(serde_json::json!({"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"message"}}))).await.unwrap();
+        tx.send(Ok(
+            serde_json::json!({"type":"response.output_text.delta","output_index":0,"delta":text}),
+        ))
+        .await
+        .unwrap();
+        tx.send(Ok(serde_json::json!({"type":"response.output_item.done","output_index":0,"item":{"type":"message"}}))).await.unwrap();
+        tx.send(Ok(serde_json::json!({"type":"response.completed","response":{"status":"completed","usage":{}}}))).await.unwrap();
+        drop(tx);
+        let (events, _) = websocket::CodexWebSocketEventStream::pending(rx);
+        let started = live_stream_response_once(
+            LiveRecovery {
+                client: Arc::new(CodexHttpClient::new()),
+                attempts: 0,
+                deadline: None,
+                websocket: false,
+            },
+            events,
+            "overflow-message".into(),
+            &request.model,
+            live_test_context("overflow"),
+            reservation.clone(),
+            request.clone(),
+            LiveStreamCompaction {
+                compact_boundary: false,
+                attempt: Some(attempt),
+                portable_request: None,
+            },
+        )
+        .await;
+        let LiveStreamStart::Response(response) = started else {
+            panic!("unexpected retry");
+        };
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let answer = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(answer.contains(&text));
+        assert!(answer.contains("event: message_stop"));
+        assert!(!answer.contains("event: error"));
+        assert!(!continuation::is_current_turn_for_owner(&reservation));
+        assert!(!store_compaction("overflow", attempt, Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn opaque_provenance_mismatch_retries_once_with_portable_history() {
+        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        let app = axum::Router::new().route("/responses", axum::routing::post(move |headers: HeaderMap, Json(body): Json<serde_json::Value>| {
+            let seen = seen.clone();
+            async move {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if headers[http::header::AUTHORIZATION] == "Bearer test" {
+                    return (StatusCode::UNAUTHORIZED, [(http::header::CONTENT_TYPE, "text/event-stream")], Vec::new());
+                }
+                assert_eq!(headers[http::header::AUTHORIZATION], "Bearer rotated");
+                assert!(!body["input"].as_array().unwrap().iter().any(|item| item["type"] == "compaction"));
+                assert!(body.to_string().contains("portable conversation"));
+                (StatusCode::OK, [(http::header::CONTENT_TYPE, "text/event-stream")], upstream_sse(&[
+                    serde_json::json!({"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"message"}}),
+                    serde_json::json!({"type":"response.output_text.delta","output_index":0,"delta":"portable-answer"}),
+                    serde_json::json!({"type":"response.output_item.done","output_index":0,"item":{"type":"message"}}),
+                    serde_json::json!({"type":"response.completed","response":{"status":"completed","usage":{}}}),
+                ]))
+            }
+        }));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = authenticated_live_test_client(format!("http://{addr}/responses"));
+        let context = client.test_model_context().await;
+        client
+            .auth_manager()
+            .set_test_auth(auth::token_store::StoredAuth {
+                access: "rotated".into(),
+                refresh: String::new(),
+                expires: u64::MAX,
+                account_id: Some("acct".into()),
+            });
+        let response = models::with_model_context(context, async {
+            let portable = live_test_request("portable conversation");
+            let mut opaque = portable.clone();
+            opaque.input = vec![translate::request::ResponsesInputItem::Compaction {
+                encrypted_content: "opaque-old-account".into(),
+            }];
+            let owner = ConversationIdentity::Main("portable-fallback".into());
+            let reservation =
+                continuation::continuation_candidate_for_owner(Some(&owner), &opaque, true);
+            live_stream_response(
+                client,
+                "portable-message".into(),
+                &portable.model,
+                live_test_context("portable-fallback"),
+                opaque,
+                reservation,
+                LiveStreamCompaction {
+                    compact_boundary: false,
+                    attempt: None,
+                    portable_request: Some(portable.clone()),
+                },
+                config::CodexTransport::Http,
+            )
+            .await
+        })
+        .await;
+        let answer = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(
+            String::from_utf8_lossy(&answer).contains("portable-answer"),
+            "{}",
+            String::from_utf8_lossy(&answer)
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn native_activation_requires_actual_completion_provenance() {
+        let _registry_guard = continuation::lock_continuation_registry_for_async_tests().await;
+        let summary = "portable summary with sufficient exact detail for this conversation";
+        let upstream = upstream_sse(&[
+            serde_json::json!({"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"message"}}),
+            serde_json::json!({"type":"response.output_text.delta","output_index":0,"delta":summary}),
+            serde_json::json!({"type":"response.output_item.done","output_index":0,"item":{"type":"message"}}),
+            serde_json::json!({"type":"response.completed","response":{"status":"completed","usage":{}}}),
+        ]);
+        let other = models::operation_provenance(
+            "http://other/responses",
+            &auth::token_store::StoredAuth {
+                access: "fixture".into(),
+                refresh: String::new(),
+                expires: u64::MAX,
+                account_id: Some("account".into()),
+            },
+            "generation",
+        )
+        .unwrap();
+        for (actual, expected) in [
+            (None, false),
+            (Some(other), false),
+            (Some(fixture_provenance()), true),
+        ] {
+            let request = live_test_request("original portable history");
+            let scope = fixture_scope("completion-provenance");
+            let reservation = continuation_candidate_for_owner(Some(&scope.owner), &request, true);
+            let attempt = compaction::begin_compaction_scoped(&scope, &request.model);
+            assert!(compaction::store_compaction_scoped(
+                &scope,
+                attempt,
+                vec![translate::request::ResponsesInputItem::Compaction {
+                    encrypted_content: "opaque".into()
+                }]
+            ));
+            update_continuation_from_upstream(
+                Some(&scope),
+                &reservation,
+                Some(attempt),
+                &request,
+                &upstream,
+                None,
+                actual.as_ref(),
+                true,
+            );
+            let mut next = live_test_request(summary);
+            next.input.extend(live_test_request("continue").input);
+            assert_eq!(
+                compaction::apply_compaction_replay_scoped(Some(&scope), &next).is_some(),
+                expected
+            );
+            compaction::abort_compaction_attempt_scoped(Some(&scope), Some(attempt));
+        }
+    }
+
+    #[test]
+    fn disabled_native_transcript_collects_nothing() {
+        let request = live_test_request("one");
+        let reservation = continuation_candidate_for_owner(None, &request, false);
+        let mut body = None;
+        append_upstream_sse_payload(
+            &mut body,
+            &serde_json::json!({"type":"response.output_text.delta","delta":"x".repeat(100_000)}),
+            &live_test_context("disabled"),
+            &reservation,
+            None,
+        );
+        assert!(body.is_none());
+        assert!(reservation.turn_id().is_none());
+    }
+
     #[test]
     fn compact_boundary_uses_http_without_rerouting_ordinary_websocket_requests() {
         assert_eq!(
@@ -2140,11 +2583,27 @@ mod tests {
 
     #[test]
     fn empty_retry_budget_includes_request_time_and_backoff() {
-        assert!(allow_empty_completion_retry(0, Duration::from_secs(1)));
-        assert!(allow_empty_completion_retry(1, Duration::from_secs(56)));
-        assert!(!allow_empty_completion_retry(1, Duration::from_secs(57)));
-        assert!(!allow_empty_completion_retry(2, Duration::ZERO));
-        assert!(!allow_empty_completion_retry(0, Duration::from_secs(60)));
+        assert!(allow_empty_completion_retry(
+            0,
+            Duration::from_secs(1),
+            2_000
+        ));
+        assert!(allow_empty_completion_retry(
+            1,
+            Duration::from_secs(56),
+            3_000
+        ));
+        assert!(!allow_empty_completion_retry(
+            1,
+            Duration::from_secs(57),
+            3_000
+        ));
+        assert!(!allow_empty_completion_retry(2, Duration::ZERO, 1_000));
+        assert!(!allow_empty_completion_retry(
+            0,
+            Duration::from_secs(60),
+            1_000
+        ));
     }
 
     #[tokio::test]
@@ -2466,6 +2925,7 @@ mod tests {
             LiveStreamCompaction {
                 compact_boundary: false,
                 attempt: None,
+                portable_request: None,
             },
         )
         .await
@@ -2628,6 +3088,7 @@ mod tests {
             LiveStreamCompaction {
                 compact_boundary: false,
                 attempt: None,
+                portable_request: None,
             },
             config::CodexTransport::WebSocket,
         )
@@ -2677,6 +3138,7 @@ mod tests {
             LiveStreamCompaction {
                 compact_boundary: false,
                 attempt: None,
+                portable_request: None,
             },
             config::CodexTransport::WebSocket,
         )
@@ -2736,6 +3198,7 @@ mod tests {
                 LiveStreamCompaction {
                     compact_boundary: false,
                     attempt: None,
+                    portable_request: None,
                 },
                 config::CodexTransport::WebSocket,
             )
@@ -2962,6 +3425,7 @@ mod tests {
                 LiveStreamCompaction {
                     compact_boundary: false,
                     attempt: Some(compaction_attempt),
+                    portable_request: None,
                 },
                 config::CodexTransport::WebSocket,
             ),
@@ -3077,6 +3541,7 @@ mod tests {
                 LiveStreamCompaction {
                     compact_boundary: false,
                     attempt: Some(compaction_attempt),
+                    portable_request: None,
                 },
                 config::CodexTransport::WebSocket,
             )
@@ -3162,6 +3627,7 @@ mod tests {
                 LiveStreamCompaction {
                     compact_boundary: false,
                     attempt: Some(compaction_attempt),
+                    portable_request: None,
                 },
                 config::CodexTransport::WebSocket,
             ),
@@ -3348,6 +3814,7 @@ mod tests {
                 LiveStreamCompaction {
                     compact_boundary: false,
                     attempt: Some(compaction_attempt),
+                    portable_request: None,
                 },
                 config::CodexTransport::WebSocket,
             )

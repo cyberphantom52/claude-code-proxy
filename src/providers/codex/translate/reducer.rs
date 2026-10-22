@@ -1,7 +1,11 @@
 use crate::anthropic::sse::parse_sse_events;
 use crate::providers::codex::events::{CodexFailureKind, classify_event_failure};
 
-use super::read_rewrite::{repair_whitespace_stalled_read_args, sanitize_read_args};
+use super::live_stream::{
+    BUFFERED_TOOL_MAX_ARGS_BYTES, CompletedFunctionCallValidationError,
+    validate_completed_function_call, validate_streamed_function_call,
+};
+use super::read_rewrite::sanitize_read_args;
 use super::reasoning_signature::{PendingReasoning, ReasoningReplay, encode_reasoning_signature};
 use super::request::ResponsesInputItem;
 use super::web_search_compat::{server_tool_use_id_from_codex_web_search_id, web_search_query};
@@ -114,7 +118,19 @@ pub const TERM_COMPLETED: &str = "response.completed";
 pub const TERM_INCOMPLETE: &str = "response.incomplete";
 pub const TERM_DONE: &str = "response.done";
 
-const BUFFERED_TOOL_MAX_ARGS_BYTES: usize = 5_000_000;
+impl From<CompletedFunctionCallValidationError> for UpstreamStreamError {
+    fn from(error: CompletedFunctionCallValidationError) -> Self {
+        Self {
+            kind: match error {
+                CompletedFunctionCallValidationError::TooLarge { .. } => UpstreamErrorKind::Failed,
+                CompletedFunctionCallValidationError::Protocol(_) => UpstreamErrorKind::Transient,
+            },
+            message: error.to_string(),
+            retry_after_seconds: None,
+            diagnostics: None,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum ReducerEvent {
@@ -192,7 +208,6 @@ enum BlockState {
         call_id: String,
         name: String,
         args_accum: String,
-        had_delta: bool,
         buffer_until_done: bool,
         emitted_args: bool,
     },
@@ -527,7 +542,6 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                         call_id: call_id.clone(),
                         name: name.clone(),
                         args_accum: String::new(),
-                        had_delta: false,
                         buffer_until_done,
                         emitted_args: false,
                     },
@@ -637,41 +651,24 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                 Some(s) => s,
                 None => continue,
             };
-            let mut repaired_read: Option<(usize, String)> = None;
             match state {
                 BlockState::Tool {
                     args_accum,
-                    had_delta,
                     buffer_until_done,
                     emitted_args,
                     name,
                     index,
-                    call_id,
                     ..
                 } => {
-                    args_accum.push_str(delta);
-                    *had_delta = true;
-                    if args_accum.len() > BUFFERED_TOOL_MAX_ARGS_BYTES {
-                        return Err(UpstreamStreamError {
-                            kind: UpstreamErrorKind::Failed,
-                            message: format!("Buffered {name} tool arguments exceeded safe limits"),
-                            retry_after_seconds: None,
-                            diagnostics: None,
-                        });
-                    }
-
-                    if *buffer_until_done {
-                        if let Some(repaired) = repair_whitespace_stalled_read_args(
-                            name,
-                            args_accum,
-                            Some(call_id.as_str()),
-                        ) {
-                            *args_accum = repaired.clone();
-                            *emitted_args = true;
-                            repaired_read = Some((*index, repaired));
-                        } else {
-                            out.push(ReducerEvent::ToolProgress { index: *index });
+                    if args_accum.len().saturating_add(delta.len()) > BUFFERED_TOOL_MAX_ARGS_BYTES {
+                        return Err(CompletedFunctionCallValidationError::TooLarge {
+                            tool: name.clone(),
                         }
+                        .into());
+                    }
+                    args_accum.push_str(delta);
+                    if *buffer_until_done {
+                        out.push(ReducerEvent::ToolProgress { index: *index });
                     } else {
                         *emitted_args = true;
                         out.push(ReducerEvent::ToolDelta {
@@ -682,28 +679,6 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                 }
                 _ => continue,
             }
-            if let Some((index, repaired)) = repaired_read {
-                if let Some(state) = blocks_by_output_index.remove(&output_index) {
-                    capture_output_item(output_index, &state, &mut output_items_by_index);
-                }
-                out.push(ReducerEvent::ToolDelta {
-                    index,
-                    partial_json: repaired,
-                });
-                out.push(ReducerEvent::ToolStop { index });
-                let output_items: Vec<ResponsesInputItem> =
-                    output_items_by_index.into_values().collect();
-                out.push(ReducerEvent::Finish {
-                    stop_reason: STOP_TOOL_USE,
-                    terminal_type: TERM_INCOMPLETE.to_string(),
-                    continuation_eligible: false,
-                    usage: None,
-                    web_search_requests,
-                    response_id: None,
-                    output_items,
-                });
-                return Ok(out);
-            }
             continue;
         }
 
@@ -712,12 +687,22 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                 Some(v) => v as usize,
                 None => continue,
             };
-            if let Some(BlockState::Tool { args_accum, .. }) =
-                blocks_by_output_index.get_mut(&output_index)
-                && let Some(args) = p.get("arguments").and_then(|v| v.as_str())
-                && args_accum.is_empty()
+            if let Some(BlockState::Tool {
+                args_accum,
+                call_id,
+                name,
+                ..
+            }) = blocks_by_output_index.get_mut(&output_index)
             {
-                *args_accum = args.to_string();
+                let completed = validate_completed_function_call(&serde_json::json!({
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": p.get("arguments"),
+                }))?;
+                validate_streamed_function_call(&completed, call_id, name, args_accum)?;
+                if args_accum.is_empty() {
+                    *args_accum = completed.arguments;
+                }
             }
             continue;
         }
@@ -780,48 +765,108 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                 continue;
             }
 
-            let state = blocks_by_output_index.remove(&output_index);
-            let mut state = match state {
-                Some(s) => s,
-                None => continue,
-            };
-
-            if let Some(item_val) = item
-                && let BlockState::Tool {
-                    args_accum,
-                    name,
-                    call_id,
-                    buffer_until_done,
-                    emitted_args,
-                    had_delta,
-                    index,
-                    ..
-                } = &mut state
+            let completed = if item
+                .and_then(|item| item.get("type"))
+                .and_then(|v| v.as_str())
+                == Some("function_call")
             {
-                if let Some(final_args) = item_val
-                    .get("arguments")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                {
-                    if !args_accum.is_empty() && !*emitted_args {
-                        // Already have accum from deltas - skip
-                    } else if *had_delta {
-                        // Already emitted deltas
+                Some(validate_completed_function_call(
+                    item.expect("function call item"),
+                )?)
+            } else {
+                None
+            };
+            let mut output_index = output_index;
+            if let Some(completed) = completed.as_ref() {
+                let explicit_tool = p.get("output_index").is_some()
+                    && matches!(
+                        blocks_by_output_index.get(&output_index),
+                        Some(BlockState::Tool { .. })
+                    );
+                if !explicit_tool {
+                    let mut matching = blocks_by_output_index.iter().filter_map(|(output_index, state)| {
+                        matches!(state, BlockState::Tool { call_id, .. } if call_id == &completed.call_id)
+                            .then_some(*output_index)
+                    });
+                    let matching_index = matching.next().filter(|_| matching.next().is_none());
+                    if let Some(matching_index) = matching_index {
+                        output_index = matching_index;
                     } else {
-                        *args_accum = final_args.to_string();
+                        // Done-only calls have no open block to close or replay.
+                        close_thinking(
+                            &mut out,
+                            &mut active_thinking,
+                            &mut reasoning_by_output_index,
+                            &mut output_items_by_index,
+                        );
+                        saw_tool_use = true;
+                        let index = anthropic_index;
+                        anthropic_index += 1;
+                        let arguments = sanitize_read_args(
+                            &completed.name,
+                            &completed.arguments,
+                            Some(&completed.call_id),
+                        );
+                        out.push(ReducerEvent::ToolStart {
+                            index,
+                            id: completed.call_id.clone(),
+                            name: completed.name.clone(),
+                        });
+                        out.push(ReducerEvent::ToolDelta {
+                            index,
+                            partial_json: arguments.clone(),
+                        });
+                        out.push(ReducerEvent::ToolStop { index });
+                        if p.get("output_index").is_none()
+                            || blocks_by_output_index.contains_key(&output_index)
+                            || output_items_by_index.contains_key(&output_index)
+                        {
+                            output_index = blocks_by_output_index
+                                .keys()
+                                .chain(output_items_by_index.keys())
+                                .copied()
+                                .max()
+                                .map_or(0, |index| index + 1);
+                        }
+                        output_items_by_index.insert(
+                            output_index,
+                            ResponsesInputItem::FunctionCall {
+                                call_id: completed.call_id.clone(),
+                                name: completed.name.clone(),
+                                arguments,
+                            },
+                        );
+                        continue;
                     }
                 }
+            }
+            let Some(mut state) = blocks_by_output_index.remove(&output_index) else {
+                continue;
+            };
 
-                if !args_accum.is_empty() {
-                    let sanitized = sanitize_read_args(name, args_accum, Some(call_id.as_str()));
-                    *args_accum = sanitized;
-                    if *buffer_until_done || !*emitted_args {
-                        *emitted_args = true;
-                        out.push(ReducerEvent::ToolDelta {
-                            index: *index,
-                            partial_json: args_accum.clone(),
-                        });
-                    }
+            if let BlockState::Tool {
+                args_accum,
+                name,
+                call_id,
+                emitted_args,
+                index,
+                ..
+            } = &mut state
+            {
+                let completed = completed.as_ref().ok_or_else(|| {
+                    CompletedFunctionCallValidationError::Protocol(
+                        "tool output closed without a completed function call".to_string(),
+                    )
+                })?;
+                validate_streamed_function_call(completed, call_id, name, args_accum)?;
+                if !*emitted_args {
+                    *args_accum =
+                        sanitize_read_args(name, &completed.arguments, Some(call_id.as_str()));
+                    *emitted_args = true;
+                    out.push(ReducerEvent::ToolDelta {
+                        index: *index,
+                        partial_json: args_accum.clone(),
+                    });
                 }
             }
 
@@ -1177,7 +1222,7 @@ mod tests {
     }
 
     #[test]
-    fn reduce_repairs_whitespace_stalled_read_args() {
+    fn reduce_does_not_finish_from_whitespace_stalled_read_delta() {
         let upstream = format!(
             "{}{}",
             sse(
@@ -1195,26 +1240,9 @@ mod tests {
                 })
             )
         );
-        let out = reduce_upstream_bytes(upstream.as_bytes()).unwrap();
-        assert!(out.iter().any(|event| {
-            matches!(
-                event,
-                ReducerEvent::ToolDelta { partial_json, .. }
-                    if partial_json == "{\"file_path\":\"/tmp/a\"}"
-            )
-        }));
-        let last = out.last().unwrap();
-        if let ReducerEvent::Finish {
-            stop_reason,
-            continuation_eligible,
-            ..
-        } = last
-        {
-            assert_eq!(*stop_reason, "tool_use");
-            assert!(!continuation_eligible);
-        } else {
-            panic!("expected Finish");
-        }
+        let err = reduce_upstream_bytes(upstream.as_bytes()).unwrap_err();
+        assert_eq!(err.kind, UpstreamErrorKind::Transient);
+        assert!(err.message.contains("terminal"));
     }
 
     #[test]

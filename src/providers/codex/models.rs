@@ -27,7 +27,7 @@ const MAX_ETAG_BYTES: usize = 1024;
 /// Debug intentionally exposes neither credentials nor account identifiers.
 pub struct ModelContext {
     endpoint: String,
-    auth: Option<StoredAuth>,
+    auth: Option<OperationAuth>,
     catalog: Arc<CatalogSnapshot>,
 }
 
@@ -42,9 +42,129 @@ impl std::fmt::Debug for ModelContext {
 }
 
 impl ModelContext {
+    #[cfg(test)]
+    pub(crate) fn for_test(endpoint: &str, auth: StoredAuth) -> Arc<Self> {
+        Arc::new(Self {
+            endpoint: endpoint.to_owned(),
+            auth: Some(auth.into()),
+            catalog: Arc::new(model_catalog::fallback_snapshot()),
+        })
+    }
+
     pub fn catalog(&self) -> Arc<CatalogSnapshot> {
         self.catalog.clone()
     }
+
+    pub fn provenance(&self) -> Option<OperationProvenance> {
+        self.auth.as_ref()?.provenance(&self.endpoint)
+    }
+}
+
+/// Exact transport endpoint and selected credential generation; never credentials.
+#[derive(Clone, PartialEq, Eq)]
+pub struct OperationProvenance {
+    endpoint: String,
+    credential: [u8; 32],
+}
+
+impl std::fmt::Debug for OperationProvenance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OperationProvenance([redacted])")
+    }
+}
+
+impl OperationProvenance {
+    pub(super) fn selected(
+        endpoint: &str,
+        account: Option<&str>,
+        access: &str,
+        revision: &str,
+    ) -> Option<Self> {
+        if endpoint.is_empty()
+            || access.is_empty()
+            || revision.is_empty()
+            || account.is_none_or(|account| account.trim().is_empty())
+        {
+            return None;
+        }
+        let mut digest = Sha256::new();
+        // Length-prefix each field: account/token boundaries cannot collide.
+        digest.update([u8::from(account.is_some())]);
+        let account = account.unwrap_or_default().as_bytes();
+        digest.update((account.len() as u64).to_be_bytes());
+        digest.update(account);
+        digest.update((access.len() as u64).to_be_bytes());
+        digest.update(access.as_bytes());
+        digest.update((revision.len() as u64).to_be_bytes());
+        digest.update(revision.as_bytes());
+        Some(Self {
+            endpoint: endpoint.to_owned(),
+            credential: digest.finalize().into(),
+        })
+    }
+}
+
+pub fn operation_provenance(
+    endpoint: &str,
+    auth: &StoredAuth,
+    revision: &str,
+) -> Option<OperationProvenance> {
+    OperationProvenance::selected(endpoint, auth.account_id.as_deref(), &auth.access, revision)
+}
+
+#[derive(Clone)]
+pub(super) struct OperationAuth {
+    auth: StoredAuth,
+    revision: String,
+    opaque_endpoint: Option<String>,
+}
+
+impl std::ops::Deref for OperationAuth {
+    type Target = StoredAuth;
+    fn deref(&self) -> &Self::Target {
+        &self.auth
+    }
+}
+
+impl OperationAuth {
+    fn from_snapshot(snapshot: crate::auth::AuthSnapshot<StoredAuth>) -> anyhow::Result<Self> {
+        Ok(Self {
+            auth: snapshot
+                .value
+                .ok_or_else(|| anyhow::anyhow!("Not authenticated"))?,
+            revision: snapshot.revision,
+            opaque_endpoint: None,
+        })
+    }
+
+    pub(super) fn require_opaque_provenance(&mut self, endpoint: &str) -> anyhow::Result<()> {
+        let provenance = self.provenance(endpoint);
+        anyhow::ensure!(
+            provenance.is_some() && provenance == current_operation_provenance(),
+            "operation_provenance_changed"
+        );
+        self.opaque_endpoint = Some(endpoint.to_owned());
+        Ok(())
+    }
+
+    pub(super) fn provenance(&self, endpoint: &str) -> Option<OperationProvenance> {
+        operation_provenance(endpoint, &self.auth, &self.revision)
+    }
+}
+
+#[cfg(test)]
+impl From<StoredAuth> for OperationAuth {
+    fn from(auth: StoredAuth) -> Self {
+        Self {
+            auth,
+            revision: "synthetic-test-revision".into(),
+            opaque_endpoint: None,
+        }
+    }
+}
+
+pub fn current_operation_provenance() -> Option<OperationProvenance> {
+    current_model_context()?.provenance()
 }
 
 tokio::task_local! {
@@ -62,7 +182,7 @@ pub fn current_model_context() -> Option<Arc<ModelContext>> {
 pub fn current_auth_for_endpoint(endpoint: &str) -> Option<StoredAuth> {
     current_model_context()
         .filter(|context| context.endpoint == endpoint)
-        .and_then(|context| context.auth.clone())
+        .and_then(|context| context.auth.as_ref().map(|auth| auth.auth.clone()))
 }
 
 // Keys contain only digests, never tokens. JWT claims are used solely as an
@@ -196,6 +316,15 @@ enum Discovery {
 }
 
 impl CodexHttpClient {
+    #[cfg(test)]
+    pub(crate) async fn test_model_context(&self) -> Arc<ModelContext> {
+        Arc::new(ModelContext {
+            endpoint: self.base_url.clone(),
+            auth: Some(self.operation_auth().await.unwrap()),
+            catalog: Arc::new(model_catalog::fallback_snapshot()),
+        })
+    }
+
     pub async fn prepare_model_context(&self) -> Arc<ModelContext> {
         self.prepare_model_context_version(CODEX_PROTOCOL_VERSION)
             .await
@@ -209,7 +338,12 @@ impl CodexHttpClient {
         }
         // OAuth refresh rotates credentials. Never cancel it with the shorter
         // metadata deadline before the auth manager can persist the response.
-        let mut auth = self.auth_manager.get_auth().await.ok();
+        let mut auth = self
+            .auth_manager
+            .get_auth_snapshot()
+            .await
+            .ok()
+            .and_then(|snapshot| OperationAuth::from_snapshot(snapshot).ok());
         let deadline = Instant::now() + DISCOVERY_TIMEOUT;
         let catalog = if crate::config::codex_model_discovery() {
             if let Some(auth) = auth.as_mut() {
@@ -229,7 +363,7 @@ impl CodexHttpClient {
 
     async fn discover_catalog(
         &self,
-        auth: &mut StoredAuth,
+        auth: &mut OperationAuth,
         version: &str,
         deadline: Instant,
     ) -> Option<Arc<CatalogSnapshot>> {
@@ -269,7 +403,7 @@ impl CodexHttpClient {
 
     async fn fetch_catalog(
         &self,
-        auth: &mut StoredAuth,
+        auth: &mut OperationAuth,
         endpoint: reqwest::Url,
         etag: Option<&http::HeaderValue>,
         mut deadline: Instant,
@@ -351,7 +485,7 @@ impl CodexHttpClient {
         ))
     }
 
-    pub(super) async fn operation_auth(&self) -> anyhow::Result<StoredAuth> {
+    pub(super) async fn operation_auth(&self) -> anyhow::Result<OperationAuth> {
         if let Some(context) = current_model_context() {
             anyhow::ensure!(
                 context.endpoint == self.base_url,
@@ -364,18 +498,32 @@ impl CodexHttpClient {
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("Not authenticated"));
         }
-        self.auth_manager.get_auth().await
+        OperationAuth::from_snapshot(self.auth_manager.get_auth_snapshot().await?)
     }
 
     pub(super) async fn refresh_operation_auth(
         &self,
-        rejected: &StoredAuth,
-    ) -> anyhow::Result<StoredAuth> {
-        let refreshed = self.auth_manager.force_refresh(&rejected.access).await?;
+        rejected: &OperationAuth,
+    ) -> anyhow::Result<OperationAuth> {
+        let snapshot = crate::auth::AuthSnapshot {
+            value: Some(rejected.auth.clone()),
+            revision: rejected.revision.clone(),
+        };
+        let mut refreshed = OperationAuth::from_snapshot(
+            self.auth_manager.force_refresh_snapshot(&snapshot).await?,
+        )?;
         anyhow::ensure!(
             same_account(rejected, &refreshed),
             "Codex account changed during operation; retry the operation"
         );
+        if let Some(endpoint) = &rejected.opaque_endpoint {
+            anyhow::ensure!(
+                rejected.provenance(endpoint).is_some()
+                    && rejected.provenance(endpoint) == refreshed.provenance(endpoint),
+                "operation_provenance_changed"
+            );
+            refreshed.opaque_endpoint = Some(endpoint.clone());
+        }
         Ok(refreshed)
     }
 }
@@ -557,7 +705,7 @@ mod tests {
         let context = |slug: &str| {
             Arc::new(ModelContext {
                 endpoint: server.url.clone(),
-                auth: Some(auth(slug, slug)),
+                auth: Some(auth(slug, slug).into()),
                 catalog: Arc::new(CatalogSnapshot::new(
                     model_catalog::parse_catalog(catalog(slug).as_bytes()).unwrap(),
                     true,
@@ -955,7 +1103,7 @@ mod tests {
         });
         let other = Arc::new(ModelContext {
             endpoint: server.url.clone(),
-            auth: Some(auth("other-secret", "other-account")),
+            auth: Some(auth("other-secret", "other-account").into()),
             catalog: Arc::new(CatalogSnapshot::new(vec![], true)),
         });
         with_model_context(missing.clone(), async {
@@ -979,6 +1127,47 @@ mod tests {
         .await;
         assert_eq!(server.count(), 0);
         assert!(model_catalog::scoped_catalog().is_none());
+    }
+
+    #[test]
+    fn operation_provenance_binds_exact_selected_auth_and_generation_without_secrets() {
+        let original = auth("synthetic-secret", "selected-account");
+        let provenance =
+            operation_provenance("http://localhost/responses?mode=a", &original, "epoch-a")
+                .unwrap();
+        for changed in [
+            operation_provenance("http://localhost/responses?mode=b", &original, "epoch-a"),
+            operation_provenance(
+                "http://localhost/responses?mode=a",
+                &auth("rotated-secret", "selected-account"),
+                "epoch-a",
+            ),
+            operation_provenance(
+                "http://localhost/responses?mode=a",
+                &auth("synthetic-secret", "other-account"),
+                "epoch-a",
+            ),
+            operation_provenance("http://localhost/responses?mode=a", &original, "epoch-b"),
+        ] {
+            assert_ne!(Some(provenance.clone()), changed);
+        }
+        assert_eq!(
+            operation_provenance("http://localhost/responses?mode=a", &original, "epoch-a"),
+            Some(provenance.clone())
+        );
+        assert_eq!(format!("{provenance:?}"), "OperationProvenance([redacted])");
+        assert!(operation_provenance("http://localhost/responses", &original, "").is_none());
+        assert!(
+            operation_provenance(
+                "http://localhost/responses",
+                &auth("", "selected-account"),
+                "epoch"
+            )
+            .is_none()
+        );
+        let mut unknown = original;
+        unknown.account_id = None;
+        assert!(operation_provenance("http://localhost/responses", &unknown, "epoch").is_none());
     }
 
     #[test]

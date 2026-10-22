@@ -102,6 +102,56 @@ pub(crate) fn validate_completed_function_call(
     })
 }
 
+pub(crate) fn validate_streamed_function_call(
+    completed: &CompletedFunctionCall,
+    call_id: &str,
+    name: &str,
+    arguments: &str,
+) -> Result<(), CompletedFunctionCallValidationError> {
+    let disagreement = || {
+        CompletedFunctionCallValidationError::Protocol(
+            "completed function call disagrees with streamed tool state".to_string(),
+        )
+    };
+    if completed.call_id != call_id || completed.name != name {
+        return Err(disagreement());
+    }
+    if arguments.is_empty() {
+        return Ok(());
+    }
+    if arguments.trim().is_empty() {
+        // Blank authoritative arguments normalize to {}, but whitespace already
+        // streamed downstream is not an executable JSON object.
+        return Err(CompletedFunctionCallValidationError::Protocol(
+            "streamed function call arguments are not valid JSON".to_string(),
+        ));
+    }
+    // Read is buffered: repair only at authoritative finalization, never close
+    // the turn from a delta or hide a later upstream failure/usage event.
+    let streamed = validate_completed_function_call(&serde_json::json!({
+        "call_id": call_id,
+        "name": name,
+        "arguments": arguments,
+    }));
+    let (streamed_arguments, final_arguments) = match streamed {
+        Ok(streamed) => (streamed.arguments, completed.arguments.clone()),
+        Err(error @ CompletedFunctionCallValidationError::TooLarge { .. }) => return Err(error),
+        Err(error) => match repair_whitespace_stalled_read_args(name, arguments, None) {
+            Some(repaired) => (
+                repaired,
+                sanitize_read_args(name, &completed.arguments, None),
+            ),
+            None => return Err(error),
+        },
+    };
+    if serde_json::from_str::<serde_json::Value>(&streamed_arguments).ok()
+        != serde_json::from_str::<serde_json::Value>(&final_arguments).ok()
+    {
+        return Err(disagreement());
+    }
+    Ok(())
+}
+
 enum LiveBlock {
     Text {
         index: usize,
@@ -113,7 +163,6 @@ enum LiveBlock {
         call_id: String,
         name: String,
         args_accum: String,
-        had_delta: bool,
         buffer_until_done: bool,
         emitted_args: bool,
     },
@@ -265,13 +314,13 @@ impl LiveStreamTranslator {
                 self.tool_delta(payload, traffic, &mut out)?;
             }
             "response.function_call_arguments.done" => {
-                self.tool_arguments_done(payload);
+                self.tool_arguments_done(payload)?;
             }
             "response.output_item.done" => {
                 self.output_item_done(payload, traffic, &mut out)?;
             }
             "response.completed" | "response.incomplete" | "response.done" => {
-                self.finish(payload, traffic, &mut out);
+                self.finish(payload, traffic, &mut out)?;
             }
             _ => {}
         }
@@ -482,7 +531,6 @@ impl LiveStreamTranslator {
                         call_id: call_id.clone(),
                         name: name.clone(),
                         args_accum: String::new(),
-                        had_delta: false,
                         buffer_until_done: name == "Read",
                         emitted_args: false,
                     },
@@ -655,13 +703,10 @@ impl LiveStreamTranslator {
             return Ok(());
         }
         self.semantic_output_started = true;
-        let mut repaired_read: Option<(usize, String)> = None;
         let Some(LiveBlock::Tool {
             index,
-            call_id,
             name,
             args_accum,
-            had_delta,
             buffer_until_done,
             emitted_args,
             ..
@@ -669,25 +714,15 @@ impl LiveStreamTranslator {
         else {
             return Ok(());
         };
+        if args_accum.len().saturating_add(delta.len()) > BUFFERED_TOOL_MAX_ARGS_BYTES {
+            return Err(format!(
+                "Buffered {name} tool arguments exceeded safe limits"
+            ));
+        }
         args_accum.push_str(delta);
-        *had_delta = true;
-        if *buffer_until_done {
-            if args_accum.len() > BUFFERED_TOOL_MAX_ARGS_BYTES {
-                return Err(format!(
-                    "Buffered {name} tool arguments exceeded safe limits"
-                ));
-            }
-            if let Some(repaired) =
-                repair_whitespace_stalled_read_args(name, args_accum, Some(call_id.as_str()))
-            {
-                *args_accum = repaired.clone();
-                *emitted_args = true;
-                repaired_read = Some((*index, repaired));
-            }
-        } else {
+        if !*buffer_until_done {
             *emitted_args = true;
             let index = *index;
-            self.semantic_output_started = true;
             self.emit(
                 traffic,
                 out,
@@ -695,64 +730,35 @@ impl LiveStreamTranslator {
                 &serde_json::json!({
                     "type": "content_block_delta",
                     "index": index,
-                    "delta": {
-                        "type": "input_json_delta",
-                        "partial_json": delta
-                    }
+                    "delta": {"type": "input_json_delta", "partial_json": delta}
                 }),
             );
-            return Ok(());
-        }
-        if let Some((index, repaired)) = repaired_read {
-            self.blocks_by_output_index.remove(&output_index);
-            self.semantic_output_started = true;
-            self.emit(
-                traffic,
-                out,
-                "content_block_delta",
-                &serde_json::json!({
-                    "type": "content_block_delta",
-                    "index": index,
-                    "delta": {
-                        "type": "input_json_delta",
-                        "partial_json": repaired
-                    }
-                }),
-            );
-            self.emit(
-                traffic,
-                out,
-                "content_block_stop",
-                &serde_json::json!({
-                    "type": "content_block_stop",
-                    "index": index,
-                }),
-            );
-            self.ensure_message_start(traffic, out);
-            self.emit_finish(STOP_TOOL_USE, None, traffic, out);
         }
         Ok(())
     }
 
-    fn tool_arguments_done(&mut self, payload: &serde_json::Value) {
-        let Some(output_index) = payload
-            .get("output_index")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as usize)
+    fn tool_arguments_done(&mut self, payload: &serde_json::Value) -> Result<(), String> {
+        let Some(LiveBlock::Tool {
+            args_accum,
+            call_id,
+            name,
+            ..
+        }) = self.blocks_by_output_index.get_mut(&output_index(payload))
         else {
-            return;
+            return Ok(());
         };
-        let Some(args) = payload.get("arguments").and_then(|v| v.as_str()) else {
-            return;
-        };
-        let Some(LiveBlock::Tool { args_accum, .. }) =
-            self.blocks_by_output_index.get_mut(&output_index)
-        else {
-            return;
-        };
+        let completed = validate_completed_function_call(&serde_json::json!({
+            "call_id": call_id,
+            "name": name,
+            "arguments": payload.get("arguments"),
+        }))
+        .map_err(|error| error.to_string())?;
+        validate_streamed_function_call(&completed, call_id, name, args_accum)
+            .map_err(|error| error.to_string())?;
         if args_accum.is_empty() {
-            *args_accum = args.to_string();
+            *args_accum = completed.arguments;
         }
+        Ok(())
     }
 
     fn output_item_done(
@@ -823,6 +829,19 @@ impl LiveStreamTranslator {
             None
         };
 
+        if let Some(LiveBlock::Tool {
+            call_id,
+            name,
+            args_accum,
+            ..
+        }) = self.blocks_by_output_index.get(&output_index)
+        {
+            let completed = completed_function_call
+                .as_ref()
+                .ok_or("tool output closed without a completed function call")?;
+            validate_streamed_function_call(completed, call_id, name, args_accum)
+                .map_err(|error| error.to_string())?;
+        }
         let Some(mut state) = self.blocks_by_output_index.remove(&output_index) else {
             return Ok(());
         };
@@ -852,37 +871,27 @@ impl LiveStreamTranslator {
                 name,
                 call_id,
                 args_accum,
-                had_delta,
-                buffer_until_done,
                 emitted_args,
                 ..
             } => {
-                self.semantic_output_started = true;
-                if let Some(final_args) = completed_function_call
+                let completed = completed_function_call
                     .as_ref()
-                    .map(|completed| completed.arguments.as_str())
-                    && (args_accum.is_empty() || (!*had_delta && !*emitted_args))
-                {
-                    *args_accum = final_args.to_string();
-                }
-                if !args_accum.is_empty() {
-                    *args_accum = sanitize_read_args(name, args_accum, Some(call_id.as_str()));
-                    if *buffer_until_done || !*emitted_args {
-                        *emitted_args = true;
-                        self.emit(
-                            traffic,
-                            out,
-                            "content_block_delta",
-                            &serde_json::json!({
-                                "type": "content_block_delta",
-                                "index": index,
-                                "delta": {
-                                    "type": "input_json_delta",
-                                    "partial_json": args_accum
-                                }
-                            }),
-                        );
-                    }
+                    .expect("validated tool completion");
+                self.semantic_output_started = true;
+                if !*emitted_args {
+                    *args_accum =
+                        sanitize_read_args(name, &completed.arguments, Some(call_id.as_str()));
+                    *emitted_args = true;
+                    self.emit(
+                        traffic,
+                        out,
+                        "content_block_delta",
+                        &serde_json::json!({
+                            "type": "content_block_delta",
+                            "index": index,
+                            "delta": {"type": "input_json_delta", "partial_json": args_accum}
+                        }),
+                    );
                 }
                 self.emit(
                     traffic,
@@ -965,7 +974,7 @@ impl LiveStreamTranslator {
             .and_then(|value| usize::try_from(value).ok())
             && matches!(
                 self.blocks_by_output_index.get(&output_index),
-                Some(LiveBlock::Tool { call_id: open_call_id, .. }) if open_call_id == call_id
+                Some(LiveBlock::Tool { .. })
             )
         {
             return Some(output_index);
@@ -1121,7 +1130,14 @@ impl LiveStreamTranslator {
         payload: &serde_json::Value,
         traffic: Option<&TrafficCapture>,
         out: &mut Vec<u8>,
-    ) {
+    ) -> Result<(), String> {
+        if self
+            .blocks_by_output_index
+            .values()
+            .any(|block| matches!(block, LiveBlock::Tool { .. }))
+        {
+            return Err("upstream stream ended with open Codex tool blocks".to_string());
+        }
         self.close_thinking(traffic, out);
         self.close_open_blocks(traffic, out);
         self.emit_web_searches(traffic, out);
@@ -1137,6 +1153,7 @@ impl LiveStreamTranslator {
             STOP_END_TURN
         };
         self.emit_finish(stop_reason, usage, traffic, out);
+        Ok(())
     }
 
     fn emit_finish(
@@ -1796,7 +1813,7 @@ mod tests {
     }
 
     #[test]
-    fn repairs_whitespace_stalled_read_args_as_tool_use_finish() {
+    fn whitespace_stalled_read_waits_for_authoritative_finalization() {
         let mut translator = LiveStreamTranslator::new("msg_1", "gpt-5.5");
         let mut out = Vec::new();
         out.extend(
@@ -1818,6 +1835,27 @@ mod tests {
                         "type": "response.function_call_arguments.delta",
                         "output_index": 0,
                         "delta": format!("{{\"file_path\":\"/tmp/a\",\"offset\":1200000{}", " ".repeat(1024))
+                    }),
+                    None,
+                )
+                .unwrap(),
+        );
+        assert!(!translator.is_finished());
+        assert!(!String::from_utf8_lossy(&out).contains("input_json_delta"));
+        assert!(
+            super::super::read_rewrite::read_offset_rewrite("call_stalled_offset_commit").is_none()
+        );
+        out.extend(translator.accept(&json!({
+            "type": "response.output_item.done", "output_index": 0,
+            "item": {"type":"function_call","call_id":"call_stalled_offset_commit","name":"Read",
+                "arguments":"{\"file_path\":\"/tmp/a\",\"offset\":1200000}"}
+        }), None).unwrap());
+        assert!(!translator.is_finished());
+        out.extend(
+            translator
+                .accept(
+                    &json!({
+                        "type":"response.completed", "response":{"usage":{"output_tokens":7}}
                     }),
                     None,
                 )

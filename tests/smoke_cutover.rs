@@ -2414,7 +2414,7 @@ async fn smoke_codex_http_finishes_reasoning_when_terminal_follows_partial_tool(
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
-async fn smoke_codex_http_does_not_retry_after_stalled_read_repair() {
+async fn smoke_codex_http_stalled_read_waits_for_authoritative_completion_and_usage() {
     let repair_event = serde_json::json!({
         "type": "response.function_call_arguments.delta",
         "output_index": 0,
@@ -2427,6 +2427,13 @@ async fn smoke_codex_http_does_not_retry_after_stalled_read_repair() {
     .as_bytes()
     .to_vec();
     first_body.extend_from_slice(format!("data: {repair_event}\n\n").as_bytes());
+    first_body.extend_from_slice(concat!(
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"message\",\"id\":\"msg_read_sibling\"}}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":1,\"delta\":\"sibling after stalled Read\"}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_stalled_read\",\"name\":\"Read\",\"arguments\":\"{\\\"file_path\\\":\\\"/tmp/stalled\\\"}\"}}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"message\"}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_stalled_read\",\"status\":\"completed\",\"service_tier\":\"default\",\"usage\":{\"input_tokens\":11,\"output_tokens\":7}}}\n\n"
+    ).as_bytes());
 
     let (attempts, status, text) =
         collect_http_stream_after_truncated_attempt(first_body, Vec::new()).await;
@@ -2434,7 +2441,114 @@ async fn smoke_codex_http_does_not_retry_after_stalled_read_repair() {
     assert_eq!(attempts, 1, "stream body: {text}");
     assert!(text.contains("call_stalled_read"), "stream body: {text}");
     assert!(text.contains("/tmp/stalled"), "stream body: {text}");
+    assert!(
+        text.contains("sibling after stalled Read"),
+        "stream body: {text}"
+    );
     assert!(!text.contains("event: error"), "stream body: {text}");
+    assert_eq!(text.matches("event: message_stop").count(), 1);
+    assert_eq!(text.matches(r#""id":"call_stalled_read""#).count(), 1);
+    let usage = claude_code_proxy::anthropic::sse::parse_sse_events(text.as_bytes())
+        .into_iter()
+        .filter_map(|event| serde_json::from_str::<Value>(&event.data).ok())
+        .find(|event| event["type"] == "message_delta")
+        .unwrap()["usage"]
+        .clone();
+    assert_eq!(usage["input_tokens"], 11);
+    assert_eq!(usage["output_tokens"], 7);
+    assert_eq!(usage["speed"], "standard");
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_http_stalled_read_preserves_authoritative_failure_with_siblings() {
+    for sibling in [false, true] {
+        for close_read in [false, true] {
+            let mut events = vec![
+                json!({"type":"response.created","response":{"id":"resp_stalled_failure"}}),
+                json!({"type":"response.output_item.added","output_index":0,
+                    "item":{"type":"function_call","call_id":"call_stalled_failure","name":"Read"}}),
+                json!({"type":"response.function_call_arguments.delta","output_index":0,
+                    "delta":format!("{{\"file_path\":\"/tmp/stalled-failure\",\"pages\":\"\"{}", " ".repeat(1_024))}),
+            ];
+            if sibling {
+                events.extend([
+                    json!({"type":"response.output_item.added","output_index":1,
+                        "item":{"type":"reasoning","id":"rs_stalled_sibling","encrypted_content":"opaque"}}),
+                    json!({"type":"response.reasoning_summary_text.delta","output_index":1,
+                        "delta":"reasoning sibling remains open"}),
+                ]);
+            }
+            if close_read {
+                events.push(json!({"type":"response.output_item.done","output_index":0,
+                    "item":{"type":"function_call","call_id":"call_stalled_failure","name":"Read",
+                        "arguments":"{\"file_path\":\"/tmp/stalled-failure\",\"pages\":\"\"}"}}));
+            }
+            events.push(json!({"type":"response.failed","response":{"status":"failed",
+                "error":{"code":"cyber_policy","message":"authoritative failure after stalled Read"}}}));
+            let first_body = events
+                .iter()
+                .map(|event| format!("data: {event}\n\n"))
+                .collect::<String>()
+                .into_bytes();
+            let (attempts, status, text) =
+                collect_http_stream_after_truncated_attempt(first_body, Vec::new()).await;
+            assert_eq!(
+                attempts, 1,
+                "sibling={sibling}, close_read={close_read}: {text}"
+            );
+            assert_eq!(
+                status,
+                if sibling || close_read {
+                    StatusCode::OK
+                } else {
+                    StatusCode::BAD_REQUEST
+                },
+                "{text}"
+            );
+            assert!(
+                text.contains("authoritative failure after stalled Read"),
+                "{text}"
+            );
+            assert!(!text.contains("event: message_stop"), "{text}");
+            assert!(!text.contains(r#""stop_reason":"tool_use""#), "{text}");
+            if sibling {
+                assert!(text.contains("reasoning sibling remains open"), "{text}");
+                assert!(text.contains("event: error"), "{text}");
+            }
+            if !close_read {
+                assert!(!text.contains("call_stalled_failure"), "{text}");
+            }
+        }
+    }
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn smoke_codex_http_stalled_read_eof_retries_without_tool_leakage() {
+    let events = [
+        json!({"type":"response.output_item.added","output_index":0,
+            "item":{"type":"function_call","call_id":"call_stalled_eof","name":"Read"}}),
+        json!({"type":"response.function_call_arguments.delta","output_index":0,
+            "delta":format!("{{\"file_path\":\"/tmp/stalled-eof\"}}{}", " ".repeat(1_024))}),
+    ];
+    let first_body = events
+        .iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect::<String>()
+        .into_bytes();
+    let (attempts, status, text) = collect_http_stream_after_truncated_attempt(
+        first_body,
+        buffered_success_sse("retry after stalled Read EOF"),
+    )
+    .await;
+    assert_eq!(attempts, 2, "{text}");
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert!(text.contains("retry after stalled Read EOF"), "{text}");
+    assert!(!text.contains("call_stalled_eof"), "{text}");
+    assert!(!text.contains("/tmp/stalled-eof"), "{text}");
+    assert!(!text.contains("event: error"), "{text}");
+    assert_eq!(text.matches("event: message_start").count(), 1);
     assert_eq!(text.matches("event: message_stop").count(), 1);
 }
 
