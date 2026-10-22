@@ -445,14 +445,6 @@ where
 }
 
 #[cfg(test)]
-pub fn fixture_store<T>() -> InMemoryAuthStore<T>
-where
-    T: Serialize + serde::de::DeserializeOwned + Send + Sync + Clone,
-{
-    InMemoryAuthStore::new()
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -522,6 +514,25 @@ mod tests {
 
     fn temp_auth_path(dir: &tempfile::TempDir, name: &str) -> String {
         dir.path().join(name).to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn file_store_preserves_legacy_auth_during_migration() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = temp_auth_path(&temp, "primary/auth.json");
+        let legacy = temp_auth_path(&temp, "legacy/auth.json");
+        write_atomically(&legacy, &json!({"source": "legacy"})).unwrap();
+        let store: FileAuthStore<serde_json::Value> =
+            FileAuthStore::new(file.clone(), legacy.clone());
+
+        assert_eq!(store.load().unwrap().unwrap()["source"], "legacy");
+        store.save(json!({"source": "primary"})).unwrap();
+        assert_eq!(store.load().unwrap().unwrap()["source"], "primary");
+        assert_eq!(
+            load_auth_file::<serde_json::Value>(&legacy).unwrap()["source"],
+            "legacy"
+        );
+        assert!(std::path::Path::new(&file).exists());
     }
 
     #[test]

@@ -87,13 +87,6 @@ pub fn record_session_request(
 }
 
 #[cfg(test)]
-pub fn reset_sessions_for_test() {
-    let mut store = SESSIONS.lock().expect("session lock");
-    store.map.clear();
-    store.order.clear();
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
 

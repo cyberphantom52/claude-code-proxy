@@ -65,34 +65,66 @@ fn path_resolvers_cover_platform_rules() {
     );
 
     let deps = DirResolverEnv {
-        platform: "darwin".to_string(),
-        home: "/home/u".into(),
-        env: HashMap::from([("XDG_CONFIG_HOME".into(), "/x".into())]),
-    };
-    assert_eq!(
-        paths::resolve_config_dir(&deps).to_string_lossy(),
-        "/home/u/.config/claude-code-proxy"
-    );
-
-    let deps = DirResolverEnv {
         platform: "linux".to_string(),
         home: "/home/u".into(),
         env: HashMap::from([("XDG_CONFIG_HOME".into(), "/x".into())]),
     };
     assert_eq!(
-        paths::resolve_config_dir(&deps).to_string_lossy(),
-        "/x/claude-code-proxy"
+        paths::resolve_config_dir(&deps),
+        std::path::Path::new("/x").join("claude-code-proxy")
     );
 
-    let deps = DirResolverEnv {
-        platform: "win32".to_string(),
-        home: "C:/Users/u".into(),
-        env: HashMap::from([("APPDATA".into(), "C:/Users/u/AppData/Roaming".into())]),
-    };
-    assert_eq!(
-        paths::resolve_config_dir(&deps).to_string_lossy(),
-        "C:/Users/u/AppData/Roaming/claude-code-proxy"
-    );
+    // Rust reports "macos"/"windows"; retain the old Node platform aliases too.
+    for platform in ["macos", "darwin"] {
+        let deps = DirResolverEnv {
+            platform: platform.into(),
+            home: "/home/u".into(),
+            env: HashMap::from([("XDG_CONFIG_HOME".into(), "/x".into())]),
+        };
+        assert_eq!(
+            paths::resolve_config_dir(&deps),
+            std::path::Path::new("/home/u").join(".config/claude-code-proxy")
+        );
+    }
+
+    for platform in ["windows", "win32"] {
+        let mut deps = DirResolverEnv {
+            platform: platform.into(),
+            home: "C:/Users/u".into(),
+            env: HashMap::from([
+                ("APPDATA".into(), "C:/Roaming/".into()),
+                ("LOCALAPPDATA".into(), "C:/Local/".into()),
+                ("XDG_CONFIG_HOME".into(), "/ignored".into()),
+                ("XDG_STATE_HOME".into(), "/ignored".into()),
+            ]),
+        };
+        assert_eq!(
+            paths::resolve_config_dir(&deps),
+            std::path::Path::new("C:/Roaming").join("claude-code-proxy")
+        );
+        assert_eq!(
+            paths::resolve_state_dir(&deps),
+            std::path::Path::new("C:/Local").join("claude-code-proxy")
+        );
+        deps.env.clear();
+        assert_eq!(
+            paths::resolve_config_dir(&deps),
+            std::path::Path::new(&deps.home).join("AppData/Roaming/claude-code-proxy")
+        );
+        assert_eq!(
+            paths::resolve_state_dir(&deps),
+            std::path::Path::new(&deps.home).join("AppData/Local/claude-code-proxy")
+        );
+        assert_eq!(
+            paths::legacy_config_dir(&deps),
+            std::path::Path::new(&deps.home).join(".config/claude-code-proxy")
+        );
+        deps.env.insert("CCP_CONFIG_DIR".into(), "/override".into());
+        assert_eq!(
+            paths::codex_auth_file(&deps),
+            std::path::Path::new("/override").join("codex/auth.json")
+        );
+    }
 }
 
 #[test]
