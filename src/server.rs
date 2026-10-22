@@ -2,11 +2,7 @@ use crate::{
     anthropic::{MAX_ANTHROPIC_REQUEST_BYTES, json_error},
     logging::{Logger, REDACT_KEYS, create_logger},
     monitor::{EndpointKind, MonitorHandle},
-    openai_compat::{
-        MAX_OPENAI_REQUEST_BYTES, OpenAiError, OpenAiSurface,
-        request::{extract_model, parse_request},
-        stream::openai_response as render_openai_response,
-    },
+    openai_compat::{MAX_OPENAI_REQUEST_BYTES, OpenAiError, request::extract_model},
     project,
     provider::RequestContext,
     providers::codex::{
@@ -26,7 +22,7 @@ use crate::{
     },
     registry::{Registry, normalize_incoming_model},
     request_identity::{CLAUDE_AGENT_HEADER, CLAUDE_PARENT_AGENT_HEADER, ConversationIdentity},
-    session::{self, SessionState},
+    session,
     traffic::{TrafficCaptureOptions, create_traffic_capture},
 };
 use axum::{
@@ -90,7 +86,6 @@ fn apply_auto_review_model(
     body: &mut crate::anthropic::schema::MessagesRequest,
     count_tokens: bool,
     configured_model: Option<&str>,
-    original_provider: &str,
 ) -> Option<AutoReviewRoute> {
     if count_tokens || !is_claude_auto_review_request(body) {
         return None;
@@ -98,7 +93,7 @@ fn apply_auto_review_model(
 
     let override_model = configured_model
         .filter(|model| !model.is_empty())
-        .or((original_provider == "codex").then_some(CODEX_AUTO_REVIEW_MODEL))?;
+        .unwrap_or(CODEX_AUTO_REVIEW_MODEL);
     let requested_model = body.model.clone()?;
     let fast_override = format!(
         "{}-fast",
@@ -181,6 +176,7 @@ pub async fn serve_listener(
     monitor: Option<MonitorHandle>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
+    crate::config::validate_config()?;
     let local_addr = listener.local_addr()?;
     let port = local_addr.port();
     create_logger("server").info(
@@ -201,7 +197,7 @@ pub async fn serve_listener(
             ),
         ])),
     );
-    let app = app_with_monitor(Arc::new(Registry::with_default_alias()), monitor);
+    let app = app_with_monitor(Arc::new(Registry::new()), monitor);
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
@@ -963,13 +959,7 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
     };
     let now = current_millis();
     let session_state = session::existing_session(session_id.as_deref(), now);
-    let affinity = session_state
-        .as_ref()
-        .and_then(|session| session.affinity_provider.as_ref());
-    let Some(provider) = state
-        .registry
-        .provider_for_model(&normalized_model, affinity)
-    else {
+    let Some(provider) = state.registry.provider_for_model(&normalized_model) else {
         let response = OpenAiError::invalid(
             format!(
                 "Unknown model \"{normalized_model}\". {}",
@@ -980,45 +970,14 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
         .response();
         return monitor_response_body(response, request_guard);
     };
-    let parsed = if provider.name() == "codex" {
-        if let Err(response) = validate_native_request_model(&body) {
-            return monitor_response_body(response, request_guard);
-        }
-        None
-    } else {
-        match parse_request(
-            OpenAiSurface::Responses,
-            body.clone(),
-            provider.name(),
-            session_id.as_deref(),
-        ) {
-            Ok(parsed) => Some(parsed),
-            Err(error) => return monitor_response_body(error.response(), request_guard),
-        }
-    };
-    if provider.name() != "codex"
-        && let Some(session_id) = session_id.as_deref()
-    {
-        crate::providers::codex::clear_session_compaction(session_id);
+    if let Err(response) = validate_native_request_model(&body) {
+        return monitor_response_body(response, request_guard);
     }
-    let current = session::record_session_request(
-        session_id.as_deref(),
-        session_state.as_ref(),
-        provider.name(),
-        &normalized_model,
-        now,
-    );
-    let effort = parsed
-        .as_ref()
-        .and_then(|parsed| {
-            parsed
-                .messages
-                .extra
-                .get("output_config")
-                .and_then(|value| value.get("effort"))
-                .and_then(Value::as_str)
-        })
-        .or_else(|| body.pointer("/reasoning/effort").and_then(Value::as_str))
+    let current =
+        session::record_session_request(session_id.as_deref(), session_state.as_ref(), now);
+    let effort = body
+        .pointer("/reasoning/effort")
+        .and_then(Value::as_str)
         .map(str::to_string);
     if let Some(monitor) = state.monitor.as_ref() {
         if let Some(current) = current.as_ref() {
@@ -1055,12 +1014,6 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
             }),
         );
         capture.write_json("010-openai-responses-request", &body);
-        if let Some(parsed) = parsed.as_ref() {
-            capture.write_json(
-                "015-anthropic-request",
-                &serde_json::to_value(&parsed.messages).unwrap_or_else(|_| json!({})),
-            );
-        }
     }
     let context = RequestContext {
         notification_id: None,
@@ -1071,45 +1024,15 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
         traffic: traffic.clone(),
         monitor: state.monitor.clone(),
     };
-    let response = if let Some(parsed) = parsed {
-        match provider
-            .generate_anthropic_stream(parsed.messages, context)
-            .await
-        {
-            Ok(generation) => {
-                if let Some(capture) = traffic.as_ref() {
-                    capture.write_json(
-                        "016-model-resolution",
-                        &json!({"requestedModel":requested_model,"resolvedModel":generation.resolved_model}),
-                    );
-                }
-                match render_openai_response(
-                    OpenAiSurface::Responses,
-                    generation,
-                    parsed.stream,
-                    parsed.include_usage,
-                    parsed.response_metadata,
-                    traffic.clone(),
-                )
-                .await
-                {
-                    Ok(response) => response,
-                    Err(error) => error.response(),
-                }
-            }
-            Err(error) => OpenAiError::from(error).response(),
-        }
-    } else {
-        match state.native_responses.as_ref() {
-            Some(backend) => backend.handle(body, context).await,
-            None => openai_error(
-                StatusCode::NOT_FOUND,
-                "not_found_error",
-                "Native Responses API is disabled",
-                None,
-                None,
-            ),
-        }
+    let response = match state.native_responses.as_ref() {
+        Some(backend) => backend.handle(body, context).await,
+        None => openai_error(
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            "Native Responses API is disabled",
+            None,
+            None,
+        ),
     };
     log_routed_openai_request_completed(
         &log,
@@ -1196,13 +1119,7 @@ async fn handler_chat_completions(
     };
     let now = current_millis();
     let session_state = session::existing_session(session_id.as_deref(), now);
-    let affinity = session_state
-        .as_ref()
-        .and_then(|session| session.affinity_provider.as_ref());
-    let Some(provider) = state
-        .registry
-        .provider_for_model(&normalized_model, affinity)
-    else {
+    let Some(provider) = state.registry.provider_for_model(&normalized_model) else {
         let response = OpenAiError::invalid(
             format!(
                 "Unknown model \"{normalized_model}\". {}",
@@ -1213,50 +1130,13 @@ async fn handler_chat_completions(
         .response();
         return monitor_response_body(response, request_guard);
     };
-    let (translated, parsed) = if provider.name() == "codex" {
-        let translated = match translate_request(body.clone()) {
-            Ok(translated) => translated,
-            Err(error) => return monitor_response_body(error.response(), request_guard),
-        };
-        (Some(translated), None)
-    } else {
-        let parsed = match parse_request(
-            OpenAiSurface::ChatCompletions,
-            body.clone(),
-            provider.name(),
-            session_id.as_deref(),
-        ) {
-            Ok(parsed) => parsed,
-            Err(error) => return monitor_response_body(error.response(), request_guard),
-        };
-        (None, Some(parsed))
+    let translated = match translate_request(body.clone()) {
+        Ok(translated) => translated,
+        Err(error) => return monitor_response_body(error.response(), request_guard),
     };
-    if provider.name() != "codex"
-        && let Some(session_id) = session_id.as_deref()
-    {
-        crate::providers::codex::clear_session_compaction(session_id);
-    }
-    let current = session::record_session_request(
-        session_id.as_deref(),
-        session_state.as_ref(),
-        provider.name(),
-        &normalized_model,
-        now,
-    );
-    let effort = translated
-        .as_ref()
-        .and_then(|translated| translated.effort.clone())
-        .or_else(|| {
-            parsed.as_ref().and_then(|parsed| {
-                parsed
-                    .messages
-                    .extra
-                    .get("output_config")
-                    .and_then(|value| value.get("effort"))
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-        });
+    let current =
+        session::record_session_request(session_id.as_deref(), session_state.as_ref(), now);
+    let effort = translated.effort.clone();
     if let Some(monitor) = state.monitor.as_ref() {
         if let Some(current) = current.as_ref() {
             monitor.session_sequence_resolved(&req_id, current.seq);
@@ -1293,15 +1173,7 @@ async fn handler_chat_completions(
             }),
         );
         capture.write_json("010-openai-chat-completions-request", &body);
-        if let Some(translated) = translated.as_ref() {
-            capture.write_json("020-upstream-request", &translated.upstream);
-        }
-        if let Some(parsed) = parsed.as_ref() {
-            capture.write_json(
-                "015-anthropic-request",
-                &serde_json::to_value(&parsed.messages).unwrap_or_else(|_| json!({})),
-            );
-        }
+        capture.write_json("020-upstream-request", &translated.upstream);
     }
     let context = RequestContext {
         notification_id: None,
@@ -1312,46 +1184,15 @@ async fn handler_chat_completions(
         traffic: traffic.clone(),
         monitor: state.monitor.clone(),
     };
-    let response = if let Some(translated) = translated {
-        match state.chat_completions.as_ref() {
-            Some(backend) => backend.handle(translated, context).await,
-            None => openai_error(
-                StatusCode::NOT_FOUND,
-                "not_found_error",
-                "Chat Completions API is disabled",
-                None,
-                None,
-            ),
-        }
-    } else {
-        let parsed = parsed.expect("non-Codex request was parsed");
-        match provider
-            .generate_anthropic_stream(parsed.messages, context)
-            .await
-        {
-            Ok(generation) => {
-                if let Some(capture) = traffic.as_ref() {
-                    capture.write_json(
-                        "016-model-resolution",
-                        &json!({"requestedModel":requested_model,"resolvedModel":generation.resolved_model}),
-                    );
-                }
-                match render_openai_response(
-                    OpenAiSurface::ChatCompletions,
-                    generation,
-                    parsed.stream,
-                    parsed.include_usage,
-                    parsed.response_metadata,
-                    traffic.clone(),
-                )
-                .await
-                {
-                    Ok(response) => response,
-                    Err(error) => error.response(),
-                }
-            }
-            Err(error) => OpenAiError::from(error).response(),
-        }
+    let response = match state.chat_completions.as_ref() {
+        Some(backend) => backend.handle(translated, context).await,
+        None => openai_error(
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            "Chat Completions API is disabled",
+            None,
+            None,
+        ),
     };
     log_routed_openai_request_completed(
         &log,
@@ -1635,19 +1476,13 @@ async fn dispatch_request(
     } else {
         None
     };
-    let session_affinity = session_state
-        .as_ref()
-        .and_then(|state| state.affinity_provider.as_ref());
-    let original_provider = state
-        .registry
-        .provider_for_model(&normalized_model, session_affinity);
+    let original_provider = state.registry.provider_for_model(&normalized_model);
     let configured_auto_review_model = crate::config::auto_review_model();
-    let auto_review_route = original_provider.as_ref().and_then(|provider| {
+    let auto_review_route = original_provider.as_ref().and_then(|_| {
         apply_auto_review_model(
             &mut body,
             count_tokens,
             configured_auto_review_model.as_deref(),
-            provider.name(),
         )
     });
     if auto_review_route.is_some() {
@@ -1656,7 +1491,7 @@ async fn dispatch_request(
     }
 
     let provider = if auto_review_route.is_some() {
-        state.registry.provider_for_model(&normalized_model, None)
+        state.registry.provider_for_model(&normalized_model)
     } else {
         original_provider
     };
@@ -1715,7 +1550,7 @@ async fn dispatch_request(
         }
     };
 
-    body.bypass_provider_model_override = auto_review_route.is_some() && provider.name() == "codex";
+    body.bypass_provider_model_override = auto_review_route.is_some();
     if body.bypass_provider_model_override {
         apply_codex_auto_review_defaults(&mut body, session_id.as_deref());
     }
@@ -1732,26 +1567,12 @@ async fn dispatch_request(
         );
     }
 
-    if !count_tokens
-        && auto_review_route.is_none()
-        && provider.name() != "codex"
-        && let Some(session_id) = session_id.as_deref()
-    {
-        crate::providers::codex::clear_session_compaction(session_id);
-    }
-
     let effort = crate::providers::translate_shared::read_effort(&body)
         .ok()
         .flatten()
         .map(str::to_string);
-    let current = session::record_session_request_with_affinity_update(
-        session_id.as_deref(),
-        session_state.as_ref(),
-        provider.name(),
-        &normalized_model,
-        auto_review_route.is_none(),
-        now,
-    );
+    let current =
+        session::record_session_request(session_id.as_deref(), session_state.as_ref(), now);
     if let Some(monitor) = state.monitor.as_ref() {
         if let Some(current) = current.as_ref() {
             monitor.session_sequence_resolved(&req_id, current.seq);
@@ -2251,11 +2072,6 @@ fn set_mode(path: &Path, mode: u32) {
     }
 }
 
-#[allow(dead_code)]
-fn _unused(session_state: Option<&SessionState>) {
-    let _ = session_state;
-}
-
 #[cfg(test)]
 mod request_id_header_tests {
     use super::{REQUEST_ID_HEADER, RequestMonitorGuard, monitor_response_body};
@@ -2380,7 +2196,7 @@ mod auto_review_tests {
             false,
             json!([]),
         );
-        let route = apply_auto_review_model(&mut classifier, false, None, "codex")
+        let route = apply_auto_review_model(&mut classifier, false, None)
             .expect("classifier should be routed");
         assert_eq!(route.requested_model, "gpt-5.6-sol");
         assert_eq!(route.override_model, "gpt-6-luna");
@@ -2444,7 +2260,7 @@ mod auto_review_tests {
         for (configured, expected) in [
             (None, "gpt-6-luna-fast"),
             (Some("gpt-5.6-sol"), "gpt-5.6-sol-fast"),
-            (Some("grok-4.5"), "grok-4.5"),
+            (Some("gpt-5.4-mini"), "gpt-5.4-mini-fast"),
         ] {
             let mut classifier = request(
                 "You are a security monitor for autonomous AI coding agents.",
@@ -2452,22 +2268,9 @@ mod auto_review_tests {
                 json!([]),
             );
             classifier.model = Some("gpt-6-astra-fast".into());
-            let route =
-                apply_auto_review_model(&mut classifier, false, configured, "codex").unwrap();
+            let route = apply_auto_review_model(&mut classifier, false, configured).unwrap();
             assert_eq!(route.override_model, expected);
         }
-    }
-
-    #[test]
-    fn non_codex_classifier_keeps_requested_model_without_override() {
-        let mut classifier = request(
-            "You are a security monitor for autonomous AI coding agents.",
-            false,
-            json!([]),
-        );
-        classifier.model = Some("kimi-for-coding".to_string());
-        assert!(apply_auto_review_model(&mut classifier, false, None, "kimi").is_none());
-        assert_eq!(classifier.model.as_deref(), Some("kimi-for-coding"));
     }
 
     #[test]
@@ -2477,10 +2280,10 @@ mod auto_review_tests {
             false,
             json!([]),
         );
-        let route = apply_auto_review_model(&mut classifier, false, Some("grok-4.5"), "codex")
+        let route = apply_auto_review_model(&mut classifier, false, Some("gpt-5.6-sol"))
             .expect("configured classifier should be routed");
-        assert_eq!(route.override_model, "grok-4.5");
-        assert_eq!(classifier.model.as_deref(), Some("grok-4.5"));
+        assert_eq!(route.override_model, "gpt-5.6-sol");
+        assert_eq!(classifier.model.as_deref(), Some("gpt-5.6-sol"));
     }
 
     #[test]
@@ -2521,9 +2324,7 @@ mod auto_review_tests {
             false,
             json!([]),
         );
-        assert!(
-            apply_auto_review_model(&mut classifier, true, Some("grok-4.5"), "codex").is_none()
-        );
+        assert!(apply_auto_review_model(&mut classifier, true, Some("gpt-6-luna")).is_none());
         assert_eq!(classifier.model.as_deref(), Some("gpt-5.6-sol"));
     }
 }

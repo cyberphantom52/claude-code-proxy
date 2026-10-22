@@ -2,7 +2,7 @@ use claude_code_proxy::anthropic::{
     encode_sse_event, parse_sse_events, parse_sse_events_with_stats, schema::MessagesRequest,
 };
 use claude_code_proxy::auth::{AuthStorage, InMemoryAuthStore};
-use claude_code_proxy::config::{AliasProvider, load_config_for_env};
+use claude_code_proxy::config::{load_config_for_env, validate_config_for_env};
 use claude_code_proxy::logging::{create_logger, redact_value};
 use claude_code_proxy::paths::{self, DirResolverEnv};
 use claude_code_proxy::retry::{RETRY_INITIAL_DELAY_MS, RETRY_MAX_DELAY_MS, compute_backoff_delay};
@@ -237,24 +237,51 @@ fn config_env_precedence_and_defaults() {
     env.insert("PORT".to_string(), "19999".to_string());
     assert_eq!(load_config_for_env(&env).port, 19999);
 
-    env.insert("CCP_ALIAS_PROVIDER".to_string(), "kimi".to_string());
-    assert!(matches!(
-        load_config_for_env(&env).alias_provider,
-        AliasProvider::Kimi
-    ));
+    assert!(validate_config_for_env(&env).is_ok());
 }
 
 #[test]
-fn alias_provider_has_expected_default() {
+fn obsolete_alias_selection_requires_explicit_migration() {
     let config = TempDir::new().unwrap();
-    let env = HashMap::from([(
+    let mut env = HashMap::from([(
         "CCP_CONFIG_DIR".to_string(),
         config.path().to_string_lossy().into_owned(),
     )]);
-    assert!(matches!(
-        load_config_for_env(&env).alias_provider,
-        AliasProvider::Codex
-    ));
+    for removed in ["kimi", "grok", "cursor", "opencode", "", "unknown"] {
+        env.insert("CCP_ALIAS_PROVIDER".to_string(), removed.to_string());
+        let error = validate_config_for_env(&env).unwrap_err().to_string();
+        assert!(error.contains("CCP_ALIAS_PROVIDER"), "{error}");
+        assert!(error.contains("ChatGPT subscription"), "{error}");
+    }
+    env.insert("CCP_ALIAS_PROVIDER".to_string(), "codex".to_string());
+    assert!(validate_config_for_env(&env).is_ok());
+    for alias in [
+        json!("kimi"),
+        json!("grok"),
+        json!("cursor"),
+        json!("opencode"),
+        json!(null),
+        json!(42),
+    ] {
+        std::fs::write(
+            config.path().join("config.json"),
+            json!({"aliasProvider": alias, "port": "invalid"}).to_string(),
+        )
+        .unwrap();
+        // A Codex env override must not conceal stale intent in the file.
+        assert!(
+            validate_config_for_env(&env)
+                .unwrap_err()
+                .to_string()
+                .contains("aliasProvider")
+        );
+    }
+    std::fs::write(
+        config.path().join("config.json"),
+        r#"{"aliasProvider":"codex"}"#,
+    )
+    .unwrap();
+    assert!(validate_config_for_env(&env).is_ok());
 }
 
 #[test]

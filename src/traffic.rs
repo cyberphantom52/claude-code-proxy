@@ -4,7 +4,6 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
-use crate::config::AliasProvider;
 use crate::logging::REDACT_KEYS;
 use crate::paths;
 use crate::providers::codex::translate::reasoning_signature::is_proxy_reasoning_signature;
@@ -271,7 +270,7 @@ impl StreamTrafficCapture {
     }
 
     pub fn finish(self, traffic: &TrafficCapture, completion: Value) {
-        self.finish_named(traffic, completion, "061-grok-stream-summary");
+        self.finish_named(traffic, completion, "061-stream-summary");
     }
 
     pub fn finish_named(self, traffic: &TrafficCapture, completion: Value, summary_name: &str) {
@@ -363,7 +362,7 @@ fn redact_traffic_with_depth(value: &Value, depth: u16) -> Value {
             for (key, value) in map {
                 let normalized = key.to_lowercase();
                 if normalized == "image_url" {
-                    // Grok/OpenAI `input_image` parts carry data URLs; never
+                    // OpenAI `input_image` parts carry data URLs; never
                     // persist the payload in traffic captures.
                     out.insert(key.clone(), redact_traffic_value(value));
                 } else if normalized == "data" && looks_like_image_source(map) {
@@ -453,7 +452,7 @@ fn looks_like_image_source(map: &Map<String, Value>) -> bool {
 fn redact_traffic_value(value: &Value) -> Value {
     match value {
         Value::String(s) => Value::String(format!("[redacted len={}]", s.len())),
-        // Structured values (e.g. Kimi's `{url: ...}` image_url) keep their
+        // Structured values (e.g. `{url: ...}` image_url) keep their
         // shape so captures stay parseable; only the payload leaves.
         Value::Object(_) | Value::Array(_) => redact_traffic(value),
         _ => Value::String("[redacted]".to_string()),
@@ -470,11 +469,6 @@ fn set_mode(path: &Path, mode: u32) {
             let _ = fs::set_permissions(path, perm);
         }
     }
-}
-
-#[allow(dead_code)]
-fn _provider_alias(_provider: &str) -> Option<AliasProvider> {
-    None
 }
 
 #[cfg(test)]
@@ -813,7 +807,7 @@ mod tests {
 
     #[test]
     fn redact_traffic_keeps_structured_image_url_shape() {
-        // Kimi-style object image_url: redact the payload but keep the object
+        // Object image_url: redact the payload but keep the object
         // structure so captures stay parseable.
         let value = serde_json::json!({
             "image_url": {"url": "DATA:IMAGE/PNG;BASE64,iVBORw0KGgoAAAANSUhEUg"}

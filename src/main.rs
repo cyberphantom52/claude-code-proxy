@@ -4,7 +4,7 @@ use claude_code_proxy::{
     config, logging,
     monitor::MonitorHandle,
     paths,
-    registry::{ANTHROPIC_STYLE_ALIASES, Registry},
+    registry::Registry,
     server::{self, ServerConfig},
     tui::{self, MonitorExit, MonitorUiConfig},
 };
@@ -16,7 +16,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 #[command(
     name = "claude-code-proxy",
     version = VERSION,
-    about = "Anthropic-compatible proxy for Claude Code provider backends",
+    about = "Anthropic-compatible proxy for Codex through a ChatGPT subscription",
     disable_version_flag = true
 )]
 struct Cli {
@@ -46,28 +46,10 @@ enum Commands {
     /// Open the monitor TUI with mock data and no proxy server
     #[command(hide = true)]
     Demo,
-    /// List supported provider models
-    Models {
-        #[arg(long)]
-        full: bool,
-    },
+    /// List supported Codex models
+    Models,
     /// Manage Codex authentication
     Codex {
-        #[command(subcommand)]
-        command: ProviderGroup,
-    },
-    /// Manage Kimi authentication
-    Kimi {
-        #[command(subcommand)]
-        command: ProviderGroup,
-    },
-    /// Manage Cursor authentication
-    Cursor {
-        #[command(subcommand)]
-        command: ProviderGroup,
-    },
-    /// Manage Grok authentication
-    Grok {
         #[command(subcommand)]
         command: ProviderGroup,
     },
@@ -94,6 +76,10 @@ fn main() -> Result<()> {
         no_monitor: false,
     });
 
+    if !matches!(commands, Commands::Version) {
+        config::validate_config()?;
+    }
+
     match commands {
         Commands::Version => {
             println!("claude-code-proxy {}", VERSION);
@@ -102,7 +88,7 @@ fn main() -> Result<()> {
         Commands::Serve { port, no_monitor } => {
             let bind_address = config::bind_address();
             let effective_port = port.unwrap_or_else(config::port);
-            let registry = Registry::with_default_alias();
+            let registry = Registry::new();
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
@@ -159,7 +145,7 @@ fn main() -> Result<()> {
             }
         }
         Commands::Demo => {
-            let registry = Registry::with_default_alias();
+            let registry = Registry::new();
             tui::run_mock_monitor(config::port(), &registry)
         }
         Commands::Monitor { url } => {
@@ -182,14 +168,11 @@ fn main() -> Result<()> {
             tui::run_attached_monitor(|| monitor.snapshot(), url.to_string())?;
             Ok(())
         }
-        Commands::Models { full } => {
-            print_models(&Registry::with_default_alias(), full);
+        Commands::Models => {
+            print_models(&Registry::new());
             Ok(())
         }
-        Commands::Codex { command } => run_provider_cli("codex", command),
-        Commands::Kimi { command } => run_provider_cli("kimi", command),
-        Commands::Cursor { command } => run_provider_cli("cursor", command),
-        Commands::Grok { command } => run_provider_cli("grok", command),
+        Commands::Codex { command } => run_codex_cli(command),
     }
 }
 
@@ -286,11 +269,9 @@ fn select_serve_mode(stdout_is_tty: bool, no_monitor: bool) -> ServeMode {
     }
 }
 
-fn run_provider_cli(name: &str, command: ProviderGroup) -> Result<()> {
-    let registry = Registry::with_default_alias();
-    let provider = registry
-        .provider(name)
-        .ok_or_else(|| anyhow::anyhow!("unknown provider: {name}"))?;
+fn run_codex_cli(command: ProviderGroup) -> Result<()> {
+    let registry = Registry::new();
+    let provider = registry.provider("codex").expect("Codex is registered");
     let handlers = provider.cli();
     match command {
         ProviderGroup::Auth { command } => match command {
@@ -326,41 +307,11 @@ fn run_provider_cli(name: &str, command: ProviderGroup) -> Result<()> {
     }
 }
 
-fn print_models(registry: &Registry, full: bool) {
-    let grouped = registry.grouped_models();
-    for provider in ["codex", "kimi", "grok", "opencode", "cursor"] {
-        let Some(models) = grouped.get(provider) else {
-            continue;
-        };
-        if full || provider != "cursor" {
-            println!("{provider}: {}", models.join(", "));
-        } else {
-            println!("{provider}: {}", compact_cursor_list(models));
-        }
-    }
-}
-
-fn compact_cursor_list(models: &[String]) -> String {
-    let mut legacy = Vec::new();
-    let mut dynamic = Vec::new();
-    for model in models {
-        if !model.contains(':') {
-            legacy.push(model.clone());
-        } else {
-            dynamic.push(model.clone());
-        }
-    }
-    let mut out = String::new();
-    if !legacy.is_empty() {
-        out.push_str(&legacy.join(", "));
-        out.push_str("; ");
-    }
-    out.push_str(&format!("{} cursor model aliases", dynamic.len()));
-    if !dynamic.is_empty() {
-        out.push_str(", example: cursor:gpt-5.5");
-    }
-    out.push_str(" run `claude-code-proxy models --full` for all aliases");
-    out
+fn print_models(registry: &Registry) {
+    println!(
+        "codex: {}",
+        registry.supported_models_for("codex").join(", ")
+    );
 }
 
 fn listen_url(bind_address: &str, port: u16) -> String {
@@ -377,7 +328,7 @@ fn print_server_banner(bind_address: &str, port: u16, registry: &Registry) {
     if cfg.exists() {
         println!("Config: {}", cfg.display());
     }
-    print_models(registry, false);
+    print_models(registry);
     println!();
     println!("Configure Claude Code (pick a model from above):");
     println!("  export ANTHROPIC_BASE_URL=\"http://localhost:{port}\"");
@@ -385,11 +336,6 @@ fn print_server_banner(bind_address: &str, port: u16, registry: &Registry) {
     println!("  export ANTHROPIC_MODEL=\"gpt-6-sol\"");
     println!("  export ANTHROPIC_SMALL_FAST_MODEL=\"gpt-6-luna\"");
     println!("  export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1");
-}
-
-#[allow(dead_code)]
-fn alias_names() -> usize {
-    ANTHROPIC_STYLE_ALIASES.len()
 }
 
 #[cfg(test)]

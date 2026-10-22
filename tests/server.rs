@@ -5,9 +5,8 @@ use axum::response::IntoResponse;
 use claude_code_proxy::{
     MessagesRequest,
     anthropic::MAX_ANTHROPIC_REQUEST_BYTES,
-    config::AliasProvider,
     monitor::{MonitorHandle, RequestStatus},
-    provider::{CliHandlers, Generation, GenerationBody, Provider, ProviderError, RequestContext},
+    provider::{CliHandlers, Provider, RequestContext},
     registry::Registry,
     request_identity::ConversationIdentity,
     server::{
@@ -66,9 +65,16 @@ impl Provider for FakeProvider {
 
     async fn handle_messages(
         &self,
-        _body: MessagesRequest,
+        body: MessagesRequest,
         _ctx: RequestContext,
     ) -> axum::response::Response {
+        if body.stream {
+            return (
+                [("content-type", "text/event-stream")],
+                "event: message_start\ndata: {\"type\":\"message_start\"}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            )
+                .into_response();
+        }
         (StatusCode::NOT_IMPLEMENTED, "unused").into_response()
     }
 
@@ -79,115 +85,6 @@ impl Provider for FakeProvider {
     ) -> axum::response::Response {
         (StatusCode::NOT_IMPLEMENTED, "unused").into_response()
     }
-
-    async fn generate_anthropic_stream(
-        &self,
-        body: MessagesRequest,
-        _ctx: RequestContext,
-    ) -> Result<Generation, ProviderError> {
-        let model = body.model.unwrap_or_default();
-        let sse = format!(
-            "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_fake\",\"model\":{model:?},\"usage\":{{\"input_tokens\":2}}}}}}\n\nevent: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\nevent: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{name}\"}}}}\n\nevent: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\nevent: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":1}}}}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n",
-            name = self.name,
-        );
-        Ok(Generation {
-            body: GenerationBody::BufferedSse(sse.into()),
-            resolved_model: model,
-        })
-    }
-}
-
-struct TranslatingProvider {
-    name: &'static str,
-    model: &'static str,
-    captured: Arc<Mutex<Option<Value>>>,
-}
-
-#[async_trait]
-impl Provider for TranslatingProvider {
-    fn name(&self) -> &'static str {
-        self.name
-    }
-
-    fn supported_models(&self) -> Vec<String> {
-        vec![self.model.to_string()]
-    }
-
-    fn cli(&self) -> &'static dyn CliHandlers {
-        &FAKE_CLI
-    }
-
-    async fn handle_messages(
-        &self,
-        _body: MessagesRequest,
-        _ctx: RequestContext,
-    ) -> axum::response::Response {
-        (StatusCode::NOT_IMPLEMENTED, "unused").into_response()
-    }
-
-    async fn handle_count_tokens(
-        &self,
-        _body: MessagesRequest,
-        _ctx: RequestContext,
-    ) -> axum::response::Response {
-        (StatusCode::NOT_IMPLEMENTED, "unused").into_response()
-    }
-
-    async fn generate_anthropic_stream(
-        &self,
-        body: MessagesRequest,
-        _ctx: RequestContext,
-    ) -> Result<Generation, ProviderError> {
-        let translated = match self.name {
-            "kimi" => serde_json::to_value(
-                claude_code_proxy::providers::kimi::translate::request::translate_request(
-                    &body,
-                    claude_code_proxy::providers::kimi::translate::request::TranslateOptions {
-                        session_id: None,
-                    },
-                )
-                .unwrap(),
-            )
-            .unwrap(),
-            "grok" => serde_json::to_value(
-                claude_code_proxy::providers::grok::translate::request::translate_request(
-                    &body,
-                    self.model.to_string(),
-                )
-                .unwrap(),
-            )
-            .unwrap(),
-            _ => unreachable!(),
-        };
-        *self.captured.lock().unwrap() = Some(translated);
-        let sse = concat!(
-            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_fake\",\"model\":\"test\",\"usage\":{\"input_tokens\":1}}}\n\n",
-            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
-            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
-            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
-            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
-            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
-        );
-        Ok(Generation {
-            body: GenerationBody::BufferedSse(sse.into()),
-            resolved_model: self.model.to_string(),
-        })
-    }
-}
-
-fn translating_registry(
-    name: &'static str,
-    model: &'static str,
-    captured: Arc<Mutex<Option<Value>>>,
-) -> Arc<Registry> {
-    Arc::new(Registry::from_providers(
-        AliasProvider::Kimi,
-        vec![Arc::new(TranslatingProvider {
-            name,
-            model,
-            captured,
-        }) as Arc<dyn Provider>],
-    ))
 }
 
 type CapturedIdentity = (Option<ConversationIdentity>, Option<String>);
@@ -240,24 +137,11 @@ impl Provider for IdentityCaptureProvider {
     }
 }
 
-fn routed_registry() -> Arc<Registry> {
-    Arc::new(Registry::from_providers(
-        AliasProvider::Kimi,
-        vec![
-            Arc::new(FakeProvider {
-                name: "kimi",
-                models: vec!["kimi-k2.6".to_string()],
-            }) as Arc<dyn Provider>,
-            Arc::new(FakeProvider {
-                name: "grok",
-                models: vec!["grok-4.5".to_string()],
-            }),
-            Arc::new(FakeProvider {
-                name: "cursor",
-                models: vec!["cursor".to_string()],
-            }),
-        ],
-    ))
+fn failure_registry() -> Arc<Registry> {
+    Arc::new(Registry::from_providers([Arc::new(FakeProvider {
+        name: "codex",
+        models: vec!["gpt-5.5".to_string()],
+    }) as Arc<dyn Provider>]))
 }
 
 async fn call_identity_ingress(
@@ -286,10 +170,7 @@ async fn messages_ingress_forwards_only_strict_conversation_identity() {
     let provider = Arc::new(IdentityCaptureProvider {
         captured: captured.clone(),
     }) as Arc<dyn Provider>;
-    let app = app(Arc::new(Registry::from_providers(
-        AliasProvider::Codex,
-        [provider],
-    )));
+    let app = app(Arc::new(Registry::from_providers([provider])));
     let normal_body = || {
         json!({
             "model": "gpt-5.5",
@@ -428,7 +309,7 @@ async fn invalid_bind_address_is_actionable() {
 
 #[tokio::test]
 async fn healthz_returns_ok() {
-    let app = app(Arc::new(Registry::with_default_alias()));
+    let app = app(Arc::new(Registry::new()));
     let response = app
         .oneshot(
             Request::builder()
@@ -451,7 +332,7 @@ async fn healthz_returns_ok() {
 
 #[tokio::test]
 async fn invalid_json_request_is_json_error() {
-    let app = app(Arc::new(Registry::with_default_alias()));
+    let app = app(Arc::new(Registry::new()));
     let response = app
         .oneshot(
             Request::builder()
@@ -475,7 +356,7 @@ async fn invalid_json_request_is_json_error() {
 
 #[tokio::test]
 async fn empty_body_is_invalid_json() {
-    let app = app(Arc::new(Registry::with_default_alias()));
+    let app = app(Arc::new(Registry::new()));
     let response = app
         .oneshot(
             Request::builder()
@@ -491,7 +372,7 @@ async fn empty_body_is_invalid_json() {
 
 #[tokio::test]
 async fn unknown_model_returns_400_with_summary() {
-    let app = app(Arc::new(Registry::with_default_alias()));
+    let app = app(Arc::new(Registry::new()));
     let response = app
         .oneshot(
             Request::builder()
@@ -548,12 +429,11 @@ async fn messages_response(app: axum::Router, model: &str) -> axum::response::Re
 #[tokio::test]
 async fn successful_response_carries_a_request_id() {
     let registry = || {
-        Arc::new(Registry::from_providers(
-            AliasProvider::Codex,
-            [Arc::new(IdentityCaptureProvider {
+        Arc::new(Registry::from_providers([
+            Arc::new(IdentityCaptureProvider {
                 captured: Arc::new(Mutex::new(Vec::new())),
-            }) as Arc<dyn Provider>],
-        ))
+            }) as Arc<dyn Provider>,
+        ]))
     };
     let first = messages_response(app(registry()), "gpt-5.5").await;
     let second = messages_response(app(registry()), "gpt-5.5").await;
@@ -567,8 +447,7 @@ async fn successful_response_carries_a_request_id() {
 // the record most worth correlating with a proxy log.
 #[tokio::test]
 async fn rejected_request_carries_a_request_id() {
-    let response =
-        messages_response(app(Arc::new(Registry::with_default_alias())), "not-a-model").await;
+    let response = messages_response(app(Arc::new(Registry::new())), "not-a-model").await;
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert!(!request_id(&response).is_empty());
@@ -578,15 +457,66 @@ async fn rejected_request_carries_a_request_id() {
 // return path than a success.
 #[tokio::test]
 async fn provider_failure_response_carries_a_request_id() {
-    let response = messages_response(app(routed_registry()), "kimi-k2.6").await;
+    let response = messages_response(app(failure_registry()), "gpt-5.5").await;
 
     assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
     assert!(!request_id(&response).is_empty());
 }
 
 #[tokio::test]
+async fn message_stream_keeps_identity_and_monitor_lifecycle() {
+    for consume_body in [true, false] {
+        let monitor = MonitorHandle::new(10);
+        let response = app_with_monitor(failure_registry(), Some(monitor.clone()))
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "gpt-5.5",
+                            "stream": true,
+                            "messages": [{"role":"user", "content":"hello"}],
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "text/event-stream");
+        assert!(!request_id(&response).is_empty());
+        assert_eq!(monitor.snapshot().active.len(), 1);
+        if consume_body {
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let text = std::str::from_utf8(&bytes).unwrap();
+            assert!(text.contains("event: message_start"));
+            assert!(text.contains("event: message_stop"));
+        } else {
+            drop(response);
+        }
+        let snapshot = monitor.snapshot();
+        assert!(snapshot.active.is_empty());
+        assert_eq!(snapshot.recent.len(), 1);
+        assert_eq!(snapshot.recent[0].provider.as_deref(), Some("codex"));
+        assert_eq!(
+            snapshot.recent[0].status,
+            if consume_body {
+                RequestStatus::Completed
+            } else {
+                RequestStatus::Failed
+            }
+        );
+    }
+}
+
+#[tokio::test]
 async fn missing_model_returns_400() {
-    let app = app(Arc::new(Registry::with_default_alias()));
+    let app = app(Arc::new(Registry::new()));
     let response = app
         .oneshot(
             Request::builder()
@@ -639,7 +569,7 @@ fn padded_messages_body_without_model(total_len: usize) -> String {
 async fn messages_body_over_16mib_clears_size_gate() {
     const OLD_LIMIT: usize = 16 * 1024 * 1024;
     const { assert!(MAX_ANTHROPIC_REQUEST_BYTES > OLD_LIMIT) };
-    let app = app(Arc::new(Registry::with_default_alias()));
+    let app = app(Arc::new(Registry::new()));
     let response = app
         .oneshot(
             Request::builder()
@@ -665,7 +595,7 @@ async fn messages_body_over_16mib_clears_size_gate() {
 
 #[tokio::test]
 async fn messages_body_at_limit_clears_size_gate() {
-    let app = app(Arc::new(Registry::with_default_alias()));
+    let app = app(Arc::new(Registry::new()));
     let response = app
         .oneshot(
             Request::builder()
@@ -692,7 +622,7 @@ async fn messages_body_at_limit_clears_size_gate() {
 #[tokio::test]
 async fn anthropic_bodies_over_limit_return_request_too_large() {
     for path in ["/v1/messages", "/v1/messages/count_tokens"] {
-        let response = app(Arc::new(Registry::with_default_alias()))
+        let response = app(Arc::new(Registry::new()))
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
@@ -714,7 +644,7 @@ async fn anthropic_bodies_over_limit_return_request_too_large() {
 
 #[tokio::test]
 async fn known_model_reaches_codex_provider() {
-    let app = app(Arc::new(Registry::with_default_alias()));
+    let app = app(Arc::new(Registry::new()));
     let response = app
         .oneshot(
             Request::builder()
@@ -739,7 +669,7 @@ async fn known_model_reaches_codex_provider() {
 
 #[tokio::test]
 async fn count_tokens_routes_to_provider() {
-    let app = app(Arc::new(Registry::with_default_alias()));
+    let app = app(Arc::new(Registry::new()));
     let response = app
         .oneshot(
             Request::builder()
@@ -764,7 +694,7 @@ async fn count_tokens_routes_to_provider() {
 
 #[tokio::test]
 async fn context_window_hint_is_removed_before_provider_dispatch() {
-    let app = app(Arc::new(Registry::with_default_alias()));
+    let app = app(Arc::new(Registry::new()));
     let response = app
         .oneshot(
             Request::builder()
@@ -784,7 +714,7 @@ async fn context_window_hint_is_removed_before_provider_dispatch() {
 
 #[tokio::test]
 async fn opus_5_alias_routes_to_provider() {
-    let app = app(Arc::new(Registry::with_default_alias()));
+    let app = app(Arc::new(Registry::new()));
     let response = app
         .oneshot(
             Request::builder()
@@ -809,7 +739,7 @@ async fn image_routes_reject_variations_wrong_media_and_oversized_generation() {
         images_api: true,
         transcriptions_api: false,
     };
-    let variation = app_with_features(Arc::new(Registry::with_default_alias()), None, features)
+    let variation = app_with_features(Arc::new(Registry::new()), None, features)
         .oneshot(
             Request::builder()
                 .method(Method::POST)
@@ -821,7 +751,7 @@ async fn image_routes_reject_variations_wrong_media_and_oversized_generation() {
         .unwrap();
     assert_eq!(variation.status(), StatusCode::NOT_FOUND);
 
-    let wrong_media = app_with_features(Arc::new(Registry::with_default_alias()), None, features)
+    let wrong_media = app_with_features(Arc::new(Registry::new()), None, features)
         .oneshot(
             Request::builder()
                 .method(Method::POST)
@@ -834,7 +764,7 @@ async fn image_routes_reject_variations_wrong_media_and_oversized_generation() {
         .unwrap();
     assert_eq!(wrong_media.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
 
-    let oversized = app_with_features(Arc::new(Registry::with_default_alias()), None, features)
+    let oversized = app_with_features(Arc::new(Registry::new()), None, features)
         .oneshot(
             Request::builder()
                 .method(Method::POST)
@@ -849,10 +779,57 @@ async fn image_routes_reject_variations_wrong_media_and_oversized_generation() {
 }
 
 #[tokio::test]
-async fn monitor_tracks_image_endpoint_without_session_affinity() {
+async fn image_routes_reject_removed_backend_models() {
+    let app = app_with_features(
+        Arc::new(Registry::new()),
+        None,
+        AppFeatures {
+            images_api: true,
+            ..AppFeatures::default()
+        },
+    );
+    for path in ["/v1/images/generations", "/v1/images/edits"] {
+        for model in [
+            "kimi-k2.6",
+            "grok-4.6",
+            "cursor:gpt-5.5",
+            "opencode-go/kimi-k2.6",
+        ] {
+            let mut body = json!({"model": model, "prompt": "draw a cat"});
+            if path.ends_with("edits") {
+                body["images"] = json!([{"image_url": "data:image/png;base64,iVBORw0KGgo="}]);
+            }
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path} {model}");
+            let error = error_body(response).await;
+            assert_eq!(error["error"]["type"], "invalid_request_error");
+            assert_eq!(error["error"]["param"], "model");
+            assert!(
+                error["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Unsupported image model")
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn monitor_tracks_image_endpoint_without_session_sequence() {
     let monitor = MonitorHandle::new(10);
     let app = app_with_features(
-        Arc::new(Registry::with_default_alias()),
+        Arc::new(Registry::new()),
         Some(monitor.clone()),
         AppFeatures {
             responses_api: false,
@@ -887,7 +864,7 @@ async fn monitor_tracks_image_endpoint_without_session_affinity() {
 #[tokio::test]
 async fn image_edit_accepts_multipart_and_validates_fields() {
     let app = app_with_features(
-        Arc::new(Registry::with_default_alias()),
+        Arc::new(Registry::new()),
         None,
         AppFeatures {
             responses_api: false,
@@ -933,7 +910,7 @@ async fn image_edit_accepts_multipart_and_validates_fields() {
 #[tokio::test]
 async fn image_routes_are_independently_opt_in() {
     let disabled = app_with_features(
-        Arc::new(Registry::with_default_alias()),
+        Arc::new(Registry::new()),
         None,
         AppFeatures {
             responses_api: false,
@@ -955,7 +932,7 @@ async fn image_routes_are_independently_opt_in() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
     let enabled = app_with_features(
-        Arc::new(Registry::with_default_alias()),
+        Arc::new(Registry::new()),
         None,
         AppFeatures {
             responses_api: false,
@@ -980,7 +957,7 @@ async fn image_routes_are_independently_opt_in() {
 #[tokio::test]
 async fn transcription_route_is_independently_opt_in_and_validates_multipart() {
     let disabled = app_with_features(
-        Arc::new(Registry::with_default_alias()),
+        Arc::new(Registry::new()),
         None,
         AppFeatures {
             responses_api: false,
@@ -1001,7 +978,7 @@ async fn transcription_route_is_independently_opt_in_and_validates_multipart() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
     let enabled = app_with_features(
-        Arc::new(Registry::with_default_alias()),
+        Arc::new(Registry::new()),
         None,
         AppFeatures {
             responses_api: false,
@@ -1040,7 +1017,7 @@ async fn transcription_route_is_independently_opt_in_and_validates_multipart() {
 #[tokio::test]
 async fn transcription_route_rejects_non_audio_uploads() {
     let app = app_with_features(
-        Arc::new(Registry::with_default_alias()),
+        Arc::new(Registry::new()),
         None,
         AppFeatures {
             responses_api: false,
@@ -1071,7 +1048,7 @@ async fn transcription_route_rejects_non_audio_uploads() {
 
 #[tokio::test]
 async fn native_responses_route_is_disabled_by_default_option() {
-    let app = app_with_options(Arc::new(Registry::with_default_alias()), None, false);
+    let app = app_with_options(Arc::new(Registry::new()), None, false);
     let response = app
         .oneshot(
             Request::builder()
@@ -1089,7 +1066,7 @@ async fn native_responses_route_is_disabled_by_default_option() {
 
 #[tokio::test]
 async fn enabled_native_responses_route_uses_openai_errors() {
-    let app = app_with_options(Arc::new(Registry::with_default_alias()), None, true);
+    let app = app_with_options(Arc::new(Registry::new()), None, true);
     let response = app
         .oneshot(
             Request::builder()
@@ -1115,7 +1092,7 @@ async fn enabled_native_responses_route_uses_openai_errors() {
 
 #[tokio::test]
 async fn chat_completions_route_uses_responses_api_gate() {
-    let disabled = app_with_options(Arc::new(Registry::with_default_alias()), None, false);
+    let disabled = app_with_options(Arc::new(Registry::new()), None, false);
     let response = disabled
         .oneshot(
             Request::builder()
@@ -1131,7 +1108,7 @@ async fn chat_completions_route_uses_responses_api_gate() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
-    let enabled = app_with_options(Arc::new(Registry::with_default_alias()), None, true);
+    let enabled = app_with_options(Arc::new(Registry::new()), None, true);
     let response = enabled
         .oneshot(
             Request::builder()
@@ -1155,188 +1132,80 @@ async fn chat_completions_route_uses_responses_api_gate() {
 }
 
 #[tokio::test]
-async fn openai_routes_select_non_codex_providers_and_aliases() {
-    for (uri, request, expected) in [
-        (
-            "/v1/chat/completions",
-            json!({"model":"kimi-k2.6","messages":[{"role":"user","content":"hello"}]}),
-            "kimi",
-        ),
-        (
-            "/v1/responses",
-            json!({"model":"grok-4.5","input":"hello"}),
-            "grok",
-        ),
-        (
-            "/v1/chat/completions",
-            json!({"model":"cursor:gpt-5.5","messages":[{"role":"user","content":"hello"}]}),
-            "cursor",
-        ),
-        (
-            "/v1/responses",
-            json!({"model":"sonnet","input":"hello"}),
-            "kimi",
-        ),
+async fn removed_backend_models_are_rejected_on_all_text_surfaces() {
+    let app = app_with_options(Arc::new(Registry::new()), None, true);
+    for path in [
+        "/v1/messages",
+        "/v1/messages/count_tokens",
+        "/v1/responses",
+        "/v1/chat/completions",
     ] {
-        let response = app_with_options(routed_registry(), None, true)
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri(uri)
-                    .header("content-type", "application/json")
-                    .body(body_string(&request.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK, "{uri} {request}");
-        let value: Value = serde_json::from_slice(
-            &axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        let text = if uri.ends_with("responses") {
-            value["output"][0]["content"][0]["text"].as_str()
-        } else {
-            value["choices"][0]["message"]["content"].as_str()
-        };
-        assert_eq!(text, Some(expected));
-    }
-}
-
-#[tokio::test]
-async fn openai_routes_preserve_serial_tool_calls_upstream() {
-    for (provider, model, uri, body, expected_choice) in [
-        (
-            "kimi",
+        for model in [
             "kimi-k2.6",
-            "/v1/chat/completions",
-            json!({
-                "model":"kimi-k2.6",
-                "messages":[{"role":"user","content":"look up x"}],
-                "tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],
-                "tool_choice":{"type":"function","function":{"name":"lookup"}},
-                "parallel_tool_calls":false
-            }),
-            json!({"type":"function","function":{"name":"lookup"}}),
-        ),
-        (
-            "grok",
-            "grok-4.5",
-            "/v1/responses",
-            json!({
-                "model":"grok-4.5",
-                "input":"look up x",
-                "tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],
-                "tool_choice":"none",
-                "parallel_tool_calls":false
-            }),
-            json!("none"),
-        ),
-    ] {
-        let captured = Arc::new(Mutex::new(None));
-        let response = app_with_options(
-            translating_registry(provider, model, captured.clone()),
-            None,
-            true,
-        )
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri(uri)
-                .header("content-type", "application/json")
-                .body(body_string(&body.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let translated = captured.lock().unwrap().clone().unwrap();
-        assert_eq!(translated["parallel_tool_calls"], false);
-        assert_eq!(translated["tool_choice"], expected_choice);
+            "kimi-for-coding",
+            "grok-4.6",
+            "cursor",
+            "cursor:gpt-5.5",
+            "opencode-go/kimi-k2.6",
+            "opencode-go/gpt-5.6-luna",
+            "opencode-go/grok-4.5",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({
+                                "model": model,
+                                "messages": [{"role":"user", "content":"hello"}],
+                                "input": "hello",
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path} {model}");
+            assert!(!request_id(&response).is_empty());
+            let body = error_body(response).await;
+            assert_eq!(body["error"]["type"], "invalid_request_error");
+            assert!(
+                body["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Unknown model")
+            );
+        }
     }
 }
 
 #[tokio::test]
-async fn routed_openai_streams_use_surface_specific_events() {
-    let chat = app_with_options(routed_registry(), None, true)
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .body(body_string(
-                    r#"{"model":"kimi-k2.6","stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"hello"}]}"#,
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let chat = String::from_utf8(
-        axum::body::to_bytes(chat.into_body(), usize::MAX)
-            .await
-            .unwrap()
-            .to_vec(),
-    )
-    .unwrap();
-    assert!(chat.contains("chat.completion.chunk"));
-    assert!(chat.contains("\"total_tokens\":3"));
-    assert!(chat.ends_with("data: [DONE]\n\n"));
-
-    let responses = app_with_options(routed_registry(), None, true)
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri("/v1/responses")
-                .header("content-type", "application/json")
-                .body(body_string(
-                    r#"{"model":"grok-4.5","stream":true,"input":"hello"}"#,
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let responses = String::from_utf8(
-        axum::body::to_bytes(responses.into_body(), usize::MAX)
-            .await
-            .unwrap()
-            .to_vec(),
-    )
-    .unwrap();
-    assert!(responses.contains("event: response.created"));
-    assert!(responses.contains("event: response.completed"));
-    assert!(responses.contains("\"sequence_number\":0"));
-}
-
-#[tokio::test]
-async fn non_codex_validation_uses_openai_errors_before_generation() {
+async fn native_validation_does_not_record_a_session_or_provider() {
     let monitor = MonitorHandle::new(10);
-    let response = app_with_options(routed_registry(), Some(monitor.clone()), true)
+    let response = app_with_options(Arc::new(Registry::new()), Some(monitor.clone()), true)
         .oneshot(
             Request::builder()
                 .method(Method::POST)
                 .uri("/v1/chat/completions")
                 .header("content-type", "application/json")
-                .header("x-client-request-id", "invalid-routed-request")
+                .header("x-client-request-id", "invalid-native-request")
                 .body(body_string(
-                    r#"{"model":"kimi-k2.6","messages":[{"role":"user","content":"hello"}],"temperature":0.5}"#,
+                    r#"{"model":"gpt-5.5","messages":[{"role":"user","content":"hello"}],"max_tokens":100}"#,
                 ))
                 .unwrap(),
         )
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let value: Value = serde_json::from_slice(
-        &axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(value["error"]["param"], "temperature");
+    let value = error_body(response).await;
+    assert_eq!(value["error"]["param"], "max_tokens");
     assert_eq!(value["error"]["code"], "unsupported_parameter");
     assert!(
-        claude_code_proxy::session::existing_session_now(Some("invalid-routed-request")).is_none()
+        claude_code_proxy::session::existing_session_now(Some("invalid-native-request")).is_none()
     );
     let snapshot = monitor.snapshot();
     assert_eq!(snapshot.recent[0].session_seq, None);
@@ -1344,8 +1213,34 @@ async fn non_codex_validation_uses_openai_errors_before_generation() {
 }
 
 #[tokio::test]
+async fn openai_bodies_over_limit_return_request_too_large() {
+    for path in ["/v1/responses", "/v1/chat/completions"] {
+        let response = app_with_options(Arc::new(Registry::new()), None, true)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .body(Body::from(vec![
+                        b'x';
+                        claude_code_proxy::openai_compat::MAX_OPENAI_REQUEST_BYTES
+                            + 1
+                    ]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(!request_id(&response).is_empty());
+        let body = error_body(response).await;
+        assert_eq!(body["error"]["code"], "request_too_large");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+    }
+}
+
+#[tokio::test]
 async fn chat_completions_validation_returns_openai_parameter_errors() {
-    let app = app_with_options(Arc::new(Registry::with_default_alias()), None, true);
+    let app = app_with_options(Arc::new(Registry::new()), None, true);
     let response = app
         .oneshot(
             Request::builder()
@@ -1372,7 +1267,7 @@ async fn chat_completions_validation_returns_openai_parameter_errors() {
 
 #[tokio::test]
 async fn unknown_routes_use_anthropic_not_found_error() {
-    let app = app(Arc::new(Registry::with_default_alias()));
+    let app = app(Arc::new(Registry::new()));
     let response = app
         .oneshot(
             Request::builder()
@@ -1395,10 +1290,7 @@ async fn unknown_routes_use_anthropic_not_found_error() {
 #[tokio::test]
 async fn monitor_records_successful_request_events() {
     let monitor = MonitorHandle::new(10);
-    let app = app_with_monitor(
-        Arc::new(Registry::with_default_alias()),
-        Some(monitor.clone()),
-    );
+    let app = app_with_monitor(Arc::new(Registry::new()), Some(monitor.clone()));
     let response = app
         .oneshot(
             Request::builder()
@@ -1443,10 +1335,7 @@ async fn monitor_records_successful_request_events() {
 #[tokio::test]
 async fn monitor_records_invalid_json_failure() {
     let monitor = MonitorHandle::new(10);
-    let app = app_with_monitor(
-        Arc::new(Registry::with_default_alias()),
-        Some(monitor.clone()),
-    );
+    let app = app_with_monitor(Arc::new(Registry::new()), Some(monitor.clone()));
     let response = app
         .oneshot(
             Request::builder()
@@ -1470,10 +1359,7 @@ async fn monitor_records_invalid_json_failure() {
 #[tokio::test]
 async fn monitor_records_unknown_model_failure() {
     let monitor = MonitorHandle::new(10);
-    let app = app_with_monitor(
-        Arc::new(Registry::with_default_alias()),
-        Some(monitor.clone()),
-    );
+    let app = app_with_monitor(Arc::new(Registry::new()), Some(monitor.clone()));
     let response = app
         .oneshot(
             Request::builder()
@@ -1519,7 +1405,7 @@ async fn get_models(app: axum::Router, uri: &str) -> (StatusCode, Value) {
 
 #[tokio::test]
 async fn models_endpoint_lists_supported_models() {
-    let app = app(Arc::new(Registry::with_default_alias()));
+    let app = app(Arc::new(Registry::new()));
     let (status, value) = get_models(app, "/v1/models").await;
 
     assert_eq!(status, StatusCode::OK);
@@ -1532,7 +1418,11 @@ async fn models_endpoint_lists_supported_models() {
     assert!(ids.contains(&"gpt-6-astra-ultrafast"));
     assert!(ids.contains(&"gpt-6.1-sol-ultrafast"));
     assert!(!ids.contains(&"gpt-6-sol-ultrafast"));
-    assert!(ids.contains(&"grok-4.6"));
+    assert!(!ids.iter().any(|id| {
+        ["kimi", "grok", "cursor", "opencode"]
+            .iter()
+            .any(|prefix| id.starts_with(prefix))
+    }));
     for entry in data {
         assert_eq!(entry["type"], "model");
         assert!(entry["display_name"].as_str().is_some());
@@ -1547,7 +1437,7 @@ async fn models_endpoint_includes_claude_prefixed_aliases_for_discovery() {
     // Claude Code's gateway model discovery ignores ids that don't start with
     // "claude" or "anthropic", so the alias entries are what make
     // CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 useful at all.
-    let app = app(Arc::new(Registry::with_default_alias()));
+    let app = app(Arc::new(Registry::new()));
     let (status, value) = get_models(app, "/v1/models?limit=1000").await;
 
     assert_eq!(status, StatusCode::OK);
@@ -1563,7 +1453,7 @@ async fn models_endpoint_includes_claude_prefixed_aliases_for_discovery() {
 
 #[tokio::test]
 async fn models_endpoint_respects_limit() {
-    let app = app(Arc::new(Registry::with_default_alias()));
+    let app = app(Arc::new(Registry::new()));
     let (status, value) = get_models(app, "/v1/models?limit=2").await;
 
     assert_eq!(status, StatusCode::OK);
@@ -1575,7 +1465,7 @@ async fn models_endpoint_respects_limit() {
 
 #[tokio::test]
 async fn models_endpoint_tolerates_unknown_query_params() {
-    let app = app(Arc::new(Registry::with_default_alias()));
+    let app = app(Arc::new(Registry::new()));
     let (status, _) = get_models(app, "/v1/models?limit=1000&after_id=x").await;
     assert_eq!(status, StatusCode::OK);
 }

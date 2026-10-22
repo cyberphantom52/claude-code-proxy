@@ -1,5 +1,5 @@
 use assert_cmd::Command;
-use predicates::str::contains;
+use predicates::{prelude::PredicateBooleanExt, str::contains};
 use std::env;
 #[cfg(unix)]
 use std::{
@@ -27,18 +27,26 @@ fn version_aliases_print_expected_version() -> Result<(), Box<dyn std::error::Er
 }
 
 #[test]
-fn models_prints_all_providers() -> Result<(), Box<dyn std::error::Error>> {
-    let mut cmd = Command::cargo_bin("claude-code-proxy")?;
-    cmd.arg("models");
-    let out = String::from_utf8(cmd.output()?.stdout)?;
-    assert!(out.contains("codex:"));
-    assert!(out.contains("kimi:"));
-    assert!(out.contains("opencode:"));
-    assert!(out.contains("cursor:"));
-
-    let mut cmd = Command::cargo_bin("claude-code-proxy")?;
-    cmd.args(["models", "--full"]);
-    cmd.output()?;
+fn models_prints_only_codex_models() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = TempDir::new()?;
+    let output = Command::cargo_bin("claude-code-proxy")?
+        .arg("models")
+        .env("CCP_CONFIG_DIR", temp.path())
+        .env_remove("CCP_ALIAS_PROVIDER")
+        .output()?;
+    assert!(output.status.success());
+    let out = String::from_utf8(output.stdout)?;
+    assert!(out.starts_with("codex: "));
+    assert_eq!(out.lines().count(), 1);
+    for removed in ["kimi", "grok", "cursor", "opencode", "composer-2.5"] {
+        assert!(!out.contains(removed), "{out}");
+    }
+    assert!(out.contains("gpt-6-sol"));
+    assert!(out.contains("haiku"));
+    Command::cargo_bin("claude-code-proxy")?
+        .args(["models", "--full"])
+        .assert()
+        .code(2);
     Ok(())
 }
 
@@ -53,11 +61,8 @@ fn help_describes_visible_commands_and_hides_demo() -> Result<(), Box<dyn std::e
     for description in [
         "Print version information",
         "Start the proxy server and monitor",
-        "List supported provider models",
+        "List supported Codex models",
         "Manage Codex authentication",
-        "Manage Kimi authentication",
-        "Manage Cursor authentication",
-        "Manage Grok authentication",
     ] {
         assert!(stdout.contains(description), "missing: {description}");
     }
@@ -77,37 +82,72 @@ fn invalid_command_exits_two() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn unsupported_provider_auth_command_exits_two() -> Result<(), Box<dyn std::error::Error>> {
-    let mut cmd = Command::cargo_bin("claude-code-proxy")?;
-    cmd.args(["cursor", "auth", "device"]);
-    let output = cmd.output()?;
-    assert_eq!(output.status.code(), Some(2));
-    let out = String::from_utf8(output.stderr)?;
-    assert!(out.contains("not yet implemented") || out.contains("unsupported"));
-    Ok(())
-}
-
-#[test]
-fn provider_logout_without_auth_is_success() -> Result<(), Box<dyn std::error::Error>> {
+fn removed_backend_commands_are_rejected_without_deleting_auth()
+-> Result<(), Box<dyn std::error::Error>> {
     let temp = TempDir::new()?;
-    let mut cmd = Command::cargo_bin("claude-code-proxy")?;
-    cmd.args(["kimi", "auth", "logout"]);
-    cmd.env("CCP_CONFIG_DIR", temp.path());
-    cmd.assert().success();
+    for backend in ["kimi", "grok", "cursor", "opencode"] {
+        let auth_path = temp.path().join(backend).join("auth.json");
+        std::fs::create_dir_all(auth_path.parent().unwrap())?;
+        std::fs::write(&auth_path, "existing credentials")?;
+        for action in ["login", "device", "status", "logout"] {
+            Command::cargo_bin("claude-code-proxy")?
+                .args([backend, "auth", action])
+                .env("CCP_CONFIG_DIR", temp.path())
+                .assert()
+                .code(2)
+                .stderr(contains("unrecognized subcommand"));
+            assert_eq!(std::fs::read_to_string(&auth_path)?, "existing credentials");
+        }
+    }
+    Command::cargo_bin("claude-code-proxy")?
+        .args(["codex", "auth", "logout"])
+        .env("CCP_CONFIG_DIR", temp.path())
+        .env("HOME", temp.path())
+        .env_remove("CCP_ALIAS_PROVIDER")
+        .assert()
+        .success();
+    for backend in ["kimi", "grok", "cursor", "opencode"] {
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join(backend).join("auth.json"))?,
+            "existing credentials"
+        );
+    }
     Ok(())
 }
 
 #[test]
-fn models_output_is_stable_order() -> Result<(), Box<dyn std::error::Error>> {
-    let mut cmd = Command::cargo_bin("claude-code-proxy")?;
-    cmd.args(["models", "--full"]);
-    let output = cmd.output()?;
-    let out = String::from_utf8(output.stdout)?;
-    let codex_pos = out.find("codex:").unwrap_or(0);
-    let kimi_pos = out.find("kimi:").unwrap_or(0);
-    let cursor_pos = out.find("cursor:").unwrap_or(0);
-    assert!(codex_pos < kimi_pos);
-    assert!(kimi_pos < cursor_pos);
+fn stale_alias_selection_fails_with_migration_error() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = TempDir::new()?;
+    Command::cargo_bin("claude-code-proxy")?
+        .arg("models")
+        .env("CCP_CONFIG_DIR", temp.path())
+        .env("CCP_ALIAS_PROVIDER", "kimi")
+        .assert()
+        .failure()
+        .stderr(contains("CCP_ALIAS_PROVIDER").and(contains("ChatGPT subscription")));
+    std::fs::write(
+        temp.path().join("config.json"),
+        r#"{"aliasProvider":"kimi"}"#,
+    )?;
+    Command::cargo_bin("claude-code-proxy")?
+        .args(["serve", "--no-monitor", "--port", "0"])
+        .env("CCP_CONFIG_DIR", temp.path())
+        .env_remove("CCP_ALIAS_PROVIDER")
+        .assert()
+        .failure()
+        .stderr(contains("aliasProvider").and(contains("ChatGPT subscription")));
+    Ok(())
+}
+
+#[test]
+fn codex_browser_and_device_auth_commands_remain_available()
+-> Result<(), Box<dyn std::error::Error>> {
+    for action in ["login", "device"] {
+        Command::cargo_bin("claude-code-proxy")?
+            .args(["codex", "auth", action, "--help"])
+            .assert()
+            .success();
+    }
     Ok(())
 }
 
@@ -189,17 +229,20 @@ fn plain_service_exits_on_second_signal(signal: &str) -> Result<(), Box<dyn std:
     });
 
     let config = TempDir::new()?;
-    let auth_dir = config.path().join("kimi");
+    let auth_dir = config.path().join("codex");
     std::fs::create_dir_all(&auth_dir)?;
     std::fs::write(
         auth_dir.join("auth.json"),
-        r#"{"access":"test","refresh":"test","expires":4102444800000,"scope":"openid","userId":"test"}"#,
+        r#"{"access":"test","refresh":"test","expires":4102444800000,"accountId":"test"}"#,
     )?;
     let port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
     let child = std::process::Command::new(env!("CARGO_BIN_EXE_claude-code-proxy"))
         .args(["serve", "--no-monitor", "--port", &port.to_string()])
         .env("CCP_CONFIG_DIR", config.path())
-        .env("CCP_KIMI_BASE_URL", upstream_url)
+        .env("CCP_CODEX_BASE_URL", upstream_url)
+        .env("CCP_CODEX_TRANSPORT", "http")
+        .env("HOME", config.path())
+        .env_remove("CCP_ALIAS_PROVIDER")
         .env("NO_PROXY", "127.0.0.1,localhost")
         .env("no_proxy", "127.0.0.1,localhost")
         .stdin(Stdio::null())
@@ -208,7 +251,8 @@ fn plain_service_exits_on_second_signal(signal: &str) -> Result<(), Box<dyn std:
         .spawn()?;
     let mut child = ChildGuard(child);
     let mut downstream = wait_for_service(&mut child, port)?;
-    let body = br#"{"model":"kimi-for-coding","max_tokens":64,"messages":[{"role":"user","content":"hello"}]}"#;
+    let body =
+        br#"{"model":"gpt-5.4","max_tokens":64,"messages":[{"role":"user","content":"hello"}]}"#;
     write!(
         downstream,
         "POST /v1/messages HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
@@ -239,20 +283,4 @@ fn plain_service_exits_on_second_ctrl_c() -> Result<(), Box<dyn std::error::Erro
 #[test]
 fn plain_service_exits_on_second_sigterm() -> Result<(), Box<dyn std::error::Error>> {
     plain_service_exits_on_second_signal("-TERM")
-}
-
-#[test]
-fn kimi_auth_status_reads_stored_auth() -> Result<(), Box<dyn std::error::Error>> {
-    let temp = TempDir::new()?;
-    let auth_dir = temp.path().join("kimi");
-    std::fs::create_dir_all(&auth_dir)?;
-    std::fs::write(
-        auth_dir.join("auth.json"),
-        r#"{"access":"a","refresh":"r","expires":4102444800000,"scope":"openid","userId":"u"}"#,
-    )?;
-    let mut cmd = Command::cargo_bin("claude-code-proxy")?;
-    cmd.args(["kimi", "auth", "status"]);
-    cmd.env("CCP_CONFIG_DIR", temp.path());
-    cmd.assert().success().stdout(contains("User: u"));
-    Ok(())
 }

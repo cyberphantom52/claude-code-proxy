@@ -1,5 +1,4 @@
 use claude_code_proxy::{
-    config::AliasProvider,
     providers::codex::{
         native::validate_native_request_model,
         translate::model_allowlist::{
@@ -25,14 +24,11 @@ fn catalog_models_route_with_fast_tiers_and_preserve_builtins() {
     .unwrap();
     // This integration test has its own process and only reads synthetic model data.
     unsafe { std::env::set_var("CODEX_HOME", home.path()) };
-    let registry = Registry::new(AliasProvider::Codex);
+    let registry = Registry::new();
     for model in ["gpt-catalog-test", "gpt-hidden-test"] {
         assert_allowed_model(model).unwrap();
         for name in [model.to_string(), format!("{model}-fast")] {
-            assert_eq!(
-                registry.provider_for_model(&name, None).unwrap().name(),
-                "codex"
-            );
+            assert_eq!(registry.provider_for_model(&name).unwrap().name(), "codex");
             assert_eq!(
                 validate_native_request_model(&json!({"model": name})).unwrap(),
                 name
@@ -48,7 +44,7 @@ fn catalog_models_route_with_fast_tiers_and_preserve_builtins() {
     assert!(assert_allowed_model("gpt-unavailable-test").is_err());
     assert!(
         registry
-            .provider_for_model("gpt-unavailable-test", None)
+            .provider_for_model("gpt-unavailable-test")
             .is_none()
     );
     let listed = registry.supported_models_for("codex");
