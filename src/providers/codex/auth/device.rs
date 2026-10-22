@@ -65,20 +65,47 @@ impl DeviceAuthClient {
             client: reqwest::blocking::Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
-                .unwrap_or_default(),
+                .expect("failed to create device OAuth client"),
             sleeper: Box::new(StdSleeper),
             max_wait: MAX_DEVICE_POLL_WAIT,
         }
     }
 
+    fn deadline(&self) -> Result<Instant, anyhow::Error> {
+        Instant::now()
+            .checked_add(self.max_wait)
+            .ok_or_else(|| anyhow::anyhow!("Device auth timeout is too large"))
+    }
+
+    fn remaining(deadline: Instant) -> Result<Duration, anyhow::Error> {
+        deadline
+            .checked_duration_since(Instant::now())
+            .filter(|duration| !duration.is_zero())
+            .map(|duration| duration.min(Duration::from_secs(30)))
+            .ok_or_else(|| anyhow::anyhow!("Device auth timed out"))
+    }
+
+    fn request_error(stage: &str, error: reqwest::Error) -> anyhow::Error {
+        if error.is_timeout() {
+            anyhow::anyhow!("Device auth timed out ({stage})")
+        } else {
+            anyhow::anyhow!("{stage}: {error}")
+        }
+    }
+
     pub fn init(&self) -> Result<DeviceInit, anyhow::Error> {
+        self.init_until(self.deadline()?)
+    }
+
+    fn init_until(&self, deadline: Instant) -> Result<DeviceInit, anyhow::Error> {
         let body = serde_json::json!({ "client_id": CLIENT_ID });
         let resp = self
             .client
             .post(format!("{}/api/accounts/deviceauth/usercode", self.issuer))
+            .timeout(Self::remaining(deadline)?)
             .json(&body)
             .send()
-            .map_err(|e| anyhow::anyhow!("Device init network error: {e}"))?;
+            .map_err(|e| Self::request_error("Device init network error", e))?;
 
         let status = resp.status().as_u16();
         if !resp.status().is_success() {
@@ -88,7 +115,7 @@ impl DeviceAuthClient {
 
         let init: DeviceInit = resp
             .json()
-            .map_err(|e| anyhow::anyhow!("failed to parse device init response: {e}"))?;
+            .map_err(|e| Self::request_error("failed to parse device init response", e))?;
         Ok(init)
     }
 
@@ -96,6 +123,7 @@ impl DeviceAuthClient {
         &self,
         device_auth_id: &str,
         user_code: &str,
+        deadline: Instant,
     ) -> Result<Option<DeviceTokenPoll>, anyhow::Error> {
         let body = serde_json::json!({
             "device_auth_id": device_auth_id,
@@ -104,15 +132,16 @@ impl DeviceAuthClient {
         let resp = self
             .client
             .post(format!("{}/api/accounts/deviceauth/token", self.issuer))
+            .timeout(Self::remaining(deadline)?)
             .json(&body)
             .send()
-            .map_err(|e| anyhow::anyhow!("Device poll network error: {e}"))?;
+            .map_err(|e| Self::request_error("Device poll network error", e))?;
 
         let status = resp.status().as_u16();
         if resp.status().is_success() {
             let poll: DeviceTokenPoll = resp
                 .json()
-                .map_err(|e| anyhow::anyhow!("failed to parse device poll response: {e}"))?;
+                .map_err(|e| Self::request_error("failed to parse device poll response", e))?;
             return Ok(Some(poll));
         }
         if status == 403 || status == 404 {
@@ -126,6 +155,7 @@ impl DeviceAuthClient {
         &self,
         code: &str,
         code_verifier: &str,
+        deadline: Instant,
     ) -> Result<TokenResponse, anyhow::Error> {
         let form = [
             ("grant_type", "authorization_code"),
@@ -140,9 +170,10 @@ impl DeviceAuthClient {
         let resp = self
             .client
             .post(format!("{}/oauth/token", self.issuer))
+            .timeout(Self::remaining(deadline)?)
             .form(&form)
             .send()
-            .map_err(|e| anyhow::anyhow!("Token exchange network error: {e}"))?;
+            .map_err(|e| Self::request_error("Token exchange network error", e))?;
 
         let status = resp.status().as_u16();
         if !resp.status().is_success() {
@@ -152,23 +183,34 @@ impl DeviceAuthClient {
 
         let tokens: TokenResponse = resp
             .json()
-            .map_err(|e| anyhow::anyhow!("failed to parse token exchange response: {e}"))?;
+            .map_err(|e| Self::request_error("failed to parse token exchange response", e))?;
         Ok(tokens)
     }
 
     fn parse_interval(interval: &str) -> Duration {
-        let ms = match interval.parse::<i64>() {
-            Ok(v) if v > 0 => v as u64 * 1000,
-            Ok(0) => 5000,
-            Ok(v) if v < 0 => 1000,
-            Ok(_) => 5000,
-            Err(_) => 5000,
+        let digits = interval.strip_prefix('+').unwrap_or(interval);
+        let ms = if !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            let seconds = digits.bytes().fold(0_u64, |value, byte| {
+                value
+                    .saturating_mul(10)
+                    .saturating_add(u64::from(byte - b'0'))
+            });
+            if seconds == 0 {
+                5000
+            } else {
+                seconds.saturating_mul(1000)
+            }
+        } else if interval.parse::<i64>().is_ok_and(|value| value < 0) {
+            1000
+        } else {
+            5000
         };
         Duration::from_millis(ms)
     }
 
     pub fn run(&self) -> Result<TokenResponse, anyhow::Error> {
-        let init = self.init()?;
+        let deadline = self.deadline()?;
+        let init = self.init_until(deadline)?;
 
         println!(
             "\nVisit: {}/codex/device\nEnter code: {}\n",
@@ -176,8 +218,7 @@ impl DeviceAuthClient {
         );
 
         let sleep_dur = Self::parse_interval(&init.interval)
-            + Duration::from_millis(DEVICE_POLL_SAFETY_MARGIN_MS);
-        let deadline = Instant::now() + self.max_wait;
+            .saturating_add(Duration::from_millis(DEVICE_POLL_SAFETY_MARGIN_MS));
 
         loop {
             if Instant::now() >= deadline {
@@ -187,14 +228,18 @@ impl DeviceAuthClient {
                 );
             }
 
-            match self.poll_token(&init.device_auth_id, &init.user_code)? {
+            match self.poll_token(&init.device_auth_id, &init.user_code, deadline)? {
                 Some(poll) => {
-                    let tokens =
-                        self.exchange_code(&poll.authorization_code, &poll.code_verifier)?;
+                    let tokens = self.exchange_code(
+                        &poll.authorization_code,
+                        &poll.code_verifier,
+                        deadline,
+                    )?;
                     return Ok(tokens);
                 }
                 None => {
-                    self.sleeper.sleep(sleep_dur);
+                    self.sleeper
+                        .sleep(sleep_dur.min(deadline.saturating_duration_since(Instant::now())));
                 }
             }
         }
@@ -590,6 +635,82 @@ mod tests {
         assert!(saw_init.load(Ordering::Relaxed));
         assert!(saw_poll_404.load(Ordering::Relaxed));
         assert!(saw_exchange.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn device_flow_bounds_every_http_stage_by_one_deadline() {
+        for stage in ["/usercode", "/deviceauth/token", "/oauth/token"] {
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let release = Mutex::new(release_rx);
+            let server = test_http::spawn_mock_server(
+                "synthetic deadline endpoint",
+                move |request| {
+                    if request.contains(stage) {
+                        release
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(3))
+                            .unwrap();
+                    }
+                    if request.contains("/usercode") {
+                        test_http::json_response(
+                            200,
+                            r#"{"device_auth_id":"synthetic","user_code":"synthetic","interval":"1"}"#,
+                        )
+                    } else if request.contains("/deviceauth/token") {
+                        test_http::json_response(
+                            200,
+                            r#"{"authorization_code":"synthetic","code_verifier":"synthetic"}"#,
+                        )
+                    } else {
+                        test_http::json_response(
+                            200,
+                            r#"{"access_token":"synthetic","refresh_token":"synthetic"}"#,
+                        )
+                    }
+                },
+            );
+            let mut client = DeviceAuthClient::with_issuer(&server.url);
+            client.max_wait = Duration::from_millis(150);
+            let start = Instant::now();
+            assert!(client.run().is_err(), "stalled stage: {stage}");
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "stalled stage: {stage}"
+            );
+            release_tx.send(()).unwrap();
+            drop(server);
+        }
+    }
+
+    #[test]
+    fn oversized_interval_sleeps_only_until_remaining_deadline() {
+        let server = test_http::spawn_mock_server(
+            "synthetic oversized interval endpoint",
+            |request| {
+                if request.contains("/usercode") {
+                    test_http::json_response(
+                        200,
+                        r#"{"device_auth_id":"synthetic","user_code":"synthetic","interval":"9999999999999999999999999999999999999999999"}"#,
+                    )
+                } else {
+                    test_http::json_response(403, "{}")
+                }
+            },
+        );
+        let mut client = DeviceAuthClient::with_issuer(&server.url);
+        client.max_wait = Duration::from_millis(150);
+        let start = Instant::now();
+        assert!(client.run().unwrap_err().to_string().contains("timed out"));
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert_eq!(
+            DeviceAuthClient::parse_interval("9223372036854775807"),
+            Duration::from_millis(u64::MAX)
+        );
+        assert_eq!(
+            DeviceAuthClient::parse_interval("9999999999999999999999999999999999999999999"),
+            Duration::from_millis(u64::MAX)
+        );
     }
 
     #[test]

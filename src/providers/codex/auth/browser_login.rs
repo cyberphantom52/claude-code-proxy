@@ -6,7 +6,7 @@ use std::time::Duration;
 use super::constants::{ISSUER, OAUTH_PORT};
 use super::jwt::TokenResponse;
 use super::pkce::{
-    PkceCodes, build_authorize_url, exchange_code_for_tokens, generate_pkce, generate_state,
+    PkceCodes, build_authorize_url, exchange_code_for_tokens_until, generate_pkce, generate_state,
 };
 
 const BROWSER_LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
@@ -65,7 +65,25 @@ fn extract_request_path_and_query(stream: &mut TcpStream) -> Option<(String, Str
     Some((path, query))
 }
 
-fn write_response(stream: &mut TcpStream, status: u16, content_type: &str, body: &str) {
+fn write_response(
+    stream: &mut TcpStream,
+    deadline: std::time::Instant,
+    status: u16,
+    content_type: &str,
+    body: &str,
+) {
+    let Some(remaining) = deadline
+        .checked_duration_since(std::time::Instant::now())
+        .filter(|duration| !duration.is_zero())
+    else {
+        return;
+    };
+    if stream
+        .set_write_timeout(Some(remaining.min(Duration::from_secs(5))))
+        .is_err()
+    {
+        return;
+    }
     let status_line = match status {
         200 => "200 OK",
         400 => "400 Bad Request",
@@ -93,6 +111,9 @@ pub fn run_browser_login() -> Result<TokenResponse, anyhow::Error> {
 pub fn run_browser_login_with_config(
     config: &BrowserLoginConfig,
 ) -> Result<TokenResponse, anyhow::Error> {
+    let deadline = std::time::Instant::now()
+        .checked_add(config.timeout)
+        .ok_or_else(|| anyhow::anyhow!("OAuth timeout is too large"))?;
     let pkce = generate_pkce();
     let state = generate_state();
     let redirect_uri = config.redirect_uri();
@@ -107,8 +128,6 @@ pub fn run_browser_login_with_config(
 
     println!("Open this URL in your browser to authorize:\n\n  {auth_url}\n");
 
-    let deadline = std::time::Instant::now() + config.timeout;
-
     loop {
         if std::time::Instant::now() >= deadline {
             anyhow::bail!("OAuth timeout");
@@ -116,7 +135,14 @@ pub fn run_browser_login_with_config(
 
         match listener.accept() {
             Ok((mut stream, _)) => {
-                match handle_callback(&mut stream, &config.issuer, &redirect_uri, &pkce, &state) {
+                match handle_callback_until(
+                    &mut stream,
+                    &config.issuer,
+                    &redirect_uri,
+                    &pkce,
+                    &state,
+                    deadline,
+                ) {
                     // Ignore unrelated or malformed requests and keep waiting for
                     // the actual OAuth callback.
                     Ok(None) => continue,
@@ -125,7 +151,10 @@ pub fn run_browser_login_with_config(
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(100));
+                std::thread::sleep(
+                    Duration::from_millis(100)
+                        .min(deadline.saturating_duration_since(std::time::Instant::now())),
+                );
             }
             Err(e) => {
                 anyhow::bail!("Server error: {e}");
@@ -134,6 +163,7 @@ pub fn run_browser_login_with_config(
     }
 }
 
+#[cfg(test)]
 fn handle_callback(
     stream: &mut TcpStream,
     issuer: &str,
@@ -141,47 +171,89 @@ fn handle_callback(
     pkce: &PkceCodes,
     state: &str,
 ) -> Result<Option<TokenResponse>, anyhow::Error> {
-    let _ = stream.set_nonblocking(false);
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    handle_callback_until(
+        stream,
+        issuer,
+        redirect_uri,
+        pkce,
+        state,
+        std::time::Instant::now() + BROWSER_LOGIN_TIMEOUT,
+    )
+}
+
+fn handle_callback_until(
+    stream: &mut TcpStream,
+    issuer: &str,
+    redirect_uri: &str,
+    pkce: &PkceCodes,
+    state: &str,
+    deadline: std::time::Instant,
+) -> Result<Option<TokenResponse>, anyhow::Error> {
+    stream.set_nonblocking(false)?;
+    let remaining = deadline
+        .checked_duration_since(std::time::Instant::now())
+        .filter(|duration| !duration.is_zero())
+        .ok_or_else(|| anyhow::anyhow!("OAuth timeout"))?;
+    stream.set_read_timeout(Some(remaining.min(Duration::from_secs(5))))?;
+    stream.set_write_timeout(Some(remaining.min(Duration::from_secs(5))))?;
 
     let (path, query) = match extract_request_path_and_query(stream) {
         Some(pair) => pair,
         None => {
-            write_response(stream, 400, "text/plain", "Bad request");
+            write_response(stream, deadline, 400, "text/plain", "Bad request");
             return Ok(None);
         }
     };
 
     if path != "/auth/callback" {
-        write_response(stream, 404, "text/plain", "Not found");
+        write_response(stream, deadline, 404, "text/plain", "Not found");
         return Ok(None);
     }
 
     let params = parse_query(&query);
 
     if let Some(error) = params.get("error") {
-        write_response(stream, 400, "text/plain", &format!("Auth failed: {error}"));
+        write_response(
+            stream,
+            deadline,
+            400,
+            "text/plain",
+            &format!("Auth failed: {error}"),
+        );
         anyhow::bail!("{error}");
     }
 
     let code = match params.get("code") {
         Some(c) => c.clone(),
         None => {
-            write_response(stream, 400, "text/plain", "Auth failed: Invalid callback");
+            write_response(
+                stream,
+                deadline,
+                400,
+                "text/plain",
+                "Auth failed: Invalid callback",
+            );
             anyhow::bail!("Invalid callback");
         }
     };
 
     let received_state = params.get("state").cloned().unwrap_or_default();
     if received_state != state {
-        write_response(stream, 400, "text/plain", "Auth failed: Invalid callback");
+        write_response(
+            stream,
+            deadline,
+            400,
+            "text/plain",
+            "Auth failed: Invalid callback",
+        );
         anyhow::bail!("Invalid callback: state mismatch");
     }
 
-    match exchange_code_for_tokens(issuer, &code, pkce, redirect_uri) {
+    match exchange_code_for_tokens_until(issuer, &code, pkce, redirect_uri, deadline) {
         Ok(tokens) => {
             write_response(
                 stream,
+                deadline,
                 200,
                 "text/html",
                 "<html><body><h1>Authorization Successful</h1><p>You can close this window.</p></body></html>",
@@ -189,7 +261,7 @@ fn handle_callback(
             Ok(Some(tokens))
         }
         Err(e) => {
-            write_response(stream, 500, "text/plain", &e.to_string());
+            write_response(stream, deadline, 500, "text/plain", &e.to_string());
             Err(e)
         }
     }
@@ -519,6 +591,59 @@ mod tests {
             matches!(result, Err(ref err) if err.contains("OAuth timeout")),
             "non-callback request must not terminate browser login: {result:?}"
         );
+    }
+
+    #[test]
+    fn callback_token_exchange_obeys_remaining_login_deadline() {
+        let endpoint = TcpListener::bind("127.0.0.1:0").unwrap();
+        let issuer = format!("http://{}", endpoint.local_addr().unwrap());
+        endpoint.set_nonblocking(true).unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let stalled = std::thread::spawn(move || {
+            let accept_deadline = std::time::Instant::now() + Duration::from_secs(3);
+            let mut stream = loop {
+                match endpoint.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < accept_deadline,
+                            "token request was never sent"
+                        );
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("synthetic token endpoint: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = [0; 4096];
+            assert!(stream.read(&mut request).unwrap() > 0);
+            // No token response until the bounded callback has returned.
+            release_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        });
+        let callback = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = callback.local_addr().unwrap();
+        let started = std::time::Instant::now();
+        let handler = std::thread::spawn(move || {
+            let (mut stream, _) = callback.accept().unwrap();
+            handle_callback_until(
+                &mut stream,
+                &issuer,
+                "http://localhost/auth/callback",
+                &PkceCodes {
+                    verifier: "synthetic".into(),
+                    challenge: "synthetic".into(),
+                },
+                "synthetic-state",
+                std::time::Instant::now() + Duration::from_secs(1),
+            )
+        });
+        let _ = test_http::send_get(addr, "/auth/callback?code=synthetic&state=synthetic-state");
+        assert!(handler.join().unwrap().is_err());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        release_tx.send(()).unwrap();
+        stalled.join().unwrap();
     }
 
     #[test]

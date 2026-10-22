@@ -6,6 +6,23 @@ use std::io::{self, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+/// A consistent value and lifecycle revision, kept outside stored credential JSON.
+#[derive(Clone)]
+pub struct AuthSnapshot<T> {
+    pub value: Option<T>,
+    pub revision: String,
+}
+
+impl<T> std::fmt::Debug for AuthSnapshot<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthSnapshot")
+            .field("has_value", &self.value.is_some())
+            .field("coordinated", &!self.revision.is_empty())
+            .finish()
+    }
+}
+
 pub trait AuthStorage<T>: Send + Sync
 where
     T: Serialize + DeserializeOwned + Send + Sync + Clone,
@@ -14,6 +31,22 @@ where
     fn save(&self, value: T) -> Result<()>;
     fn clear(&self) -> Result<()>;
     fn path(&self) -> String;
+
+    /// Read value and revision atomically. Empty revision means the store has
+    /// no coordinated lifecycle support (ordinary reads only).
+    fn load_snapshot(&self) -> Result<AuthSnapshot<T>> {
+        Ok(AuthSnapshot {
+            value: self.load()?,
+            revision: String::new(),
+        })
+    }
+
+    /// Atomically compare the snapshot and replace/clear it. Implementations must
+    /// coordinate with save/clear and advance a store-unique revision on every
+    /// mutation, including clear and identical-value writes, without ABA reuse.
+    fn replace_if_unchanged(&self, _expected: &AuthSnapshot<T>, _value: Option<T>) -> Result<bool> {
+        anyhow::bail!("Auth store does not support coordinated refresh")
+    }
 }
 
 pub trait Keychain: Send + Sync {
@@ -153,6 +186,97 @@ where
             _marker: Default::default(),
         }
     }
+
+    fn lock(&self) -> Result<fs::File> {
+        let path = format!("{}.lock", self.file);
+        let dir = std::path::Path::new(&path).parent().unwrap();
+        fs::create_dir_all(dir)?;
+        set_mode(dir, 0o700);
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        // Never rename/remove this inode: all cooperating processes lock it.
+        let file = options.open(path)?;
+        file.lock()?;
+        Ok(file)
+    }
+
+    fn revision(&self) -> Result<AuthRevision> {
+        match fs::read_to_string(format!("{}.revision", self.file)) {
+            Ok(raw) => Ok(serde_json::from_str(&raw)?),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                // Adopt pre-revision file/keychain credentials without changing
+                // their public JSON or migration source.
+                let mut revision = AuthRevision::next();
+                revision.cleared = false;
+                self.set_revision(&revision)?;
+                Ok(revision)
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    fn set_revision(&self, revision: &AuthRevision) -> Result<()> {
+        write_atomically(&format!("{}.revision", self.file), revision)
+    }
+
+    fn load_unlocked(&self) -> Result<Option<T>> {
+        if self.revision()?.cleared {
+            return Ok(None);
+        }
+        Ok(load_auth_file::<T>(&self.file).or_else(|| load_auth_file::<T>(&self.legacy_file)))
+    }
+
+    fn clear_unlocked(&self) -> Result<()> {
+        delete_auth_file(
+            std::path::Path::new(&self.file),
+            std::path::Path::new(&self.legacy_file),
+        )?;
+        Ok(())
+    }
+
+    fn update_unlocked(&self, value: Option<T>) -> Result<()> {
+        let mut revision = AuthRevision::next();
+        // Publish invalidation before touching credentials. Interrupted writes
+        // fail closed, including stale keychain/legacy fallback after logout.
+        self.set_revision(&revision)?;
+        if let Some(value) = value {
+            write_atomically(&self.file, &value)?;
+            revision.cleared = false;
+            self.set_revision(&revision)?;
+        } else {
+            self.clear_unlocked()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct AuthRevision {
+    revision: String,
+    cleared: bool,
+}
+
+impl AuthRevision {
+    fn next() -> Self {
+        Self {
+            revision: uuid::Uuid::new_v4().to_string(),
+            cleared: true,
+        }
+    }
+}
+
+fn snapshot_matches<T: Serialize>(
+    snapshot: &AuthSnapshot<T>,
+    revision: &str,
+    value: &Option<T>,
+) -> Result<bool> {
+    Ok(snapshot.revision == revision
+        && serde_json::to_value(&snapshot.value)? == serde_json::to_value(value)?)
 }
 
 impl<T> AuthStorage<T> for FileAuthStore<T>
@@ -160,29 +284,35 @@ where
     T: Serialize + DeserializeOwned + Send + Sync + Clone,
 {
     fn load(&self) -> Result<Option<T>> {
-        let parsed = load_auth_file::<T>(&self.file);
-        if parsed.is_some() {
-            return Ok(parsed);
-        }
-        if self.file == self.legacy_file {
-            return Ok(None);
-        }
-        Ok(load_auth_file::<T>(&self.legacy_file))
+        let _lock = self.lock()?;
+        self.load_unlocked()
     }
 
     fn save(&self, value: T) -> Result<()> {
-        write_atomically(&self.file, &value)
+        let _lock = self.lock()?;
+        self.update_unlocked(Some(value))
     }
 
     fn clear(&self) -> Result<()> {
-        for path in [&self.file, &self.legacy_file] {
-            if let Err(err) = fs::remove_file(path)
-                && err.kind() != io::ErrorKind::NotFound
-            {
-                return Err(anyhow::Error::from(err));
-            }
+        let _lock = self.lock()?;
+        self.update_unlocked(None)
+    }
+
+    fn load_snapshot(&self) -> Result<AuthSnapshot<T>> {
+        let _lock = self.lock()?;
+        Ok(AuthSnapshot {
+            value: self.load_unlocked()?,
+            revision: self.revision()?.revision,
+        })
+    }
+
+    fn replace_if_unchanged(&self, expected: &AuthSnapshot<T>, value: Option<T>) -> Result<bool> {
+        let _lock = self.lock()?;
+        if !snapshot_matches(expected, &self.revision()?.revision, &self.load_unlocked()?)? {
+            return Ok(false);
         }
-        Ok(())
+        self.update_unlocked(value)?;
+        Ok(true)
     }
 
     fn path(&self) -> String {
@@ -223,15 +353,12 @@ where
             use_keychain,
         }
     }
-}
 
-impl<T, K> AuthStorage<T> for KeychainFileAuthStore<T, K>
-where
-    T: Serialize + DeserializeOwned + Send + Sync + Clone,
-    K: Keychain,
-{
-    fn load(&self) -> Result<Option<T>> {
-        if let Some(parsed) = self.file_store.load()? {
+    fn load_unlocked(&self) -> Result<Option<T>> {
+        if self.file_store.revision()?.cleared {
+            return Ok(None);
+        }
+        if let Some(parsed) = self.file_store.load_unlocked()? {
             return Ok(Some(parsed));
         }
         if self.use_keychain
@@ -244,25 +371,78 @@ where
         Ok(None)
     }
 
-    fn save(&self, value: T) -> Result<()> {
-        if self.use_keychain {
-            let raw = serde_json::to_string(&value)?;
-            if self
-                .keychain
-                .write(&self.service, &self.account, &raw)
-                .is_ok()
+    fn update_unlocked(&self, value: Option<T>) -> Result<()> {
+        let mut revision = AuthRevision::next();
+        self.file_store.set_revision(&revision)?;
+        if let Some(value) = value {
+            let keychain_saved = self.use_keychain
+                && self
+                    .keychain
+                    .write(
+                        &self.service,
+                        &self.account,
+                        &serde_json::to_string(&value)?,
+                    )
+                    .is_ok();
+            // File/legacy credentials take precedence when present. Keep the
+            // primary current rather than deleting migration sources.
+            if !keychain_saved
+                || std::path::Path::new(&self.file_store.file).exists()
+                || std::path::Path::new(&self.file_store.legacy_file).exists()
             {
-                return Ok(());
+                write_atomically(&self.file_store.file, &value)?;
             }
+            revision.cleared = false;
+            self.file_store.set_revision(&revision)?;
+        } else {
+            if self.use_keychain {
+                self.keychain.delete(&self.service, &self.account)?;
+            }
+            self.file_store.clear_unlocked()?;
         }
-        self.file_store.save(value)
+        Ok(())
+    }
+}
+
+impl<T, K> AuthStorage<T> for KeychainFileAuthStore<T, K>
+where
+    T: Serialize + DeserializeOwned + Send + Sync + Clone,
+    K: Keychain,
+{
+    fn load(&self) -> Result<Option<T>> {
+        let _lock = self.file_store.lock()?;
+        self.load_unlocked()
+    }
+
+    fn save(&self, value: T) -> Result<()> {
+        let _lock = self.file_store.lock()?;
+        self.update_unlocked(Some(value))
     }
 
     fn clear(&self) -> Result<()> {
-        if self.use_keychain {
-            self.keychain.delete(&self.service, &self.account)?;
+        let _lock = self.file_store.lock()?;
+        self.update_unlocked(None)
+    }
+
+    fn load_snapshot(&self) -> Result<AuthSnapshot<T>> {
+        let _lock = self.file_store.lock()?;
+        Ok(AuthSnapshot {
+            value: self.load_unlocked()?,
+            revision: self.file_store.revision()?.revision,
+        })
+    }
+
+    fn replace_if_unchanged(&self, expected: &AuthSnapshot<T>, value: Option<T>) -> Result<bool> {
+        let _lock = self.file_store.lock()?;
+        if !snapshot_matches(
+            expected,
+            &self.file_store.revision()?.revision,
+            &self.load_unlocked()?,
+        )? {
+            return Ok(false);
         }
-        self.file_store.clear()
+        self.update_unlocked(value)?;
+        Ok(true)
     }
 
     fn path(&self) -> String {
@@ -342,6 +522,13 @@ pub fn write_atomically<T: Serialize>(path: &str, value: &T) -> Result<()> {
         return Err(err.into());
     }
     set_mode(std::path::Path::new(path), 0o600);
+    #[cfg(unix)]
+    fs::File::open(if dir.as_os_str().is_empty() {
+        std::path::Path::new(".")
+    } else {
+        dir
+    })?
+    .sync_all()?;
     Ok(())
 }
 
@@ -360,7 +547,7 @@ pub struct InMemoryAuthStore<T>
 where
     T: Serialize + DeserializeOwned + Send + Sync + Clone,
 {
-    inner: std::sync::Arc<std::sync::Mutex<Option<T>>>,
+    inner: std::sync::Arc<std::sync::Mutex<AuthSnapshot<T>>>,
 }
 
 impl<T> Default for InMemoryAuthStore<T>
@@ -378,7 +565,10 @@ where
 {
     pub fn new() -> Self {
         Self {
-            inner: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            inner: std::sync::Arc::new(std::sync::Mutex::new(AuthSnapshot {
+                value: None,
+                revision: uuid::Uuid::new_v4().to_string(),
+            })),
         }
     }
 }
@@ -403,7 +593,7 @@ where
             .inner
             .lock()
             .map_err(|err| anyhow::anyhow!(err.to_string()))?;
-        Ok(inner.clone())
+        Ok(inner.value.clone())
     }
 
     fn save(&self, value: T) -> Result<()> {
@@ -411,7 +601,8 @@ where
             .inner
             .lock()
             .map_err(|err| anyhow::anyhow!(err.to_string()))?;
-        *inner = Some(value);
+        inner.value = Some(value);
+        inner.revision = uuid::Uuid::new_v4().to_string();
         Ok(())
     }
 
@@ -420,8 +611,30 @@ where
             .inner
             .lock()
             .map_err(|err| anyhow::anyhow!(err.to_string()))?;
-        *inner = None;
+        inner.value = None;
+        inner.revision = uuid::Uuid::new_v4().to_string();
         Ok(())
+    }
+
+    fn load_snapshot(&self) -> Result<AuthSnapshot<T>> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|err| anyhow::anyhow!(err.to_string()))?
+            .clone())
+    }
+
+    fn replace_if_unchanged(&self, expected: &AuthSnapshot<T>, value: Option<T>) -> Result<bool> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+        if !snapshot_matches(expected, &inner.revision, &inner.value)? {
+            return Ok(false);
+        }
+        inner.value = value;
+        inner.revision = uuid::Uuid::new_v4().to_string();
+        Ok(true)
     }
 
     fn path(&self) -> String {
@@ -586,6 +799,7 @@ mod tests {
             KeychainFileAuthStore::new(file.clone(), legacy, "svc", "acct", true, keychain.clone());
 
         store.save(json!({"source": "saved"})).unwrap();
+        assert_eq!(store.load().unwrap().unwrap()["source"], "saved");
         let raw = keychain.raw("svc", "acct").unwrap();
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&raw).unwrap()["source"],
@@ -617,6 +831,64 @@ mod tests {
             json!("file-fallback")
         );
         assert!(std::path::Path::new(&file).exists());
+    }
+
+    #[test]
+    fn revision_adopts_legacy_json_and_rejects_aba_and_corrupt_state() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = temp_auth_path(&temp, "auth.json");
+        let legacy = temp_auth_path(&temp, "legacy.json");
+        write_atomically(&legacy, &json!({"synthetic": "legacy"})).unwrap();
+        let store = FileAuthStore::new(file.clone(), legacy.clone());
+        let snapshot = store.load_snapshot().unwrap();
+        assert!(!snapshot.revision.is_empty());
+        assert_eq!(snapshot.value, Some(json!({"synthetic": "legacy"})));
+        store.clear().unwrap();
+        store.save(snapshot.value.clone().unwrap()).unwrap();
+        assert!(!store.replace_if_unchanged(&snapshot, None).unwrap());
+        assert!(
+            !store
+                .replace_if_unchanged(&snapshot, Some(json!({"synthetic": "stale rotation"})))
+                .unwrap()
+        );
+        assert_eq!(store.load().unwrap(), snapshot.value);
+        // Coordination metadata never changes the stored credential schema.
+        assert_eq!(load_auth_file::<serde_json::Value>(&file), snapshot.value);
+        fs::write(format!("{file}.revision"), "broken state").unwrap();
+        assert!(store.load().is_err());
+        assert!(store.load_snapshot().is_err());
+    }
+
+    #[test]
+    fn tombstone_blocks_stale_keychain_and_legacy_fallback() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = temp_auth_path(&temp, "auth.json");
+        let legacy = temp_auth_path(&temp, "legacy.json");
+        let keychain = MockKeychain::default();
+        keychain.set_raw("synthetic", "account", json!({"synthetic": "old keychain"}));
+        let store: KeychainFileAuthStore<serde_json::Value, _> = KeychainFileAuthStore::new(
+            file.clone(),
+            legacy.clone(),
+            "synthetic",
+            "account",
+            true,
+            keychain.clone(),
+        );
+        let old = store.load_snapshot().unwrap();
+        store.clear().unwrap();
+        let cleared = store.load_snapshot().unwrap();
+        assert_ne!(old.revision, cleared.revision);
+        // Simulate stale external migration sources after a completed logout.
+        keychain.set_raw("synthetic", "account", json!({"synthetic": "old keychain"}));
+        write_atomically(&legacy, &json!({"synthetic": "old legacy"})).unwrap();
+        assert!(store.load().unwrap().is_none());
+        assert!(
+            !store
+                .replace_if_unchanged(&old, Some(json!({"synthetic": "stale refresh"})))
+                .unwrap()
+        );
+        store.save(json!({"synthetic": "new login"})).unwrap();
+        assert_eq!(store.load().unwrap().unwrap()["synthetic"], "new login");
     }
 
     #[test]

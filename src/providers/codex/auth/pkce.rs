@@ -76,7 +76,29 @@ pub fn exchange_code_for_tokens(
     pkce: &PkceCodes,
     redirect_uri: &str,
 ) -> Result<crate::providers::codex::auth::jwt::TokenResponse, anyhow::Error> {
-    let client = reqwest::blocking::Client::new();
+    exchange_code_for_tokens_until(
+        issuer,
+        code,
+        pkce,
+        redirect_uri,
+        std::time::Instant::now() + std::time::Duration::from_secs(30),
+    )
+}
+
+pub(super) fn exchange_code_for_tokens_until(
+    issuer: &str,
+    code: &str,
+    pkce: &PkceCodes,
+    redirect_uri: &str,
+    deadline: std::time::Instant,
+) -> Result<crate::providers::codex::auth::jwt::TokenResponse, anyhow::Error> {
+    let remaining = deadline
+        .checked_duration_since(std::time::Instant::now())
+        .filter(|duration| !duration.is_zero())
+        .ok_or_else(|| anyhow::anyhow!("OAuth timeout"))?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(remaining.min(std::time::Duration::from_secs(30)))
+        .build()?;
     let form = [
         ("grant_type", "authorization_code"),
         ("code", code),
@@ -87,6 +109,13 @@ pub fn exchange_code_for_tokens(
 
     let resp = client
         .post(format!("{issuer}/oauth/token"))
+        .timeout(
+            deadline
+                .checked_duration_since(std::time::Instant::now())
+                .filter(|duration| !duration.is_zero())
+                .ok_or_else(|| anyhow::anyhow!("OAuth timeout"))?
+                .min(std::time::Duration::from_secs(30)),
+        )
         .form(&form)
         .send()
         .map_err(|e| anyhow::anyhow!("Token exchange network error: {e}"))?;

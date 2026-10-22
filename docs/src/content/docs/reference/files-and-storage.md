@@ -30,6 +30,10 @@ When `CCP_CONFIG_DIR` is set, credentials use `<CCP_CONFIG_DIR>/codex/auth.json`
 
 The proxy owns these tokens independently of native Codex CLI credentials. No OpenAI Platform API key is used.
 
+Credential lifecycle coordination also uses `<configuration-root>/codex/auth.json.lock` and `auth.json.revision`, including when the tokens themselves are in macOS Keychain. The lock inode is stable; the revision stores a durable generation/logout tombstone, not token contents. Keep these files with the credential store, not with disposable logs/caches, and do not remove them while proxy/auth processes are running. The built-in store needs a writable coordination directory; unreadable or corrupt state fails closed.
+
+Cooperating processes use atomic snapshots and conditional updates so an old refresh cannot overwrite a newer login or undo logout, including identical-credential relogin. A rejected refresh does not erase credentials while a successful peer may still be rotating them. External programs directly editing the raw file/Keychain without this coordination are outside that guarantee. Existing credential JSON and legacy migration formats remain readable.
+
 ## Model metadata
 
 Default-on discovery fetches subscription model metadata directly using the proxy's OAuth login. Its immutable cache is bounded and in memory, scoped to account/owner, endpoint, and protocol version; it is not a native Codex disk cache. Freshness is 300 seconds, failure cooldown 30 seconds, and same-scope stale reuse is bounded to 900 seconds after validation.

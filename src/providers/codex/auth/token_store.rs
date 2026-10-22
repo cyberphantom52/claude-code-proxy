@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::auth::{AuthStorage, KeychainFileAuthStore, SystemKeychain};
+use crate::auth::{AuthSnapshot, AuthStorage, KeychainFileAuthStore, SystemKeychain};
 use crate::paths;
 
 pub const KEYCHAIN_SERVICE: &str = "claude-code-proxy.codex";
@@ -39,6 +39,18 @@ impl<S: AuthStorage<StoredAuth>> CodexTokenStore<S> {
 
     pub fn clear_auth(&self) -> Result<(), anyhow::Error> {
         self.store.clear()
+    }
+
+    pub fn load_snapshot(&self) -> Result<AuthSnapshot<StoredAuth>, anyhow::Error> {
+        self.store.load_snapshot()
+    }
+
+    pub fn replace_if_unchanged(
+        &self,
+        expected: &AuthSnapshot<StoredAuth>,
+        value: Option<StoredAuth>,
+    ) -> Result<bool, anyhow::Error> {
+        self.store.replace_if_unchanged(expected, value)
     }
 
     pub fn auth_path(&self) -> String {
