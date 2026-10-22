@@ -32,34 +32,19 @@ where
     fn clear(&self) -> Result<()>;
     fn path(&self) -> String;
 
-    /// Read value and revision atomically. Empty revision means the store has
-    /// no coordinated lifecycle support (ordinary reads only).
-    fn load_snapshot(&self) -> Result<AuthSnapshot<T>> {
-        Ok(AuthSnapshot {
-            value: self.load()?,
-            revision: String::new(),
-        })
-    }
+    /// Read value and revision atomically.
+    fn load_snapshot(&self) -> Result<AuthSnapshot<T>>;
 
     /// Atomically compare the snapshot and replace/clear it. Implementations must
     /// coordinate with save/clear and advance a store-unique revision on every
     /// mutation, including clear and identical-value writes, without ABA reuse.
-    fn replace_if_unchanged(&self, _expected: &AuthSnapshot<T>, _value: Option<T>) -> Result<bool> {
-        anyhow::bail!("Auth store does not support coordinated refresh")
-    }
+    fn replace_if_unchanged(&self, expected: &AuthSnapshot<T>, value: Option<T>) -> Result<bool>;
 }
 
-pub trait Keychain: Send + Sync {
-    fn read(&self, service: &str, account: &str) -> Result<Option<String>>;
-    fn write(&self, service: &str, account: &str, value: &str) -> Result<()>;
-    fn delete(&self, service: &str, account: &str) -> Result<()>;
-}
-
-#[derive(Default, Clone, Copy)]
-pub struct SystemKeychain;
+struct SystemKeychain;
 
 #[cfg(target_os = "macos")]
-impl Keychain for SystemKeychain {
+impl SystemKeychain {
     fn read(&self, service: &str, account: &str) -> Result<Option<String>> {
         let output = run_security(&["find-generic-password", "-s", service, "-a", account, "-w"])?;
         if output.status.success() {
@@ -73,10 +58,6 @@ impl Keychain for SystemKeychain {
             return Ok(None);
         }
         Err(anyhow::anyhow!("Keychain read failed: {}", stderr.trim()))
-    }
-
-    fn write(&self, _service: &str, _account: &str, _value: &str) -> Result<()> {
-        anyhow::bail!("Keychain write is not available through non-interactive compatibility mode")
     }
 
     fn delete(&self, service: &str, account: &str) -> Result<()> {
@@ -135,13 +116,9 @@ fn trim_one_trailing_newline(value: &mut String) {
 }
 
 #[cfg(not(target_os = "macos"))]
-impl Keychain for SystemKeychain {
+impl SystemKeychain {
     fn read(&self, _service: &str, _account: &str) -> Result<Option<String>> {
         Ok(None)
-    }
-
-    fn write(&self, _service: &str, _account: &str, _value: &str) -> Result<()> {
-        anyhow::bail!("Keychain storage is not available on this platform")
     }
 
     fn delete(&self, _service: &str, _account: &str) -> Result<()> {
@@ -149,7 +126,7 @@ impl Keychain for SystemKeychain {
     }
 }
 
-pub struct FileAuthStore<T>
+struct FileAuthStore<T>
 where
     T: Serialize + DeserializeOwned + Send + Sync + Clone,
 {
@@ -221,21 +198,6 @@ where
         )?;
         Ok(())
     }
-
-    fn update_unlocked(&self, value: Option<T>) -> Result<()> {
-        let mut revision = AuthRevision::next();
-        // Publish invalidation before touching credentials. Interrupted writes
-        // fail closed, including stale keychain/legacy fallback after logout.
-        self.set_revision(&revision)?;
-        if let Some(value) = value {
-            write_atomically(&self.file, &value)?;
-            revision.cleared = false;
-            self.set_revision(&revision)?;
-        } else {
-            self.clear_unlocked()?;
-        }
-        Ok(())
-    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -262,63 +224,19 @@ fn snapshot_matches<T: Serialize>(
         && serde_json::to_value(&snapshot.value)? == serde_json::to_value(value)?)
 }
 
-impl<T> AuthStorage<T> for FileAuthStore<T>
+pub struct KeychainFileAuthStore<T>
 where
     T: Serialize + DeserializeOwned + Send + Sync + Clone,
-{
-    fn load(&self) -> Result<Option<T>> {
-        let _lock = self.lock()?;
-        self.load_unlocked()
-    }
-
-    fn save(&self, value: T) -> Result<()> {
-        let _lock = self.lock()?;
-        self.update_unlocked(Some(value))
-    }
-
-    fn clear(&self) -> Result<()> {
-        let _lock = self.lock()?;
-        self.update_unlocked(None)
-    }
-
-    fn load_snapshot(&self) -> Result<AuthSnapshot<T>> {
-        let _lock = self.lock()?;
-        Ok(AuthSnapshot {
-            value: self.load_unlocked()?,
-            revision: self.revision()?.revision,
-        })
-    }
-
-    fn replace_if_unchanged(&self, expected: &AuthSnapshot<T>, value: Option<T>) -> Result<bool> {
-        let _lock = self.lock()?;
-        if !snapshot_matches(expected, &self.revision()?.revision, &self.load_unlocked()?)? {
-            return Ok(false);
-        }
-        self.update_unlocked(value)?;
-        Ok(true)
-    }
-
-    fn path(&self) -> String {
-        self.file.clone()
-    }
-}
-
-pub struct KeychainFileAuthStore<T, K = SystemKeychain>
-where
-    T: Serialize + DeserializeOwned + Send + Sync + Clone,
-    K: Keychain,
 {
     file_store: FileAuthStore<T>,
-    keychain: K,
     service: String,
     account: String,
     use_keychain: bool,
 }
 
-impl<T, K> KeychainFileAuthStore<T, K>
+impl<T> KeychainFileAuthStore<T>
 where
     T: Serialize + DeserializeOwned + Send + Sync + Clone,
-    K: Keychain,
 {
     pub fn new(
         file: String,
@@ -326,11 +244,9 @@ where
         service: impl Into<String>,
         account: impl Into<String>,
         use_keychain: bool,
-        keychain: K,
     ) -> Self {
         Self {
             file_store: FileAuthStore::new(file, legacy_file),
-            keychain,
             service: service.into(),
             account: account.into(),
             use_keychain,
@@ -345,7 +261,7 @@ where
             return Ok(Some(parsed));
         }
         if self.use_keychain
-            && let Some(raw) = self.keychain.read(&self.service, &self.account)?
+            && let Some(raw) = SystemKeychain.read(&self.service, &self.account)?
         {
             return serde_json::from_str::<T>(&raw)
                 .map(Some)
@@ -356,30 +272,16 @@ where
 
     fn update_unlocked(&self, value: Option<T>) -> Result<()> {
         let mut revision = AuthRevision::next();
+        // Publish invalidation before touching credentials. Interrupted writes
+        // fail closed, including stale keychain/legacy fallback after logout.
         self.file_store.set_revision(&revision)?;
         if let Some(value) = value {
-            let keychain_saved = self.use_keychain
-                && self
-                    .keychain
-                    .write(
-                        &self.service,
-                        &self.account,
-                        &serde_json::to_string(&value)?,
-                    )
-                    .is_ok();
-            // File/legacy credentials take precedence when present. Keep the
-            // primary current rather than deleting migration sources.
-            if !keychain_saved
-                || std::path::Path::new(&self.file_store.file).exists()
-                || std::path::Path::new(&self.file_store.legacy_file).exists()
-            {
-                write_atomically(&self.file_store.file, &value)?;
-            }
+            write_atomically(&self.file_store.file, &value)?;
             revision.cleared = false;
             self.file_store.set_revision(&revision)?;
         } else {
             if self.use_keychain {
-                self.keychain.delete(&self.service, &self.account)?;
+                SystemKeychain.delete(&self.service, &self.account)?;
             }
             self.file_store.clear_unlocked()?;
         }
@@ -387,10 +289,9 @@ where
     }
 }
 
-impl<T, K> AuthStorage<T> for KeychainFileAuthStore<T, K>
+impl<T> AuthStorage<T> for KeychainFileAuthStore<T>
 where
     T: Serialize + DeserializeOwned + Send + Sync + Clone,
-    K: Keychain,
 {
     fn load(&self) -> Result<Option<T>> {
         let _lock = self.file_store.lock()?;
@@ -432,7 +333,7 @@ where
         if self.use_keychain {
             "macOS Keychain".to_string()
         } else {
-            self.file_store.path()
+            self.file_store.file.clone()
         }
     }
 }
@@ -440,25 +341,6 @@ where
 pub fn load_auth_file<T: DeserializeOwned>(path: &str) -> Option<T> {
     let raw = fs::read_to_string(path).ok()?;
     serde_json::from_str::<T>(&raw).ok()
-}
-
-pub fn load_auth_file_value(path: &std::path::Path) -> Option<serde_json::Value> {
-    let raw = fs::read_to_string(path).ok()?;
-    serde_json::from_str::<serde_json::Value>(&raw).ok()
-}
-
-pub fn load_auth_file_with_legacy<T: DeserializeOwned>(
-    primary: &std::path::Path,
-    legacy: &std::path::Path,
-) -> Option<T> {
-    if let Some(value) = load_auth_file_value(primary) {
-        return serde_json::from_value(value).ok();
-    }
-    if primary == legacy {
-        None
-    } else {
-        load_auth_file_value(legacy).and_then(|value| serde_json::from_value(value).ok())
-    }
 }
 
 pub fn delete_auth_file(primary: &std::path::Path, legacy: &std::path::Path) -> io::Result<()> {

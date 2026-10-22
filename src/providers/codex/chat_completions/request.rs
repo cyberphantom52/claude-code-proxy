@@ -4,10 +4,10 @@ use serde_json::{Map, Value, json};
 use crate::providers::codex::translate::{
     model_allowlist::{
         assert_allowed_model, model_parallel_tool_calls, model_reasoning_summary, model_verbosity,
-        resolve_model_effort, resolve_model_request_with_config_override,
-        resolve_service_tier_value, uses_responses_lite, validate_input_modalities,
+        resolve_model_effort, resolve_model_request, resolve_service_tier_value,
+        uses_responses_lite, validate_input_modalities,
     },
-    request::{Effort, reasoning_requested, resolve_effort_override, to_codex_effort},
+    request::{Effort, ServiceTier, reasoning_requested, resolve_effort_override, to_codex_effort},
 };
 use crate::{config, registry::normalize_incoming_model};
 
@@ -31,7 +31,6 @@ const SUPPORTED_FIELDS: &[&str] = &[
 #[derive(Debug, Clone)]
 pub struct TranslatedRequest {
     pub upstream: Value,
-    pub requested_model: String,
     pub model: String,
     pub effort: Option<String>,
     pub stream: bool,
@@ -39,22 +38,15 @@ pub struct TranslatedRequest {
     pub use_responses_lite: bool,
 }
 
-pub fn translate_request(body: Value) -> Result<TranslatedRequest, ChatError> {
-    translate_request_with_override(body, config::codex_effort().as_deref())
-}
-
-fn translate_request_with_override(
-    body: Value,
-    effort_override: Option<&str>,
-) -> Result<TranslatedRequest, ChatError> {
+pub fn translate_request(body: &Value) -> Result<TranslatedRequest, ChatError> {
     let object = body
         .as_object()
         .ok_or_else(|| ChatError::invalid("Request body must be a JSON object", None, None))?;
     reject_unsupported_fields(object)?;
 
     let requested_model = required_string(object, "model")?;
-    let normalized = normalize_incoming_model(&requested_model);
-    let resolved = resolve_model_request_with_config_override(&normalized, false);
+    let normalized = normalize_incoming_model(requested_model);
+    let resolved = resolve_model_request(&normalized);
     assert_allowed_model(&resolved.model).map_err(|error| {
         ChatError::invalid(error.to_string(), Some("model"), Some("invalid_value"))
     })?;
@@ -100,15 +92,16 @@ fn translate_request_with_override(
             ));
         }
     };
-    let effort = resolve_effort_override(request_effort, effort_override).map_err(|error| {
-        ChatError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "api_error",
-            error.to_string(),
-            None,
-            None,
-        )
-    })?;
+    let effort = resolve_effort_override(request_effort, config::codex_effort().as_deref())
+        .map_err(|error| {
+            ChatError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+                error.to_string(),
+                None,
+                None,
+            )
+        })?;
 
     let effort_string = effort.as_ref().map(ToString::to_string);
     let effort = resolve_model_effort(&resolved.model, effort_string.as_deref())
@@ -179,7 +172,7 @@ fn translate_request_with_override(
                 Some("unsupported_value"),
             )
         })?;
-        if String::from(tier.clone()) != "default" {
+        if !matches!(&tier, ServiceTier::Other(value) if value == "default") {
             upstream.insert("service_tier".to_string(), json!(tier));
         }
     }
@@ -235,7 +228,6 @@ fn translate_request_with_override(
 
     Ok(TranslatedRequest {
         upstream: Value::Object(upstream),
-        requested_model,
         model: resolved.model,
         effort: effort.map(|effort| effort.to_string()),
         stream,
@@ -253,12 +245,14 @@ fn reject_unsupported_fields(object: &Map<String, Value>) -> Result<(), ChatErro
     Ok(())
 }
 
-fn required_string(object: &Map<String, Value>, key: &'static str) -> Result<String, ChatError> {
+fn required_string<'a>(
+    object: &'a Map<String, Value>,
+    key: &'static str,
+) -> Result<&'a str, ChatError> {
     object
         .get(key)
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
-        .map(str::to_string)
         .ok_or_else(|| ChatError::invalid(format!("Missing or invalid '{key}'"), Some(key), None))
 }
 

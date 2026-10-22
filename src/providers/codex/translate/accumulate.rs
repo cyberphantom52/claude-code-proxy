@@ -8,14 +8,6 @@ use super::reducer::{
 };
 use super::web_search_compat::{WebSearchCompatContent, build_web_search_compat_blocks};
 
-pub fn accumulate_response(
-    upstream: &[u8],
-    message_id: &str,
-    model: &str,
-) -> Result<Value, anyhow::Error> {
-    accumulate_response_with_traffic(upstream, message_id, model, None)
-}
-
 pub fn accumulate_response_with_traffic(
     upstream: &[u8],
     message_id: &str,
@@ -37,8 +29,8 @@ pub fn accumulate_response_with_traffic(
     let mut blocks: Vec<AccumulatedBlock> = Vec::new();
     let mut stop_reason: Option<String> = None;
     let mut usage: Option<AnthropicUsage> = None;
-    let mut web_search_events: Vec<ReducerEvent> = Vec::new();
-    let mut deferred_text_parts: Vec<String> = Vec::new();
+    let mut has_web_search = false;
+    let mut text_from_deferred = String::new();
 
     enum BlockKind {
         Thinking {
@@ -63,7 +55,7 @@ pub fn accumulate_response_with_traffic(
     for event in &events {
         match event {
             ReducerEvent::WebSearch { .. } => {
-                web_search_events.push(event.clone());
+                has_web_search = true;
             }
             ReducerEvent::ThinkingStart { index } => {
                 blocks.push(AccumulatedBlock {
@@ -102,7 +94,7 @@ pub fn accumulate_response_with_traffic(
                 {
                     t.push_str(text);
                 }
-                deferred_text_parts.push(text.clone());
+                text_from_deferred.push_str(text);
             }
             ReducerEvent::ToolStart { index, id, name } => {
                 blocks.push(AccumulatedBlock {
@@ -134,16 +126,13 @@ pub fn accumulate_response_with_traffic(
                 let ws = Some(*web_search_requests).filter(|n| *n > 0);
                 usage = Some(map_codex_usage_to_anthropic(u, ws));
             }
-            _ => {}
         }
     }
 
-    let text_from_deferred: String = deferred_text_parts.join("");
-
     let mut indexed_content: Vec<(usize, Value)> = Vec::new();
 
-    if !web_search_events.is_empty() {
-        let compat_blocks = build_web_search_compat_blocks(&web_search_events, &text_from_deferred);
+    if has_web_search {
+        let compat_blocks = build_web_search_compat_blocks(&events, &text_from_deferred);
         for block in &compat_blocks {
             match &block.content {
                 WebSearchCompatContent::ServerToolUse { id, name, input } => {

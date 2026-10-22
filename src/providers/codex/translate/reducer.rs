@@ -145,18 +145,12 @@ pub enum ReducerEvent {
         index: usize,
         signature: String,
     },
-    ThinkingStop {
-        index: usize,
-    },
     TextStart {
         index: usize,
     },
     TextDelta {
         index: usize,
         text: String,
-    },
-    TextStop {
-        index: usize,
     },
     ToolStart {
         index: usize,
@@ -167,13 +161,6 @@ pub enum ReducerEvent {
         index: usize,
         partial_json: String,
     },
-    ToolStop {
-        index: usize,
-    },
-    ToolProgress {
-        index: usize,
-    },
-    Progress,
     WebSearch {
         index: usize,
         result_index: usize,
@@ -243,9 +230,6 @@ fn finalize_active_thinking(
         });
         output_items_by_index.insert(active.output_index, reasoning_input_item(replay));
     }
-    out.push(ReducerEvent::ThinkingStop {
-        index: active.anthropic_index,
-    });
 }
 
 fn close_thinking(
@@ -284,7 +268,6 @@ fn emit_signature_only_reasoning(
     *anthropic_index += 1;
     out.push(ReducerEvent::ThinkingStart { index });
     out.push(ReducerEvent::ThinkingSignature { index, signature });
-    out.push(ReducerEvent::ThinkingStop { index });
     output_items_by_index.insert(output_index, reasoning_input_item(replay));
 }
 
@@ -452,20 +435,6 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
 
         if t == "codex.rate_limits" {
             latest_rate_limits = parse_codex_rate_limits(&p).or(latest_rate_limits);
-            out.push(ReducerEvent::Progress);
-            continue;
-        }
-
-        if t == "keepalive" {
-            out.push(ReducerEvent::Progress);
-            continue;
-        }
-
-        if t == "response.web_search_call.in_progress"
-            || t == "response.web_search_call.searching"
-            || t == "response.web_search_call.completed"
-        {
-            out.push(ReducerEvent::Progress);
             continue;
         }
 
@@ -485,11 +454,6 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                     .capture(item);
                 continue;
             }
-            if item_type == "web_search_call" {
-                out.push(ReducerEvent::Progress);
-                continue;
-            }
-
             if item_type == "message" {
                 close_thinking(
                     &mut out,
@@ -663,9 +627,7 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                         .into());
                     }
                     args_accum.push_str(delta);
-                    if name == "Read" {
-                        out.push(ReducerEvent::ToolProgress { index: *index });
-                    } else {
+                    if name != "Read" {
                         *emitted_args = true;
                         out.push(ReducerEvent::ToolDelta {
                             index: *index,
@@ -812,7 +774,6 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                             index,
                             partial_json: arguments.clone(),
                         });
-                        out.push(ReducerEvent::ToolStop { index });
                         if p.get("output_index").is_none()
                             || blocks_by_output_index.contains_key(&output_index)
                             || output_items_by_index.contains_key(&output_index)
@@ -867,14 +828,6 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
 
             capture_output_item(output_index, &state, &mut output_items_by_index);
 
-            match &state {
-                BlockState::Text { index, .. } => {
-                    out.push(ReducerEvent::TextStop { index: *index });
-                }
-                BlockState::Tool { index, .. } => {
-                    out.push(ReducerEvent::ToolStop { index: *index });
-                }
-            }
             continue;
         }
 
@@ -1077,7 +1030,3 @@ pub struct OutputTokensDetails {
 pub struct WebSearchUsage {
     pub web_search_requests: usize,
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------

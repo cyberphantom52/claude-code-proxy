@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex as AsyncMutex;
@@ -8,12 +7,10 @@ use super::jwt::{TokenResponse, extract_account_id, validate_token_response};
 use super::token_store::{CodexTokenStore, StoredAuth};
 use crate::auth::{AuthSnapshot, AuthStorage};
 
-static CODEX_REFRESH_LOCK: LazyLock<Arc<AsyncMutex<()>>> =
-    LazyLock::new(|| Arc::new(AsyncMutex::new(())));
+static CODEX_REFRESH_LOCK: LazyLock<AsyncMutex<()>> = LazyLock::new(|| AsyncMutex::new(()));
 
 pub struct CodexAuthManager<S: AuthStorage<StoredAuth>> {
     pub store: CodexTokenStore<S>,
-    refresh_lock: Arc<AsyncMutex<()>>,
     refresh_client: reqwest::Client,
 }
 
@@ -21,7 +18,6 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
     pub fn new(store: CodexTokenStore<S>) -> Self {
         Self {
             store,
-            refresh_lock: CODEX_REFRESH_LOCK.clone(),
             refresh_client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(15))
                 .timeout(Duration::from_secs(30))
@@ -37,14 +33,6 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
             .as_millis() as u64
     }
 
-    pub async fn get_auth(&self) -> Result<StoredAuth, anyhow::Error> {
-        Ok(self
-            .get_auth_snapshot()
-            .await?
-            .value
-            .expect("authenticated snapshot"))
-    }
-
     pub async fn get_auth_snapshot(&self) -> Result<AuthSnapshot<StoredAuth>, anyhow::Error> {
         let snapshot = self.store.load_snapshot()?;
         let stored = snapshot.value.as_ref().ok_or_else(|| {
@@ -53,38 +41,28 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
         if stored.expires > Self::now_ms().saturating_add(REFRESH_MARGIN_MS) {
             return Ok(snapshot);
         }
-        self.refresh(false, None, None).await
-    }
-
-    pub async fn force_refresh(&self, rejected_access: &str) -> Result<StoredAuth, anyhow::Error> {
-        Ok(self
-            .refresh(true, Some(rejected_access), None)
-            .await?
-            .value
-            .expect("authenticated snapshot"))
+        self.refresh(None).await
     }
 
     pub async fn force_refresh_snapshot(
         &self,
         rejected: &AuthSnapshot<StoredAuth>,
     ) -> Result<AuthSnapshot<StoredAuth>, anyhow::Error> {
-        self.refresh(true, None, Some(&rejected.revision)).await
+        self.refresh(Some(&rejected.revision)).await
     }
 
     async fn refresh(
         &self,
-        force: bool,
-        rejected_access: Option<&str>,
         rejected_revision: Option<&str>,
     ) -> Result<AuthSnapshot<StoredAuth>, anyhow::Error> {
-        let _refresh_guard = self.refresh_lock.lock().await;
+        let _refresh_guard = CODEX_REFRESH_LOCK.lock().await;
         let snapshot = self.store.load_snapshot()?;
         let current = snapshot
             .value
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Not authenticated"))?;
-        if (!force && current.expires > Self::now_ms().saturating_add(REFRESH_MARGIN_MS))
-            || rejected_access.is_some_and(|access| current.access != access)
+        if (rejected_revision.is_none()
+            && current.expires > Self::now_ms().saturating_add(REFRESH_MARGIN_MS))
             || rejected_revision.is_some_and(|revision| snapshot.revision != revision)
         {
             return Ok(snapshot);

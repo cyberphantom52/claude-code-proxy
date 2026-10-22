@@ -95,13 +95,11 @@ fn main() -> Result<()> {
             match select_serve_mode(std::io::stdout().is_terminal(), no_monitor) {
                 ServeMode::Plain => {
                     print_server_banner(&bind_address, effective_port, &registry);
-                    runtime
-                        .block_on(run_service(ServerConfig {
-                            bind_address,
-                            port: effective_port,
-                            monitor: Some(MonitorHandle::default()),
-                        }))
-                        .map_err(|err| anyhow::anyhow!(err))
+                    runtime.block_on(run_service(ServerConfig {
+                        bind_address,
+                        port: effective_port,
+                        monitor: Some(MonitorHandle::default()),
+                    }))
                 }
                 ServeMode::Monitor => {
                     let _stderr_guard = logging::suppress_stderr();
@@ -140,7 +138,7 @@ fn main() -> Result<()> {
                     }
                     let server_result = runtime.block_on(server_task)?;
                     ui_result?;
-                    server_result.map_err(|err| anyhow::anyhow!(err))
+                    server_result
                 }
             }
         }

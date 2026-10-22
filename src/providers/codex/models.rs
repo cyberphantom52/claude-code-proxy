@@ -159,12 +159,6 @@ pub fn current_model_context() -> Option<Arc<ModelContext>> {
     MODEL_CONTEXT.try_with(Arc::clone).ok()
 }
 
-pub fn current_auth_for_endpoint(endpoint: &str) -> Option<StoredAuth> {
-    current_model_context()
-        .filter(|context| context.endpoint == endpoint)
-        .and_then(|context| context.auth.as_ref().map(|auth| auth.auth.clone()))
-}
-
 // Keys contain only digests, never tokens. JWT claims are used solely as an
 // isolation discriminator, not to authenticate or trust an unsigned token.
 #[derive(PartialEq, Eq)]
@@ -271,7 +265,7 @@ impl ModelCache {
     }
 }
 
-fn models_endpoint(base_url: &str, version: &str) -> Option<reqwest::Url> {
+fn models_endpoint(base_url: &str) -> Option<reqwest::Url> {
     let mut url = reqwest::Url::parse(base_url).ok()?;
     if !matches!(url.scheme(), "http" | "https")
         || !url.username().is_empty()
@@ -284,7 +278,8 @@ fn models_endpoint(base_url: &str, version: &str) -> Option<reqwest::Url> {
     url.set_path(&format!("{root}/models"));
     url.set_query(None);
     url.set_fragment(None);
-    url.query_pairs_mut().append_pair("client_version", version);
+    url.query_pairs_mut()
+        .append_pair("client_version", CODEX_PROTOCOL_VERSION);
     Some(url)
 }
 
@@ -296,11 +291,6 @@ enum Discovery {
 
 impl CodexHttpClient {
     pub async fn prepare_model_context(&self) -> Arc<ModelContext> {
-        self.prepare_model_context_version(CODEX_PROTOCOL_VERSION)
-            .await
-    }
-
-    async fn prepare_model_context_version(&self, version: &str) -> Arc<ModelContext> {
         if let Some(context) =
             current_model_context().filter(|context| context.endpoint == self.base_url)
         {
@@ -317,7 +307,7 @@ impl CodexHttpClient {
         let deadline = Instant::now() + DISCOVERY_TIMEOUT;
         let catalog = if crate::config::codex_model_discovery() {
             if let Some(auth) = auth.as_mut() {
-                self.discover_catalog(auth, version, deadline).await
+                self.discover_catalog(auth, deadline).await
             } else {
                 None
             }
@@ -334,10 +324,9 @@ impl CodexHttpClient {
     async fn discover_catalog(
         &self,
         auth: &mut OperationAuth,
-        version: &str,
         deadline: Instant,
     ) -> Option<Arc<CatalogSnapshot>> {
-        let endpoint = models_endpoint(&self.base_url, version)?;
+        let endpoint = models_endpoint(&self.base_url)?;
         let key = CacheKey {
             identity: identity(auth),
             // The endpoint already includes the client_version query parameter.

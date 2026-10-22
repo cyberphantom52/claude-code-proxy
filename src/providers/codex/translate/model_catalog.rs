@@ -86,12 +86,6 @@ impl Default for CatalogModel {
 }
 
 impl CatalogModel {
-    pub fn supports_effort(&self, effort: &str) -> Option<bool> {
-        self.supported_reasoning_levels
-            .as_ref()
-            .map(|levels| levels.iter().any(|level| level.effort == effort))
-    }
-
     pub fn supports_service_tier(&self, tier: &str) -> Option<bool> {
         if matches!(tier, "auto" | "default" | "flex") {
             return Some(true);
@@ -124,10 +118,6 @@ tokio::task_local! {
 pub async fn scope_catalog<F: Future>(catalog: Arc<CatalogSnapshot>, future: F) -> F::Output {
     // Workers receive resolved request values; task locals do not cross spawn.
     ACTIVE_CATALOG.scope(catalog, future).await
-}
-
-pub fn with_catalog<T>(catalog: Arc<CatalogSnapshot>, f: impl FnOnce() -> T) -> T {
-    ACTIVE_CATALOG.sync_scope(catalog, f)
 }
 
 pub fn scoped_catalog() -> Option<Arc<CatalogSnapshot>> {

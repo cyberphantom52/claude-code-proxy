@@ -78,10 +78,6 @@ pub fn state_dir() -> PathBuf {
     resolve_state_dir(&DirResolverEnv::default())
 }
 
-pub fn codex_auth_file(deps: &DirResolverEnv) -> PathBuf {
-    resolve_config_dir(deps).join("codex").join("auth.json")
-}
-
 pub fn log_file() -> PathBuf {
     resolve_state_dir(&DirResolverEnv::default()).join("proxy.log")
 }
@@ -94,28 +90,4 @@ pub fn provider_auth_file(provider: &str) -> PathBuf {
 pub fn provider_legacy_auth_file(provider: &str) -> PathBuf {
     let deps = DirResolverEnv::default();
     legacy_config_dir(&deps).join(provider).join("auth.json")
-}
-
-pub fn resolve_config_dir_for_env(
-    platform: &str,
-    home: &str,
-    env: &HashMap<String, String>,
-) -> PathBuf {
-    resolve_config_dir(&DirResolverEnv {
-        platform: platform.to_string(),
-        env: env.clone(),
-        home: home.to_string(),
-    })
-}
-
-pub fn resolve_state_dir_for_env(
-    platform: &str,
-    home: &str,
-    env: &HashMap<String, String>,
-) -> PathBuf {
-    resolve_state_dir(&DirResolverEnv {
-        platform: platform.to_string(),
-        env: env.clone(),
-        home: home.to_string(),
-    })
 }

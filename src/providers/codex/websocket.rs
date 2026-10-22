@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -132,10 +132,6 @@ impl CodexWebSocketEventStream {
         self.provider_retry_handoff.store(true, Ordering::Release);
     }
 
-    pub(crate) fn into_receiver(self) -> CodexWebSocketEventReceiver {
-        self.receiver
-    }
-
     pub(crate) fn replace_receiver(
         &mut self,
         receiver: CodexWebSocketEventReceiver,
@@ -210,16 +206,6 @@ impl WebSocketProxyConfig {
         }
     }
 
-    pub(super) fn uses_proxy_for(&self, websocket_url: &str) -> bool {
-        let Ok(http_url) = to_http_upgrade_url(websocket_url) else {
-            return true;
-        };
-        let Ok(destination) = http_url.parse::<http::Uri>() else {
-            return true;
-        };
-        self.matcher.intercept(&destination).is_some()
-    }
-
     fn http_connect_route(
         &self,
         websocket_url: &str,
@@ -251,28 +237,27 @@ impl WebSocketProxyConfig {
     }
 }
 
-static WEBSOCKET_TLS_CONFIG: once_cell::sync::Lazy<Arc<rustls::ClientConfig>> =
-    once_cell::sync::Lazy::new(|| {
-        let mut roots = rustls::RootCertStore::empty();
-        let native = rustls_native_certs::load_native_certs();
-        let load_error_count = native.errors.len();
-        let (_, parse_error_count) = roots.add_parsable_certificates(native.certs);
-        if load_error_count > 0 || parse_error_count > 0 {
-            let mut fields = serde_json::Map::new();
-            fields.insert("loadErrorCount".into(), serde_json::json!(load_error_count));
-            fields.insert(
-                "parseErrorCount".into(),
-                serde_json::json!(parse_error_count),
-            );
-            create_logger("codex").warn("native_certificate_load_errors", Some(fields));
-        }
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        Arc::new(
-            rustls::ClientConfig::builder()
-                .with_root_certificates(roots)
-                .with_no_client_auth(),
-        )
-    });
+static WEBSOCKET_TLS_CONFIG: LazyLock<Arc<rustls::ClientConfig>> = LazyLock::new(|| {
+    let mut roots = rustls::RootCertStore::empty();
+    let native = rustls_native_certs::load_native_certs();
+    let load_error_count = native.errors.len();
+    let (_, parse_error_count) = roots.add_parsable_certificates(native.certs);
+    if load_error_count > 0 || parse_error_count > 0 {
+        let mut fields = serde_json::Map::new();
+        fields.insert("loadErrorCount".into(), serde_json::json!(load_error_count));
+        fields.insert(
+            "parseErrorCount".into(),
+            serde_json::json!(parse_error_count),
+        );
+        create_logger("codex").warn("native_certificate_load_errors", Some(fields));
+    }
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    )
+});
 
 pub(super) fn websocket_tls_config() -> Arc<rustls::ClientConfig> {
     WEBSOCKET_TLS_CONFIG.clone()
@@ -282,34 +267,14 @@ pub(super) fn websocket_tls_config() -> Arc<rustls::ClientConfig> {
 // Errors
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct CodexWebSocketError {
     pub message: String,
-    pub status: Option<u16>,
-    pub code: Option<String>,
-    pub retry_after: Option<String>,
-    pub request_sent: bool,
 }
 
 impl CodexWebSocketError {
     pub fn new(message: String) -> Self {
-        Self {
-            message,
-            status: None,
-            code: None,
-            retry_after: None,
-            request_sent: false,
-        }
-    }
-
-    pub fn with_status(mut self, status: u16) -> Self {
-        self.status = Some(status);
-        self
-    }
-
-    pub fn with_code(mut self, code: String) -> Self {
-        self.code = Some(code);
-        self
+        Self { message }
     }
 }
 
@@ -354,12 +319,10 @@ impl PoolEntry {
 static NEXT_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
 static POOLED_VALIDATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static POOL_ACTIVITY_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-static WS_POOL: once_cell::sync::Lazy<Mutex<HashMap<ConversationIdentity, Arc<PoolEntry>>>> =
-    once_cell::sync::Lazy::new(|| Mutex::new(HashMap::new()));
-static WS_CONNECT_GATE: once_cell::sync::Lazy<WebSocketConnectGate> =
-    once_cell::sync::Lazy::new(|| {
-        WebSocketConnectGate::new(crate::config::codex_websocket_connect_spacing())
-    });
+static WS_POOL: LazyLock<Mutex<HashMap<ConversationIdentity, Arc<PoolEntry>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static WS_CONNECT_GATE: LazyLock<WebSocketConnectGate> =
+    LazyLock::new(|| WebSocketConnectGate::new(crate::config::codex_websocket_connect_spacing()));
 
 fn next_monotonic_nonzero(sequence: &AtomicU64, label: &str) -> u64 {
     let previous = sequence
@@ -386,15 +349,6 @@ pub fn invalidate_codex_websocket_pool_owner(owner: &ConversationIdentity) {
     guard.remove(owner);
 }
 
-#[deprecated(note = "use typed conversation ownership internally")]
-pub fn invalidate_codex_websocket_pool_key(session_id: &str) {
-    let mut guard = WS_POOL.lock().unwrap();
-    guard.retain(|owner, _| match owner {
-        ConversationIdentity::Main(owner_session_id)
-        | ConversationIdentity::Agent(owner_session_id, _) => owner_session_id != session_id,
-    });
-}
-
 pub(crate) fn invalidate_codex_websocket_pool_turn_for_owner(
     owner: &ConversationIdentity,
     turn_id: Option<u64>,
@@ -403,12 +357,6 @@ pub(crate) fn invalidate_codex_websocket_pool_turn_for_owner(
     super::continuation::with_current_turn_for_owner(&reservation, || {
         invalidate_codex_websocket_pool_owner(owner)
     });
-}
-
-#[deprecated(note = "use typed conversation ownership internally")]
-pub fn invalidate_codex_websocket_pool_turn(session_id: &str, turn_id: Option<u64>) {
-    let owner = ConversationIdentity::Main(session_id.to_owned());
-    invalidate_codex_websocket_pool_turn_for_owner(&owner, turn_id);
 }
 
 fn invalidate_pool_entry(owner: &ConversationIdentity, entry: &Arc<PoolEntry>) {
@@ -597,14 +545,14 @@ impl WebSocketConnectGate {
         }
     }
 
-    async fn wait_to_start(&self, before_start: impl std::future::Future<Output = ()>) {
+    async fn wait_to_start(&self) {
         let mut state = self.state.lock().await;
         if let Some(previous) = state.last_start
             && !state.spacing.is_zero()
         {
             tokio::time::sleep_until(previous + state.spacing).await;
         }
-        before_start.await;
+        cleanup_pool_before_connect();
         state.last_start = Some(tokio::time::Instant::now());
     }
 
@@ -1981,28 +1929,27 @@ fn connect_timeout_error(connect_timeout: Duration) -> CodexError {
     ))
 }
 
-async fn connect_with_policy<T, P, PFut, F, Fut>(
-    gate: &WebSocketConnectGate,
-    connect_timeout: Duration,
-    forbidden_cooldown: Duration,
-    mut before_start: P,
-    mut connect: F,
-) -> Result<T, CodexError>
-where
-    P: FnMut() -> PFut,
-    PFut: std::future::Future<Output = ()>,
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<T, ConnectAttemptError>>,
-{
+async fn connect_with_timeout(
+    websocket_client: &reqwest::Client,
+    proxy_config: &WebSocketProxyConfig,
+    url: &str,
+    headers: &HeaderMap,
+    connect_timeout_ms: u64,
+) -> Result<CodexWebSocketStream, CodexError> {
+    let gate = &*WS_CONNECT_GATE;
+    let connect_timeout = Duration::from_millis(connect_timeout_ms);
     for attempt in 0..=1 {
-        gate.wait_to_start(before_start()).await;
-        let result = tokio::time::timeout(connect_timeout, connect())
-            .await
-            .unwrap_or_else(|_| {
-                Err(ConnectAttemptError::Origin(connect_timeout_error(
-                    connect_timeout,
-                )))
-            });
+        gate.wait_to_start().await;
+        let result = tokio::time::timeout(
+            connect_timeout,
+            connect_once(websocket_client, proxy_config, url, headers),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(ConnectAttemptError::Origin(connect_timeout_error(
+                connect_timeout,
+            )))
+        });
         // L'espacement suit ce que l'origine répond réellement : un upgrade refusé
         // l'élargit, une connexion établie le relâche vers le plancher configuré.
         if result
@@ -2011,8 +1958,11 @@ where
         {
             gate.note_origin_forbidden().await;
             if attempt == 0 {
-                retry_sleep(u64::try_from(forbidden_cooldown.as_millis()).unwrap_or(u64::MAX))
-                    .await;
+                retry_sleep(
+                    u64::try_from(WEBSOCKET_CONNECT_FORBIDDEN_COOLDOWN.as_millis())
+                        .unwrap_or(u64::MAX),
+                )
+                .await;
                 continue;
             }
         } else if result.is_ok() {
@@ -2021,23 +1971,6 @@ where
         return result.map_err(ConnectAttemptError::into_error);
     }
     unreachable!()
-}
-
-async fn connect_with_timeout(
-    websocket_client: &reqwest::Client,
-    proxy_config: &WebSocketProxyConfig,
-    url: &str,
-    headers: &HeaderMap,
-    connect_timeout_ms: u64,
-) -> Result<CodexWebSocketStream, CodexError> {
-    connect_with_policy(
-        &WS_CONNECT_GATE,
-        Duration::from_millis(connect_timeout_ms),
-        WEBSOCKET_CONNECT_FORBIDDEN_COOLDOWN,
-        || async { cleanup_pool_before_connect() },
-        || connect_once(websocket_client, proxy_config, url, headers),
-    )
-    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -2053,14 +1986,13 @@ enum WebSocketRead {
 async fn read_ws_frame_with_keepalive<S>(
     ws: &mut WebSocketStream<S>,
     read_timeout: Duration,
-    keepalive_interval: Duration,
 ) -> WebSocketRead
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let timeout = tokio::time::sleep(read_timeout);
     tokio::pin!(timeout);
-    let mut keepalive = tokio::time::interval(keepalive_interval);
+    let mut keepalive = tokio::time::interval(WEBSOCKET_KEEPALIVE_INTERVAL);
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     keepalive.tick().await;
 
@@ -2108,28 +2040,6 @@ async fn collect_ws_events<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    collect_ws_events_with_keepalive_interval(
-        ws,
-        idle_timeout_ms,
-        pool_owner,
-        pool_entry,
-        traffic,
-        WEBSOCKET_KEEPALIVE_INTERVAL,
-    )
-    .await
-}
-
-async fn collect_ws_events_with_keepalive_interval<S>(
-    ws: &mut WebSocketStream<S>,
-    idle_timeout_ms: u64,
-    pool_owner: Option<&ConversationIdentity>,
-    pool_entry: Option<&Arc<PoolEntry>>,
-    traffic: Option<&TrafficCapture>,
-    keepalive_interval: Duration,
-) -> Result<(Vec<u8>, Option<WsEvent>), CodexError>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
     let mut sse_body: Vec<u8> = Vec::new();
     let mut terminal_event: Option<WsEvent> = None;
     let response_event_budget = Duration::from_millis(idle_timeout_ms);
@@ -2168,7 +2078,7 @@ where
             }
         };
 
-        let frame = match read_ws_frame_with_keepalive(ws, read_timeout, keepalive_interval).await {
+        let frame = match read_ws_frame_with_keepalive(ws, read_timeout).await {
             WebSocketRead::Frame(frame) => frame,
             WebSocketRead::Timeout => {
                 invalidate_pool_owner(pool_owner, pool_entry);
@@ -2342,11 +2252,7 @@ where
         let frame = tokio::select! {
             biased;
             _ = tx.closed() => break,
-            frame = read_ws_frame_with_keepalive(
-                ws,
-                read_timeout,
-                WEBSOCKET_KEEPALIVE_INTERVAL,
-            ) => match frame {
+            frame = read_ws_frame_with_keepalive(ws, read_timeout) => match frame {
                 WebSocketRead::Frame(frame) => frame,
                 WebSocketRead::Timeout => {
                     terminal_item = Some(Err(if response_started {

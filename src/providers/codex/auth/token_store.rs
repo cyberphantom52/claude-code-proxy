@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::auth::{AuthSnapshot, AuthStorage, KeychainFileAuthStore, SystemKeychain};
+use crate::auth::{AuthSnapshot, AuthStorage, KeychainFileAuthStore};
 use crate::paths;
 
 pub const KEYCHAIN_SERVICE: &str = "claude-code-proxy.codex";
@@ -58,7 +58,7 @@ impl<S: AuthStorage<StoredAuth>> CodexTokenStore<S> {
     }
 }
 
-pub type DefaultCodexAuthStore = KeychainFileAuthStore<StoredAuth, SystemKeychain>;
+pub type DefaultCodexAuthStore = KeychainFileAuthStore<StoredAuth>;
 
 pub fn file_store() -> CodexTokenStore<DefaultCodexAuthStore> {
     let primary = paths::provider_auth_file("codex");
@@ -69,7 +69,6 @@ pub fn file_store() -> CodexTokenStore<DefaultCodexAuthStore> {
         KEYCHAIN_SERVICE,
         KEYCHAIN_ACCOUNT,
         use_macos_keychain(),
-        SystemKeychain,
     );
     CodexTokenStore::new(store)
 }

@@ -1,10 +1,12 @@
 use crate::{config, paths};
 use serde_json::Value;
-use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{
+    LazyLock,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const MAX_LOG_BYTES: u64 = 20 * 1024 * 1024;
@@ -28,10 +30,6 @@ pub const REDACT_KEYS: [&str; 15] = [
     "apikey",
     "api_key",
 ];
-
-pub fn log_file() -> std::path::PathBuf {
-    paths::log_file()
-}
 
 #[must_use]
 pub struct StderrSuppressionGuard;
@@ -58,23 +56,9 @@ fn should_mirror_to_stderr(level: &str) -> bool {
 #[derive(Clone)]
 pub struct Logger {
     service: String,
-    base: serde_json::Map<String, Value>,
 }
 
 impl Logger {
-    pub fn child(&self, bindings: serde_json::Map<String, Value>) -> Logger {
-        let mut merged = self.base.clone();
-        merged.extend(bindings);
-        Logger {
-            service: self.service.clone(),
-            base: merged,
-        }
-    }
-
-    pub fn debug(&self, msg: &str, fields: Option<serde_json::Map<String, Value>>) {
-        self.emit("debug", msg, fields)
-    }
-
     pub fn info(&self, msg: &str, fields: Option<serde_json::Map<String, Value>>) {
         self.emit("info", msg, fields)
     }
@@ -94,12 +78,8 @@ impl Logger {
         body.insert("service".into(), Value::String(self.service.clone()));
         body.insert("msg".into(), Value::String(msg.to_string()));
 
-        let mut merged = self.base.clone();
-        if let Some(fields) = fields {
-            merged.extend(fields);
-        }
-        if !merged.is_empty() {
-            body.insert("fields".into(), redact_value(Value::Object(merged)));
+        if let Some(fields) = fields.filter(|fields| !fields.is_empty()) {
+            body.insert("fields".into(), redact_value(Value::Object(fields)));
         }
 
         let line = Value::Object(body).to_string();
@@ -116,12 +96,11 @@ impl Logger {
 pub fn create_logger(service: &str) -> Logger {
     Logger {
         service: service.to_string(),
-        base: serde_json::Map::new(),
     }
 }
 
 fn write_log_line(line: &str) -> io::Result<()> {
-    let file = log_file();
+    let file = paths::log_file();
     if let Some(dir) = file.parent() {
         create_dir(dir, 0o700)?;
     }
@@ -165,12 +144,16 @@ fn set_mode(path: &Path, mode: u32) {
 }
 
 fn now_iso8601() -> String {
-    let now = time::OffsetDateTime::now_utc();
-    let format = time::format_description::parse_borrowed::<3>(
-        "[year]-[month]-[day]T[hour]:[minute]:[second]Z",
-    )
-    .unwrap();
-    now.format(&format).unwrap_or_else(|_| String::new())
+    static FORMAT: LazyLock<time::format_description::FormatDescriptionV3<'static>> =
+        LazyLock::new(|| {
+            time::format_description::parse_borrowed::<3>(
+                "[year]-[month]-[day]T[hour]:[minute]:[second]Z",
+            )
+            .expect("valid log timestamp format")
+        });
+    time::OffsetDateTime::now_utc()
+        .format(&*FORMAT)
+        .unwrap_or_default()
 }
 
 pub fn redact_value(value: Value) -> Value {
@@ -219,8 +202,4 @@ fn redact_key_redaction(value: Value) -> Value {
         Value::String(s) => Value::String(format!("[redacted len={}]", s.len())),
         _ => Value::String("[redacted]".to_string()),
     }
-}
-
-pub fn redacted_keys() -> HashSet<&'static str> {
-    REDACT_KEYS.iter().copied().collect()
 }

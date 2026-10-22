@@ -12,7 +12,7 @@ use crate::traffic::TrafficCapture;
 use super::auth::constants::{CODEX_API_ENDPOINT, ORIGINATOR, RESPONSES_LITE_ORIGINATOR};
 use super::auth::manager::CodexAuthManager;
 use super::auth::token_store::{DefaultCodexAuthStore, StoredAuth, file_store};
-pub use super::events::{CodexLimitWindow, CodexUsageLimit};
+use super::events::CodexUsageLimit;
 use super::models::OperationAuth;
 use super::search::{SearchRequest, SearchResponse};
 use super::translate::request::ResponsesRequest;
@@ -57,32 +57,6 @@ impl CodexError {
 impl std::fmt::Display for CodexError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Codex error {}: {}", self.status, self.message)
-    }
-}
-
-#[derive(Debug)]
-pub struct CodexHeaderTimeoutError {
-    pub timeout_ms: u64,
-}
-
-impl std::fmt::Display for CodexHeaderTimeoutError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Timed out waiting {}ms for Codex response headers",
-            self.timeout_ms
-        )
-    }
-}
-
-#[derive(Debug)]
-pub struct CodexTransportError {
-    pub message: String,
-}
-
-impl std::fmt::Display for CodexTransportError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Codex transport error: {}", self.message)
     }
 }
 
@@ -321,7 +295,7 @@ fn search_endpoint(base_url: &str) -> String {
 // WebSocket request shaping
 // ---------------------------------------------------------------------------
 
-pub fn build_websocket_request(
+fn build_websocket_request(
     body: &ResponsesRequest,
     continuation: Option<&super::continuation::ContinuationCandidate>,
 ) -> serde_json::Value {
@@ -388,7 +362,7 @@ struct DecodedHttpSseEvent {
 }
 
 struct HttpEventStreamState {
-    provenance_publisher: Option<super::websocket::CodexWebSocketSocketIdPublisher>,
+    provenance_publisher: super::websocket::CodexWebSocketSocketIdPublisher,
     resp: reqwest::Response,
     response_headers: Vec<(String, String)>,
     started_at: Instant,
@@ -685,22 +659,11 @@ fn websocket_http_client(proxy_environment: &ProxyEnvironment) -> reqwest::Clien
         .expect("failed to create Codex WebSocket HTTP client")
 }
 
-fn custom_client_auto_http_fallback_enabled(
-    base_url: &str,
-    proxy_config: &super::websocket::WebSocketProxyConfig,
-) -> bool {
-    let Ok(websocket_url) = super::websocket::to_websocket_url(base_url) else {
-        return false;
-    };
-    !proxy_config.uses_proxy_for(&websocket_url)
-}
-
 pub struct CodexHttpClient {
     client: reqwest::Client,
     pub(super) native_client: reqwest::Client,
     websocket_client: reqwest::Client,
     websocket_proxy_config: super::websocket::WebSocketProxyConfig,
-    auto_http_fallback_enabled: bool,
     pub(super) auth_manager: CodexAuthManager<DefaultCodexAuthStore>,
     pub(super) base_url: String,
     pub(super) model_cache: super::models::ModelCache,
@@ -726,40 +689,12 @@ impl CodexHttpClient {
             native_client: native_http_client(&proxy_environment),
             websocket_client: websocket_http_client(&proxy_environment),
             websocket_proxy_config: proxy_environment.websocket_proxy_config(),
-            auto_http_fallback_enabled: true,
             model_cache: Default::default(),
             auth_manager: CodexAuthManager::new(file_store()),
             base_url: config::codex_base_url(CODEX_API_ENDPOINT),
             header_timeout_ms: timeout_ms,
             body_idle_timeout_ms: HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS,
         }
-    }
-
-    pub fn new_with_client(
-        client: reqwest::Client,
-        auth_manager: CodexAuthManager<DefaultCodexAuthStore>,
-        base_url: String,
-    ) -> Self {
-        let proxy_environment = ProxyEnvironment::from_env();
-        let websocket_proxy_config = proxy_environment.websocket_proxy_config();
-        let auto_http_fallback_enabled =
-            custom_client_auto_http_fallback_enabled(&base_url, &websocket_proxy_config);
-        Self {
-            native_client: native_http_client(&proxy_environment),
-            websocket_client: websocket_http_client(&proxy_environment),
-            websocket_proxy_config,
-            auto_http_fallback_enabled,
-            model_cache: Default::default(),
-            client,
-            auth_manager,
-            base_url,
-            header_timeout_ms: config::codex_header_timeout_ms(),
-            body_idle_timeout_ms: HTTP_RESPONSE_BODY_IDLE_TIMEOUT_MS,
-        }
-    }
-
-    pub fn auth_manager(&self) -> &CodexAuthManager<DefaultCodexAuthStore> {
-        &self.auth_manager
     }
 
     pub fn body_idle_timeout_ms(&self) -> u64 {
@@ -1039,34 +974,6 @@ impl CodexHttpClient {
         })
     }
 
-    pub async fn post_codex(
-        &self,
-        body: &ResponsesRequest,
-        ctx: &RequestContext,
-        continuation: Option<&super::continuation::ContinuationCandidate>,
-    ) -> Result<CodexResponse, CodexError> {
-        let reservation =
-            continuation.map(super::continuation::ContinuationReservation::from_public_candidate);
-        self.post_codex_with_transport(
-            body,
-            ctx,
-            reservation.as_ref(),
-            crate::config::codex_transport(),
-        )
-        .await
-        .map(OwnerAwareCodexResponse::into_response)
-    }
-
-    pub(crate) async fn post_codex_for_owner(
-        &self,
-        body: &ResponsesRequest,
-        ctx: &RequestContext,
-        continuation: Option<&super::continuation::ContinuationReservation>,
-    ) -> Result<OwnerAwareCodexResponse, CodexError> {
-        self.post_codex_with_transport(body, ctx, continuation, crate::config::codex_transport())
-            .await
-    }
-
     pub async fn post_search(
         &self,
         body: &SearchRequest,
@@ -1133,19 +1040,11 @@ impl CodexHttpClient {
         }
     }
 
-    pub async fn stream_codex_http_events(
-        self: &Arc<Self>,
-        body: &ResponsesRequest,
-        ctx: &RequestContext,
-    ) -> Result<CodexHttpEventReceiver, CodexError> {
-        self.stream_codex_http_events_inner(body, ctx, None).await
-    }
-
     async fn stream_codex_http_events_inner(
         self: &Arc<Self>,
         body: &ResponsesRequest,
         ctx: &RequestContext,
-        provenance_publisher: Option<super::websocket::CodexWebSocketSocketIdPublisher>,
+        provenance_publisher: super::websocket::CodexWebSocketSocketIdPublisher,
     ) -> Result<CodexHttpEventReceiver, CodexError> {
         let mut auth = self.operation_auth().await.map_err(|e| CodexError {
             status: 401,
@@ -1204,9 +1103,7 @@ impl CodexHttpClient {
             }
         };
 
-        if let Some(publisher) = &provenance_publisher {
-            publisher.publish_provenance(auth.provenance(&self.base_url));
-        }
+        provenance_publisher.publish_provenance(auth.provenance(&self.base_url));
         Ok(self.spawn_http_event_stream(
             HttpEventStreamState {
                 provenance_publisher,
@@ -1232,7 +1129,7 @@ impl CodexHttpClient {
         let (mut stream, publisher) =
             super::websocket::CodexWebSocketEventStream::pending(receiver);
         let receiver = self
-            .stream_codex_http_events_inner(body, ctx, Some(publisher))
+            .stream_codex_http_events_inner(body, ctx, publisher)
             .await?;
         stream.replace_receiver(receiver);
         Ok(stream)
@@ -1279,19 +1176,6 @@ impl CodexHttpClient {
             }
             return Ok((resp, headers, started_at));
         }
-    }
-
-    pub async fn stream_codex_auto_events(
-        self: &Arc<Self>,
-        body: &ResponsesRequest,
-        ctx: &RequestContext,
-        continuation: Option<&super::continuation::ContinuationCandidate>,
-    ) -> Result<super::websocket::CodexWebSocketEventReceiver, CodexError> {
-        let reservation =
-            continuation.map(super::continuation::ContinuationReservation::from_public_candidate);
-        self.stream_codex_auto_events_for_owner(body, ctx, reservation.as_ref())
-            .await
-            .map(super::websocket::CodexWebSocketEventStream::into_receiver)
     }
 
     pub(crate) async fn stream_codex_auto_events_for_owner(
@@ -1669,9 +1553,8 @@ impl CodexHttpClient {
                     };
                     match next_attempt {
                         Ok((next_resp, next_response_headers, next_started_at)) => {
-                            if let Some(publisher) = &provenance_publisher {
-                                publisher.publish_provenance(auth.provenance(&client.base_url));
-                            }
+                            provenance_publisher
+                                .publish_provenance(auth.provenance(&client.base_url));
                             resp = next_resp;
                             response_headers = next_response_headers;
                             started_at = next_started_at;
@@ -1692,14 +1575,15 @@ impl CodexHttpClient {
         rx
     }
 
-    async fn post_codex_with_transport(
+    pub(crate) async fn post_codex_for_owner(
         &self,
         body: &ResponsesRequest,
         ctx: &RequestContext,
         continuation: Option<&super::continuation::ContinuationReservation>,
-        transport: crate::config::CodexTransport,
     ) -> Result<OwnerAwareCodexResponse, CodexError> {
         use crate::config::CodexTransport;
+
+        let transport = config::codex_transport();
 
         let mut auth = self.operation_auth().await.map_err(|e| CodexError {
             status: 401,
@@ -1748,32 +1632,7 @@ impl CodexHttpClient {
                         .await
                         .map(|response| OwnerAwareCodexResponse::new(response, None))
                 }
-                CodexTransport::WebSocket => {
-                    let ws_headers =
-                        build_codex_headers(&auth, ctx, body.client_metadata.is_some())?;
-                    let ws_headers = super::websocket::codex_websocket_headers(&ws_headers);
-                    let ws_body = build_websocket_request(
-                        body,
-                        active_continuation
-                            .as_ref()
-                            .map(super::continuation::ContinuationReservation::candidate),
-                    );
-
-                    super::websocket::codex_websocket_request(
-                        &self.websocket_client,
-                        &self.websocket_proxy_config,
-                        &self.base_url,
-                        &ws_headers,
-                        &ws_body,
-                        ctx.traffic.as_deref(),
-                        super::websocket::WEBSOCKET_CONNECT_TIMEOUT_MS,
-                        super::websocket::WEBSOCKET_IDLE_TIMEOUT_MS,
-                        active_continuation.as_ref(),
-                        auth.provenance(&self.base_url),
-                    )
-                    .await
-                }
-                CodexTransport::Auto => {
+                CodexTransport::WebSocket | CodexTransport::Auto => {
                     let ws_headers =
                         build_codex_headers(&auth, ctx, body.client_metadata.is_some())?;
                     let ws_headers = super::websocket::codex_websocket_headers(&ws_headers);
@@ -1812,7 +1671,8 @@ impl CodexHttpClient {
                             Err(err)
                         }
                         Err(err)
-                            if self.auto_http_fallback_enabled && should_fallback_to_http(&err) =>
+                            if transport == CodexTransport::Auto
+                                && should_fallback_to_http(&err) =>
                         {
                             // Fall back to HTTP only if WebSocket failed before sending
                             let body_json =
@@ -2071,19 +1931,6 @@ impl CodexHttpClient {
                 }
             }
         }
-    }
-
-    pub async fn stream_codex_websocket_events(
-        self: &Arc<Self>,
-        body: &ResponsesRequest,
-        ctx: &RequestContext,
-        continuation: Option<&super::continuation::ContinuationCandidate>,
-    ) -> Result<super::websocket::CodexWebSocketEventReceiver, CodexError> {
-        let reservation =
-            continuation.map(super::continuation::ContinuationReservation::from_public_candidate);
-        self.stream_codex_websocket_events_for_owner(body, ctx, reservation.as_ref())
-            .await
-            .map(super::websocket::CodexWebSocketEventStream::into_receiver)
     }
 
     pub(crate) async fn stream_codex_websocket_events_for_owner(

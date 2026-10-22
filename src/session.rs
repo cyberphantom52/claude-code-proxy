@@ -19,14 +19,6 @@ struct SessionStore {
 static SESSIONS: LazyLock<Mutex<SessionStore>> =
     LazyLock::new(|| Mutex::new(SessionStore::default()));
 
-fn now_millis() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let dur = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    dur.as_millis() as u64
-}
-
 pub fn existing_session(session_id: Option<&str>, now: u64) -> Option<SessionState> {
     let id = session_id?;
     let mut store = SESSIONS.lock().expect("session lock");
@@ -37,10 +29,6 @@ pub fn existing_session(session_id: Option<&str>, now: u64) -> Option<SessionSta
         return None;
     }
     Some(state)
-}
-
-pub fn existing_session_now(session_id: Option<&str>) -> Option<SessionState> {
-    existing_session(session_id, now_millis())
 }
 
 pub fn record_session_request(

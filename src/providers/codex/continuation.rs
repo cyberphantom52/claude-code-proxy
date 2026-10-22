@@ -38,11 +38,10 @@ static REGISTRY: Mutex<Option<ContinuationRegistry>> = Mutex::new(None);
 static NEXT_TURN_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
-pub struct ContinuationCandidate {
+pub(crate) struct ContinuationCandidate {
     pub turn_id: Option<u64>,
     pub previous_response_id: Option<String>,
     pub input_delta: Option<Vec<ResponsesInputItem>>,
-    pub input_delta_count: usize,
     pub disabled_reason: Option<String>,
 }
 
@@ -68,12 +67,6 @@ impl ContinuationReservation {
         }
     }
 
-    pub(crate) fn from_public_candidate(candidate: &ContinuationCandidate) -> Self {
-        let mut reservation = Self::new(candidate.clone(), None, None);
-        reservation.provenance = None;
-        reservation
-    }
-
     pub(crate) fn for_owner_turn(
         owner: Option<&ConversationIdentity>,
         turn_id: Option<u64>,
@@ -83,7 +76,6 @@ impl ContinuationReservation {
                 turn_id,
                 previous_response_id: None,
                 input_delta: None,
-                input_delta_count: 0,
                 disabled_reason: None,
             },
             owner.cloned(),
@@ -129,49 +121,13 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-#[deprecated(note = "use the owner-aware provider flow for typed conversation ownership")]
-pub fn continuation_candidate(
-    session_id: Option<&str>,
-    body: &ResponsesRequest,
-    _enabled: bool,
-) -> ContinuationCandidate {
-    ContinuationCandidate {
-        turn_id: None,
-        previous_response_id: None,
-        input_delta: None,
-        input_delta_count: body.input.len(),
-        disabled_reason: Some(
-            if session_id.is_none() {
-                "missing_session"
-            } else {
-                "untyped_ownership"
-            }
-            .to_string(),
-        ),
-    }
-}
-
 pub(crate) fn continuation_candidate_for_owner(
     owner: Option<&ConversationIdentity>,
     body: &ResponsesRequest,
     enabled: bool,
 ) -> ContinuationReservation {
-    continuation_candidate_with_provenance(owner, body, enabled, current_operation_provenance())
-}
-
-pub(crate) fn continuation_candidate_with_provenance(
-    owner: Option<&ConversationIdentity>,
-    body: &ResponsesRequest,
-    enabled: bool,
-    provenance: Option<OperationProvenance>,
-) -> ContinuationReservation {
-    let mut reservation = continuation_candidate_inner(
-        owner,
-        body,
-        enabled,
-        "missing_identity",
-        provenance.as_ref(),
-    );
+    let provenance = current_operation_provenance();
+    let mut reservation = continuation_candidate_inner(owner, body, enabled, provenance.as_ref());
     reservation.provenance = provenance;
     reservation
 }
@@ -180,7 +136,6 @@ fn continuation_candidate_inner(
     owner: Option<&ConversationIdentity>,
     body: &ResponsesRequest,
     enabled: bool,
-    missing_owner_reason: &str,
     provenance: Option<&OperationProvenance>,
 ) -> ContinuationReservation {
     if !enabled {
@@ -189,7 +144,6 @@ fn continuation_candidate_inner(
                 turn_id: None,
                 previous_response_id: None,
                 input_delta: None,
-                input_delta_count: body.input.len(),
                 disabled_reason: Some("disabled".to_string()),
             },
             owner.cloned(),
@@ -203,8 +157,7 @@ fn continuation_candidate_inner(
                 turn_id: None,
                 previous_response_id: None,
                 input_delta: None,
-                input_delta_count: body.input.len(),
-                disabled_reason: Some(missing_owner_reason.to_string()),
+                disabled_reason: Some("missing_identity".to_string()),
             },
             None,
             None,
@@ -212,8 +165,7 @@ fn continuation_candidate_inner(
     };
 
     let Some(provenance) = provenance else {
-        let mut reservation =
-            continuation_candidate_inner(Some(owner), body, false, missing_owner_reason, None);
+        let mut reservation = continuation_candidate_inner(Some(owner), body, false, None);
         reservation.candidate.disabled_reason = Some("missing_provenance".to_string());
         return reservation;
     };
@@ -275,7 +227,6 @@ fn continuation_candidate_from_state(
                     turn_id: Some(turn_id),
                     previous_response_id: None,
                     input_delta: None,
-                    input_delta_count: body.input.len(),
                     disabled_reason: Some(if superseded_turn {
                         "superseded_turn".to_string()
                     } else {
@@ -295,7 +246,6 @@ fn continuation_candidate_from_state(
                 turn_id: Some(turn_id),
                 previous_response_id: None,
                 input_delta: None,
-                input_delta_count: body.input.len(),
                 disabled_reason: Some("prompt_changed".to_string()),
             },
             Some(owner.clone()),
@@ -309,7 +259,6 @@ fn continuation_candidate_from_state(
                 turn_id: Some(turn_id),
                 previous_response_id: None,
                 input_delta: None,
-                input_delta_count: body.input.len(),
                 disabled_reason: Some("not_append_only".to_string()),
             },
             Some(owner.clone()),
@@ -323,7 +272,6 @@ fn continuation_candidate_from_state(
                 turn_id: Some(turn_id),
                 previous_response_id: None,
                 input_delta: None,
-                input_delta_count: 0,
                 disabled_reason: Some("empty_delta".to_string()),
             },
             Some(owner.clone()),
@@ -335,23 +283,12 @@ fn continuation_candidate_from_state(
         ContinuationCandidate {
             turn_id: Some(turn_id),
             previous_response_id: Some(state.response_id),
-            input_delta_count: suffix.len(),
             input_delta: Some(suffix),
             disabled_reason: None,
         },
         Some(owner.clone()),
         Some(state.socket_id),
     )
-}
-
-#[deprecated(note = "recording without typed socket provenance is not reusable")]
-pub fn record_continuation(
-    _session_id: Option<&str>,
-    _turn_id: Option<u64>,
-    _request_body: &ResponsesRequest,
-    _response_id: Option<&str>,
-    _output_items: &[ResponsesInputItem],
-) {
 }
 
 pub(crate) fn record_continuation_for_owner(
@@ -423,9 +360,6 @@ pub(crate) fn record_continuation_for_owner(
     evict_oldest(registry);
 }
 
-#[deprecated(note = "use the owner-aware provider flow for typed conversation ownership")]
-pub fn abort_continuation(_session_id: Option<&str>, _turn_id: Option<u64>) {}
-
 pub(crate) fn abort_continuation_for_owner(reservation: &ContinuationReservation) {
     abort_continuation_inner(reservation.owner(), reservation.turn_id());
 }
@@ -451,28 +385,11 @@ fn abort_continuation_inner(owner: Option<&ConversationIdentity>, turn_id: Optio
     }
 }
 
-#[deprecated(note = "use the owner-aware provider flow for typed conversation ownership")]
-pub fn if_current_turn<T>(
-    _session_id: Option<&str>,
-    _turn_id: Option<u64>,
-    _action: impl FnOnce() -> T,
-) -> Option<T> {
-    None
-}
-
 pub(crate) fn if_current_turn_for_owner<T>(
     reservation: &ContinuationReservation,
     action: impl FnOnce() -> T,
 ) -> Option<T> {
-    if_current_turn_inner(reservation.owner(), reservation.turn_id(), action)
-}
-
-fn if_current_turn_inner<T>(
-    owner: Option<&ConversationIdentity>,
-    turn_id: Option<u64>,
-    action: impl FnOnce() -> T,
-) -> Option<T> {
-    let (Some(owner), Some(turn_id)) = (owner, turn_id) else {
+    let (Some(owner), Some(turn_id)) = (reservation.owner(), reservation.turn_id()) else {
         return None;
     };
     let guard = REGISTRY.lock().unwrap();
@@ -483,29 +400,12 @@ fn if_current_turn_inner<T>(
     current.then(action)
 }
 
-#[deprecated(note = "use the owner-aware provider flow for typed conversation ownership")]
-pub fn with_current_turn(
-    _session_id: Option<&str>,
-    _turn_id: Option<u64>,
-    _action: impl FnOnce(),
-) -> bool {
-    false
-}
-
 pub(crate) fn with_current_turn_for_owner(
     reservation: &ContinuationReservation,
     action: impl FnOnce(),
 ) -> bool {
     if_current_turn_for_owner(reservation, action).is_some()
 }
-
-#[deprecated(note = "use the owner-aware provider flow for typed conversation ownership")]
-pub fn is_current_turn(_session_id: Option<&str>, _turn_id: Option<u64>) -> bool {
-    false
-}
-
-#[deprecated(note = "use the owner-aware provider flow for typed conversation ownership")]
-pub fn clear_continuation(_session_id: Option<&str>) {}
 
 fn input_suffix_after_prefix(
     input: &[ResponsesInputItem],

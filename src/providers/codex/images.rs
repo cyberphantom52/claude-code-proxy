@@ -147,18 +147,18 @@ pub struct PreparedImageRequest {
 }
 
 pub struct CodexImagesBackend {
-    client: std::sync::Arc<super::client::CodexHttpClient>,
+    client: super::client::CodexHttpClient,
     base_url: String,
-    limiter: std::sync::Arc<tokio::sync::Semaphore>,
+    limiter: tokio::sync::Semaphore,
 }
 
 impl CodexImagesBackend {
     pub fn new() -> Result<Self, String> {
         let base_url = validate_image_base_url(&crate::config::codex_images_base_url())?;
         Ok(Self {
-            client: std::sync::Arc::new(super::client::CodexHttpClient::new()),
+            client: super::client::CodexHttpClient::new(),
             base_url,
-            limiter: std::sync::Arc::new(tokio::sync::Semaphore::new(2)),
+            limiter: tokio::sync::Semaphore::new(2),
         })
     }
 
@@ -170,7 +170,7 @@ impl CodexImagesBackend {
     ) -> axum::response::Response {
         use axum::response::IntoResponse;
 
-        let _permit = match self.limiter.clone().try_acquire_owned() {
+        let _permit = match self.limiter.try_acquire() {
             Ok(permit) => permit,
             Err(_) => {
                 return image_error_response(ImageRequestError {
@@ -313,12 +313,7 @@ fn copy_safe_image_headers(source: &http::HeaderMap, target: &mut http::HeaderMa
 
 fn image_transport_error_response(error: super::client::CodexError) -> axum::response::Response {
     let status = match error.status {
-        401 => StatusCode::UNAUTHORIZED,
-        403 => StatusCode::FORBIDDEN,
-        429 => StatusCode::TOO_MANY_REQUESTS,
-        value if (400..=599).contains(&value) => {
-            StatusCode::from_u16(value).unwrap_or(StatusCode::BAD_GATEWAY)
-        }
+        value @ 400..=599 => StatusCode::from_u16(value).unwrap_or(StatusCode::BAD_GATEWAY),
         _ => StatusCode::BAD_GATEWAY,
     };
     let mut response = image_error_response(ImageRequestError {

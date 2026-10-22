@@ -287,13 +287,7 @@ pub struct CodexUsageLimit {
 /// (`resets_at`, `resets_in_seconds`) and in `X-Codex-*` headers mirrored into
 /// the event payload.
 pub(crate) fn usage_limit_from_event(payload: &Value) -> Option<CodexUsageLimit> {
-    if !matches!(
-        payload.get("type").and_then(Value::as_str),
-        Some("response.failed" | "response.error" | "error")
-    ) {
-        return None;
-    }
-    usage_limit_from_payload_with_headers(payload, &[])
+    usage_limit_from_event_with_headers(payload, &[])
 }
 
 /// Read a quota exhaustion event while consulting the current HTTP response
@@ -322,21 +316,9 @@ pub(crate) fn usage_limit_from_response(
     let events = crate::anthropic::sse::parse_sse_events(body)
         .into_iter()
         .filter_map(|event| serde_json::from_str::<Value>(&event.data).ok());
-    direct.chain(events).find_map(|payload| {
-        // Parse JSON before checking the event shape so escaped strings and all
-        // other valid JSON forms retain serde_json's normal semantics. Header
-        // lookup is only needed for an actual quota event.
-        is_usage_limit_payload(&payload)
-            .then(|| usage_limit_from_payload_with_headers(&payload, headers))
-            .flatten()
-    })
-}
-
-fn is_usage_limit_payload(payload: &Value) -> bool {
-    event_error(payload)
-        .and_then(|error| error.get("type"))
-        .and_then(Value::as_str)
-        == Some("usage_limit_reached")
+    direct
+        .chain(events)
+        .find_map(|payload| usage_limit_from_payload_with_headers(&payload, headers))
 }
 
 fn usage_limit_from_payload_with_headers(

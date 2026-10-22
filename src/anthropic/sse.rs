@@ -6,28 +6,13 @@ pub struct SseEvent {
     pub data: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SseParseStats {
-    pub bytes_read: usize,
-    pub chunk_count: usize,
-    pub event_count: usize,
-}
-
 pub fn parse_sse_events(input: &[u8]) -> Vec<SseEvent> {
-    parse_sse_events_with_stats(input).0
-}
-
-pub fn parse_sse_events_with_stats(input: &[u8]) -> (Vec<SseEvent>, SseParseStats) {
     let text = String::from_utf8_lossy(input);
     let normalized = normalize_lines(&text);
     let mut events = Vec::new();
     let mut block = String::new();
-    let mut bytes_read = 0usize;
-    let mut chunk_count = 0usize;
 
     for segment in normalized.split('\n') {
-        chunk_count += 1;
-        bytes_read += segment.len() + 1;
         if segment.is_empty() {
             events.extend(parse_block(&block));
             block.clear();
@@ -43,14 +28,7 @@ pub fn parse_sse_events_with_stats(input: &[u8]) -> (Vec<SseEvent>, SseParseStat
         events.extend(parse_block(&block));
     }
 
-    let event_count = events.len();
-    let payload = SseParseStats {
-        bytes_read,
-        chunk_count,
-        event_count,
-    };
-
-    (events, payload)
+    events
 }
 
 pub fn encode_sse_event(event: Option<&str>, data: &str) -> Vec<u8> {

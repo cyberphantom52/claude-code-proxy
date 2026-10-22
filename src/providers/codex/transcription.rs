@@ -51,17 +51,15 @@ struct TranscriptionResponse<'a> {
 }
 
 pub struct CodexTranscriptionBackend {
-    client: std::sync::Arc<super::client::CodexHttpClient>,
-    base_url: String,
-    limiter: std::sync::Arc<tokio::sync::Semaphore>,
+    client: super::client::CodexHttpClient,
+    limiter: tokio::sync::Semaphore,
 }
 
 impl CodexTranscriptionBackend {
     pub fn new() -> Self {
         Self {
-            client: std::sync::Arc::new(super::client::CodexHttpClient::new()),
-            base_url: TRANSCRIPTION_BASE_URL.to_string(),
-            limiter: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
+            client: super::client::CodexHttpClient::new(),
+            limiter: tokio::sync::Semaphore::new(4),
         }
     }
 
@@ -70,7 +68,7 @@ impl CodexTranscriptionBackend {
         input: PreparedTranscription,
         ctx: crate::provider::RequestContext,
     ) -> Response {
-        let _permit = match self.limiter.clone().try_acquire_owned() {
+        let _permit = match self.limiter.try_acquire() {
             Ok(permit) => permit,
             Err(_) => {
                 return transcription_error_response(TranscriptionRequestError {
@@ -86,7 +84,7 @@ impl CodexTranscriptionBackend {
         }
         let upstream = match self
             .client
-            .post_transcription(&self.base_url, &input, &ctx)
+            .post_transcription(TRANSCRIPTION_BASE_URL, &input, &ctx)
             .await
         {
             Ok(response) => response,
@@ -286,12 +284,7 @@ fn copy_safe_headers(source: &http::HeaderMap, target: &mut http::HeaderMap) {
 
 fn transcription_transport_error_response(error: super::client::CodexError) -> Response {
     let status = match error.status {
-        401 => StatusCode::UNAUTHORIZED,
-        403 => StatusCode::FORBIDDEN,
-        429 => StatusCode::TOO_MANY_REQUESTS,
-        value if (400..=599).contains(&value) => {
-            StatusCode::from_u16(value).unwrap_or(StatusCode::BAD_GATEWAY)
-        }
+        value @ 400..=599 => StatusCode::from_u16(value).unwrap_or(StatusCode::BAD_GATEWAY),
         _ => StatusCode::BAD_GATEWAY,
     };
     let mut response = transcription_error_response(TranscriptionRequestError {

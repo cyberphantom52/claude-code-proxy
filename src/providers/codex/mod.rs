@@ -57,8 +57,7 @@ use self::count_tokens::count_translated_tokens;
 use self::translate::accumulate::accumulate_response_with_traffic;
 use self::translate::live_stream::LiveStreamTranslator;
 use self::translate::model_allowlist::{
-    assert_allowed_model, resolve_model_request_with_config_override, uses_responses_lite,
-    validate_hosted_web_search,
+    assert_allowed_model, resolve_model_request, uses_responses_lite, validate_hosted_web_search,
 };
 use self::translate::reducer::finish_metadata_from_upstream;
 use self::translate::request::{
@@ -127,8 +126,7 @@ impl CodexProvider {
             );
         }
 
-        let resolved =
-            resolve_model_request_with_config_override(model, !body.bypass_provider_model_override);
+        let resolved = resolve_model_request(model);
         if let Err(e) = assert_allowed_model(&resolved.model) {
             return json_error(
                 StatusCode::BAD_REQUEST,
@@ -632,8 +630,7 @@ impl CodexProvider {
                 error.to_string(),
             );
         }
-        let resolved =
-            resolve_model_request_with_config_override(model, !body.bypass_provider_model_override);
+        let resolved = resolve_model_request(model);
         if let Err(e) = assert_allowed_model(&resolved.model) {
             return json_error(
                 StatusCode::BAD_REQUEST,
@@ -2260,7 +2257,3 @@ fn format_auth_saved_output(auth_path: &str, account_id: Option<&str>) -> String
     }
     out
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------

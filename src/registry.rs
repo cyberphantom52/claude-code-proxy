@@ -55,10 +55,6 @@ impl Registry {
         Self { models, handlers }
     }
 
-    pub fn list_provider_names(&self) -> Vec<String> {
-        self.handlers.keys().cloned().collect()
-    }
-
     pub fn provider(&self, name: &str) -> Option<Arc<dyn Provider>> {
         self.handlers.get(name).cloned()
     }
@@ -75,8 +71,7 @@ impl Registry {
                 models.dedup();
             }
             for alias in ANTHROPIC_STYLE_ALIASES {
-                let target =
-                    model_allowlist::resolve_model_request_with_config_override(alias, false);
+                let target = model_allowlist::resolve_model_request(alias);
                 if model_catalog::catalog_model(&target.model).is_some()
                     && !models.iter().any(|value| value == alias)
                 {

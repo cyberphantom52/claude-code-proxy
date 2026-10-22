@@ -8,6 +8,7 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 use http::{HeaderMap, HeaderName, StatusCode};
+use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use crate::anthropic::sse::parse_sse_events;
@@ -20,13 +21,13 @@ use crate::traffic::{
 use super::client::{CodexError, CodexHttpClient};
 use super::translate::model_allowlist::{
     assert_allowed_model, model_parallel_tool_calls, model_reasoning_summary, model_verbosity,
-    resolve_model_effort, resolve_model_request_with_config_override, resolve_service_tier_value,
-    uses_responses_lite, validate_hosted_web_search, validate_input_modalities,
+    resolve_model_effort, resolve_model_request, resolve_service_tier_value, uses_responses_lite,
+    validate_hosted_web_search, validate_input_modalities,
 };
-use super::translate::request::{Effort, effort_wire_value};
+use super::translate::request::{Effort, ServiceTier, effort_wire_value};
 
 pub struct CodexNativeBackend {
-    client: Arc<CodexHttpClient>,
+    client: CodexHttpClient,
 }
 
 impl Default for CodexNativeBackend {
@@ -38,7 +39,7 @@ impl Default for CodexNativeBackend {
 impl CodexNativeBackend {
     pub fn new() -> Self {
         Self {
-            client: Arc::new(CodexHttpClient::new()),
+            client: CodexHttpClient::new(),
         }
     }
 
@@ -72,7 +73,7 @@ struct NativeResolved {
 }
 
 #[allow(clippy::result_large_err)]
-pub fn validate_native_request_model(body: &Value) -> Result<String, Response> {
+pub fn validate_native_request_model(body: &Value) -> Result<&str, Response> {
     let object = body.as_object().ok_or_else(|| {
         openai_error(
             StatusCode::BAD_REQUEST,
@@ -86,7 +87,6 @@ pub fn validate_native_request_model(body: &Value) -> Result<String, Response> {
         .get("model")
         .and_then(Value::as_str)
         .filter(|model| !model.is_empty())
-        .map(str::to_string)
         .ok_or_else(|| {
             openai_error(
                 StatusCode::BAD_REQUEST,
@@ -96,7 +96,7 @@ pub fn validate_native_request_model(body: &Value) -> Result<String, Response> {
                 None,
             )
         })?;
-    let resolved = resolve_model_request_with_config_override(&requested, false);
+    let resolved = resolve_model_request(requested);
     if let Err(error) = assert_allowed_model(&resolved.model) {
         return Err(openai_error(
             StatusCode::BAD_REQUEST,
@@ -112,11 +112,11 @@ pub fn validate_native_request_model(body: &Value) -> Result<String, Response> {
 #[allow(clippy::result_large_err)]
 fn shape_native_request(body: &mut Value) -> Result<NativeResolved, Response> {
     let requested = validate_native_request_model(body)?;
+    let resolved = resolve_model_request(requested);
     let object = body
         .as_object_mut()
         .expect("validated native Responses body must be an object");
 
-    let resolved = resolve_model_request_with_config_override(&requested, false);
     let model = resolved.model;
 
     let hosted_web_search = has_native_hosted_web_search(object);
@@ -196,7 +196,7 @@ fn apply_native_capabilities(
     if let Some(tier) = native_optional_string(object, "service_tier", "service_tier")? {
         let tier = resolve_service_tier_value(model, tier)
             .map_err(|error| invalid_capability("service_tier", error))?;
-        if String::from(tier.clone()) == "default" {
+        if matches!(&tier, ServiceTier::Other(value) if value == "default") {
             object.remove("service_tier");
         } else {
             object.insert("service_tier".to_string(), json!(tier));
@@ -216,7 +216,7 @@ fn apply_native_capabilities(
     let explicit_effort = match reasoning.get("effort") {
         None | Some(Value::Null) => None,
         Some(value) => Some(
-            serde_json::from_value::<Effort>(value.clone())
+            Effort::deserialize(value)
                 .map_err(|error| invalid_capability("reasoning.effort", error))?
                 .to_string(),
         ),
@@ -255,9 +255,9 @@ fn apply_native_capabilities(
     if !reasoning.is_empty() && object.get("reasoning") != Some(&Value::Null) {
         object.insert("reasoning".to_string(), Value::Object(reasoning));
     }
-    let mut text = match object.get("text") {
+    let mut text = match object.get_mut("text") {
         None | Some(Value::Null) => Map::new(),
-        Some(Value::Object(text)) => text.clone(),
+        Some(Value::Object(text)) => std::mem::take(text),
         Some(_) => return Err(invalid_capability("text", "text must be an object")),
     };
     let requested_verbosity = native_optional_string(&text, "verbosity", "text.verbosity")?;
@@ -296,9 +296,6 @@ fn has_native_hosted_web_search(object: &Map<String, Value>) -> bool {
 
 fn local_codex_error(error: CodexError) -> Response {
     let status = match error.status {
-        401 => StatusCode::UNAUTHORIZED,
-        403 => StatusCode::FORBIDDEN,
-        429 => StatusCode::TOO_MANY_REQUESTS,
         400..=599 => StatusCode::from_u16(error.status).unwrap_or(StatusCode::BAD_GATEWAY),
         _ => StatusCode::BAD_GATEWAY,
     };
@@ -309,13 +306,13 @@ fn local_codex_error(error: CodexError) -> Response {
         _ => "api_error",
     };
     let message = error.detail.as_deref().unwrap_or(&error.message);
-    let response = openai_error(status, kind, message, None, None);
+    let mut response = openai_error(status, kind, message, None, None);
     if let Some(retry_after) = error.retry_after
         && let Ok(value) = http::HeaderValue::from_str(&retry_after)
     {
-        let (mut parts, body) = response.into_parts();
-        parts.headers.insert(http::header::RETRY_AFTER, value);
-        return Response::from_parts(parts, body);
+        response
+            .headers_mut()
+            .insert(http::header::RETRY_AFTER, value);
     }
     response
 }
@@ -536,7 +533,7 @@ impl NativeResponseObserver {
 
     fn drain_sse_events(&mut self) -> u64 {
         if self.discarding_oversized_frame {
-            let Some((end, separator_len)) = find_sse_boundary(&self.pending) else {
+            let Some((end, separator_len)) = find_sse_boundary_from(&self.pending, 0) else {
                 retain_boundary_prefix(&mut self.pending);
                 return 0;
             };
@@ -736,11 +733,7 @@ impl Drop for NativeResponseObserver {
     }
 }
 
-fn find_sse_boundary(bytes: &[u8]) -> Option<(usize, usize)> {
-    find_sse_boundary_from(bytes, 0)
-}
-
-fn find_sse_boundary_from(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
+pub(super) fn find_sse_boundary_from(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
     for index in start.min(bytes.len())..bytes.len() {
         if bytes[index..].starts_with(b"\r\n\r\n") {
             return Some((index, 4));

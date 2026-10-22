@@ -307,7 +307,6 @@ dependencies = [
  "http-body-util",
  "hyper-util",
  "jiff",
- "once_cell",
  "rand 0.8.6",
  "ratatui",
  "regex-lite",

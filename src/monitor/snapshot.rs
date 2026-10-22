@@ -250,9 +250,7 @@ impl From<SessionSummary> for SessionSnapshot {
 }
 
 impl SessionSnapshot {
-    pub fn label(&self) -> String {
-        self.session_id
-            .clone()
-            .unwrap_or_else(|| "no-session".to_string())
+    pub fn label(&self) -> &str {
+        self.session_id.as_deref().unwrap_or("no-session")
     }
 }

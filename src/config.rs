@@ -161,10 +161,6 @@ fn load_config_from_env(env: &HashMap<String, String>, config_dir: PathBuf) -> L
     out
 }
 
-pub fn config_path() -> PathBuf {
-    paths::config_dir().join("config.json")
-}
-
 pub fn port() -> u16 {
     load_config().port
 }
@@ -179,104 +175,6 @@ pub fn log_verbose() -> bool {
 
 pub fn log_stderr() -> bool {
     load_config().log_stderr
-}
-
-pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
-    let file = read_file_config(&cfg.config_dir);
-    let env: HashMap<_, _> = std::env::vars().collect();
-    let mut out = Vec::new();
-    if env.contains_key("CCP_BIND_ADDRESS") {
-        out.push("bindAddress (env)".to_string());
-    }
-    if env.contains_key("PORT") {
-        out.push("port (env)".to_string());
-    }
-    if env.contains_key("CCP_LOG_VERBOSE") {
-        out.push("log.verbose (env)".to_string());
-    }
-    if env.contains_key("CCP_LOG_STDERR") {
-        out.push("log.stderr (env)".to_string());
-    }
-    if env.contains_key("CCP_CODEX_RESPONSES_API") {
-        out.push("codex.responsesApi (env)".to_string());
-    }
-    if env.contains_key("CCP_CODEX_IMAGES_API") {
-        out.push("codex.imagesApi (env)".to_string());
-    }
-    if env.contains_key("CCP_CODEX_IMAGES_BASE_URL") {
-        out.push("codex.imagesBaseUrl (env)".to_string());
-    }
-    if env.contains_key("CCP_CODEX_TRANSCRIPTIONS_API") {
-        out.push("codex.transcriptionsApi (env)".to_string());
-    }
-    if env
-        .get("CCP_CODEX_REASONING_SUMMARY")
-        .is_some_and(|raw| !raw.is_empty())
-    {
-        out.push("CCP_CODEX_REASONING_SUMMARY (env)".to_string());
-    }
-    if env.contains_key("CCP_CODEX_SERVER_COMPACTION") {
-        out.push("CCP_CODEX_SERVER_COMPACTION (env)".to_string());
-    }
-    if env
-        .get("CCP_AUTO_REVIEW_MODEL")
-        .is_some_and(|raw| !raw.is_empty())
-    {
-        out.push("CCP_AUTO_REVIEW_MODEL (env)".to_string());
-    }
-    if let Some(file_cfg) = file {
-        if let Some(bind_address) = file_cfg.bind_address {
-            out.push(format!("bindAddress: {bind_address}"));
-        }
-        if let Some(p) = file_cfg.port {
-            out.push(format!("port: {p}"));
-        }
-        if file_cfg
-            .auto_review_model
-            .is_some_and(|model| !model.is_empty())
-        {
-            out.push("autoReviewModel (config)".to_string());
-        }
-        if let Some(log) = file_cfg.log {
-            if let Some(v) = log.verbose {
-                out.push(format!("log.verbose: {v}"));
-            }
-            if let Some(v) = log.stderr {
-                out.push(format!("log.stderr: {v}"));
-            }
-        }
-        if let Some(codex) = file_cfg.codex {
-            if codex
-                .reasoning_summary
-                .is_some_and(|value| !value.is_empty())
-            {
-                out.push("codex.reasoningSummary (config)".to_string());
-            }
-            if let Some(enabled) = codex.server_compaction {
-                out.push(format!("codex.serverCompaction: {enabled}"));
-            }
-            if codex.responses_api == Some(true) {
-                out.push("codex.responsesApi: true".to_string());
-            }
-            if codex.images_api == Some(true) {
-                out.push("codex.imagesApi: true".to_string());
-            }
-            if codex.images_base_url.is_some() {
-                out.push("codex.imagesBaseUrl (config)".to_string());
-            }
-            if codex.transcriptions_api == Some(true) {
-                out.push("codex.transcriptionsApi: true".to_string());
-            }
-            if let Some(ms) = codex.header_timeout_ms {
-                out.push(format!("codex.headerTimeoutMs: {ms}"));
-            }
-        }
-    }
-    out
-}
-
-pub fn is_verbose() -> bool {
-    log_verbose()
 }
 
 // ---------------------------------------------------------------------------

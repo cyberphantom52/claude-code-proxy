@@ -2,7 +2,7 @@ pub mod request;
 pub mod response;
 pub mod stream;
 
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 use axum::{
     Json,
@@ -18,7 +18,7 @@ use super::client::{CodexError, CodexHttpClient};
 use request::TranslatedRequest;
 
 pub struct ChatCompletionsBackend {
-    client: Arc<CodexHttpClient>,
+    client: CodexHttpClient,
 }
 
 impl Default for ChatCompletionsBackend {
@@ -30,7 +30,7 @@ impl Default for ChatCompletionsBackend {
 impl ChatCompletionsBackend {
     pub fn new() -> Self {
         Self {
-            client: Arc::new(CodexHttpClient::new()),
+            client: CodexHttpClient::new(),
         }
     }
 
@@ -150,18 +150,17 @@ async fn collect_body(
     }
 }
 
-fn codex_error_response(error: CodexError) -> Response {
-    let retry_after = error.retry_after.clone();
-    let response = ChatError::from_codex(error).response();
+fn codex_error_response(mut error: CodexError) -> Response {
+    let retry_after = error.retry_after.take();
+    let mut response = ChatError::from_codex(error).response();
     if let Some(retry_after) = retry_after
         && let Ok(value) = http::HeaderValue::from_str(&retry_after)
     {
-        let (mut parts, body) = response.into_parts();
-        parts.headers.insert(http::header::RETRY_AFTER, value);
-        Response::from_parts(parts, body)
-    } else {
         response
+            .headers_mut()
+            .insert(http::header::RETRY_AFTER, value);
     }
+    response
 }
 
 async fn upstream_error_response(upstream: reqwest::Response, idle_timeout_ms: u64) -> Response {

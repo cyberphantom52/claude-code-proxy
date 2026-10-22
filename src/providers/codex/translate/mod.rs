@@ -6,5 +6,4 @@ pub mod read_rewrite;
 pub mod reasoning_signature;
 pub mod reducer;
 pub mod request;
-pub mod stream;
 pub mod web_search_compat;

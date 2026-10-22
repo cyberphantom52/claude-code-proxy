@@ -51,19 +51,6 @@ impl Default for MockMonitor {
     }
 }
 
-pub fn mock_state() -> MonitorState {
-    let now = SystemTime::now();
-    let mut output_buckets = initial_output_buckets(now);
-    advance_output_buckets(&mut output_buckets, now, 0);
-    mock_state_for_tick(
-        now - Duration::from_secs(3_723),
-        now,
-        Instant::now(),
-        0,
-        &output_buckets,
-    )
-}
-
 fn mock_state_for_tick(
     started_at: SystemTime,
     now: SystemTime,

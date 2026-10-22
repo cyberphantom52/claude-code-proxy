@@ -502,16 +502,18 @@ pub fn normalize_strict_json_schema(schema: &Value) -> Value {
     match schema {
         Value::Array(arr) => Value::Array(arr.iter().map(normalize_strict_json_schema).collect()),
         Value::Object(map) => {
-            let mut out = map.clone();
-            if let Some(properties) = out.get("properties").and_then(|v| v.as_object()) {
-                let keys: Vec<String> = properties.keys().cloned().collect();
-                out.insert(
-                    "required".into(),
-                    Value::Array(keys.into_iter().map(Value::String).collect()),
-                );
-            }
-            for (key, val) in out.clone().iter() {
-                out.insert(key.clone(), normalize_strict_json_schema(val));
+            let required = map
+                .get("properties")
+                .and_then(Value::as_object)
+                .map(|properties| {
+                    Value::Array(properties.keys().cloned().map(Value::String).collect())
+                });
+            let mut out: serde_json::Map<String, Value> = map
+                .iter()
+                .map(|(key, value)| (key.clone(), normalize_strict_json_schema(value)))
+                .collect();
+            if let Some(required) = required {
+                out.insert("required".into(), required);
             }
             Value::Object(out)
         }
@@ -693,7 +695,7 @@ pub fn translate_request(
             None
         };
         out.reasoning = Some(ResponsesReasoning {
-            effort: resolved_effort.clone(),
+            effort: resolved_effort,
             summary,
             context: opts.use_responses_lite.then_some("all_turns".to_string()),
         });
@@ -1107,14 +1109,14 @@ fn build_input(req: &MessagesRequest) -> anyhow::Result<Vec<ResponsesInputItem>>
         match msg.role.as_str() {
             "user" => {
                 let mut parts: Vec<ResponsesContentPart> = Vec::new();
-                for block in &blocks {
+                for block in blocks {
                     match block {
                         ContentBlock::Text { text } => {
-                            parts.push(ResponsesContentPart::InputText { text: text.clone() });
+                            parts.push(ResponsesContentPart::InputText { text });
                         }
                         ContentBlock::Image { source } => {
                             parts.push(ResponsesContentPart::InputImage {
-                                image_url: image_source_to_url(source),
+                                image_url: image_source_to_url(&source),
                                 detail: None,
                             });
                         }
@@ -1129,24 +1131,24 @@ fn build_input(req: &MessagesRequest) -> anyhow::Result<Vec<ResponsesInputItem>>
                                     content: std::mem::take(&mut parts),
                                 });
                             }
-                            let mut rendered = render_tool_result(content);
+                            let mut rendered = render_tool_result(&content);
                             if is_error.unwrap_or(false) {
                                 rendered.prepend_text("[tool execution error]".to_string());
                             }
                             if let Some(note) =
-                                rewritten_read_offset_note(&rendered.joined_text(), tool_use_id)
+                                rewritten_read_offset_note(&rendered.joined_text(), &tool_use_id)
                             {
                                 rendered.push_text(format!("\n{note}"));
                             }
                             if should_append_read_offset_guidance(
                                 &rendered.joined_text(),
-                                read_tool_uses_with_offset.contains(tool_use_id),
+                                read_tool_uses_with_offset.contains(&tool_use_id),
                                 is_error.unwrap_or(false),
                             ) {
                                 rendered.push_text(format!("\n{}", read_offset_guidance()));
                             }
                             out.push(ResponsesInputItem::FunctionCallOutput {
-                                call_id: tool_use_id.clone(),
+                                call_id: tool_use_id,
                                 output: function_call_output(rendered),
                             });
                         }
@@ -1162,10 +1164,10 @@ fn build_input(req: &MessagesRequest) -> anyhow::Result<Vec<ResponsesInputItem>>
             }
             "system" => {
                 let parts: Vec<ResponsesContentPart> = blocks
-                    .iter()
+                    .into_iter()
                     .filter_map(|b| match b {
                         ContentBlock::Text { text } => {
-                            Some(ResponsesContentPart::InputText { text: text.clone() })
+                            Some(ResponsesContentPart::InputText { text })
                         }
                         _ => None,
                     })
@@ -1189,22 +1191,21 @@ fn build_input(req: &MessagesRequest) -> anyhow::Result<Vec<ResponsesInputItem>>
                             });
                         }
                     };
-                for block in &blocks {
+                for block in blocks {
                     match block {
                         ContentBlock::Text { text } => {
-                            text_parts
-                                .push(ResponsesContentPart::OutputText { text: text.clone() });
+                            text_parts.push(ResponsesContentPart::OutputText { text });
                         }
                         ContentBlock::ToolUse { id, name, input } => {
                             flush_text(&mut out, &mut text_parts);
-                            if is_read_tool_use_with_offset(name, input) {
+                            if is_read_tool_use_with_offset(&name, &input) {
                                 read_tool_uses_with_offset.insert(id.clone());
                             }
                             let args =
-                                serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
+                                serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string());
                             out.push(ResponsesInputItem::FunctionCall {
-                                call_id: id.clone(),
-                                name: name.clone(),
+                                call_id: id,
+                                name,
                                 arguments: args,
                             });
                         }

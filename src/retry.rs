@@ -18,20 +18,7 @@ pub fn should_retry_status(status: u16) -> bool {
 }
 
 pub fn compute_backoff_delay(attempt: u32, retry_after: Option<&str>) -> BackoffOutcome {
-    compute_backoff_delay_with(
-        attempt,
-        retry_after,
-        OffsetDateTime::now_utc(),
-        &mut rand::thread_rng(),
-    )
-}
-
-fn compute_backoff_delay_with(
-    attempt: u32,
-    retry_after: Option<&str>,
-    now: OffsetDateTime,
-    rng: &mut impl Rng,
-) -> BackoffOutcome {
+    let now = OffsetDateTime::now_utc();
     let target_ms = retry_after.and_then(|raw| {
         let raw = raw.trim();
         if let Ok(seconds) = raw.parse::<f64>() {
@@ -53,7 +40,7 @@ fn compute_backoff_delay_with(
         .saturating_mul(RETRY_BACKOFF_FACTOR.saturating_pow(attempt))
         .min(RETRY_MAX_DELAY_MS);
     BackoffOutcome {
-        wait_ms: rng.gen_range(exp / 2..=exp),
+        wait_ms: rand::thread_rng().gen_range(exp / 2..=exp),
         exceeds_budget: false,
     }
 }

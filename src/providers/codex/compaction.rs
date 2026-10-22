@@ -64,13 +64,7 @@ pub struct CompactionReplay {
     pub attempt: CompactionAttempt,
 }
 
-#[derive(Default)]
-struct CompactionRegistry {
-    states: HashMap<ConversationIdentity, CompactionState>,
-    total_bytes: usize,
-}
-
-static REGISTRY: Mutex<Option<CompactionRegistry>> = Mutex::new(None);
+static REGISTRY: Mutex<Option<HashMap<ConversationIdentity, CompactionState>>> = Mutex::new(None);
 static NEXT_ATTEMPT_ID: AtomicU64 = AtomicU64::new(1);
 
 pub async fn request_compaction(
@@ -118,9 +112,9 @@ pub(crate) fn begin_compaction_scoped(scope: &CompactionScope, model: &str) -> C
     };
     let now = state.updated_at;
     let mut guard = REGISTRY.lock().unwrap();
-    let registry = guard.get_or_insert_with(CompactionRegistry::default);
+    let registry = guard.get_or_insert_with(HashMap::new);
     evict_states(registry, now);
-    registry.states.insert(scope.owner.clone(), state);
+    registry.insert(scope.owner.clone(), state);
     evict_states(registry, now);
     attempt
 }
@@ -136,7 +130,7 @@ pub(crate) fn store_compaction_scoped(
         return false;
     };
     evict_states(registry, now);
-    let Some(state) = registry.states.get_mut(&scope.owner) else {
+    let Some(state) = registry.get_mut(&scope.owner) else {
         return false;
     };
     if state.scope != *scope
@@ -149,13 +143,11 @@ pub(crate) fn store_compaction_scoped(
     state.phase = CompactionPhase::Unconfirmed;
     state.updated_at = now;
     if state_size(&scope.owner, state) > MAX_STATE_BYTES {
-        registry.states.remove(&scope.owner);
-        update_total_bytes(registry);
+        registry.remove(&scope.owner);
         return false;
     }
     evict_states(registry, now);
     registry
-        .states
         .get(&scope.owner)
         .is_some_and(|state| state.scope == *scope && state.attempt == attempt)
 }
@@ -180,26 +172,24 @@ pub(crate) fn activate_compaction_scoped(
         return false;
     };
     evict_states(registry, now);
-    let Some(state) = registry.states.get_mut(&scope.owner) else {
+    let Some(state) = registry.get_mut(&scope.owner) else {
         return false;
     };
     if state.scope != *scope || state.attempt != attempt {
         return false;
     }
     if state.model != model || !matches!(state.phase, CompactionPhase::Unconfirmed) {
-        registry.states.remove(&scope.owner);
-        update_total_bytes(registry);
+        registry.remove(&scope.owner);
         return false;
     }
     state.phase = CompactionPhase::Anchored { portable_summary };
     state.updated_at = now;
     if state_size(&scope.owner, state) > MAX_STATE_BYTES {
-        registry.states.remove(&scope.owner);
-        update_total_bytes(registry);
+        registry.remove(&scope.owner);
         return false;
     }
     evict_states(registry, now);
-    registry.states.contains_key(&scope.owner)
+    registry.contains_key(&scope.owner)
 }
 
 pub(crate) fn apply_compaction_replay_scoped(
@@ -211,13 +201,12 @@ pub(crate) fn apply_compaction_replay_scoped(
     let mut guard = REGISTRY.lock().unwrap();
     let registry = guard.as_mut()?;
     evict_states(registry, now);
-    let state = registry.states.get_mut(&scope.owner)?;
+    let state = registry.get_mut(&scope.owner)?;
     if state.scope != *scope || !matches!(state.phase, CompactionPhase::Anchored { .. }) {
         return None;
     }
     if state.model != request.model {
-        registry.states.remove(&scope.owner);
-        update_total_bytes(registry);
+        registry.remove(&scope.owner);
         return None;
     }
     let CompactionPhase::Anchored { portable_summary } = &state.phase else {
@@ -227,13 +216,11 @@ pub(crate) fn apply_compaction_replay_scoped(
     let (envelope, conversation) = split_input_envelope(&request.input);
     let summary_item = conversation.first()?;
     let Some(text) = message_text(summary_item) else {
-        registry.states.remove(&scope.owner);
-        update_total_bytes(registry);
+        registry.remove(&scope.owner);
         return None;
     };
     if text.match_indices(portable_summary).count() != 1 {
-        registry.states.remove(&scope.owner);
-        update_total_bytes(registry);
+        registry.remove(&scope.owner);
         return None;
     }
     if conversation.len() == 1 {
@@ -248,8 +235,7 @@ pub(crate) fn apply_compaction_replay_scoped(
         .chain(conversation[1..].iter().cloned())
         .collect();
     if serialized_size(&replay.input) > MAX_STATE_BYTES {
-        registry.states.remove(&scope.owner);
-        update_total_bytes(registry);
+        registry.remove(&scope.owner);
         return None;
     }
     state.updated_at = now;
@@ -271,53 +257,21 @@ pub(crate) fn abort_compaction_attempt_scoped(
         return;
     };
     if registry
-        .states
         .get(&scope.owner)
         .is_some_and(|state| state.scope == *scope && state.attempt == attempt)
     {
-        registry.states.remove(&scope.owner);
-        update_total_bytes(registry);
+        registry.remove(&scope.owner);
     }
 }
-
-// Session-only compatibility calls cannot establish ownership of opaque native state.
-pub fn begin_compaction(_session_id: &str, _model: &str) -> CompactionAttempt {
-    CompactionAttempt(NEXT_ATTEMPT_ID.fetch_add(1, Ordering::Relaxed))
-}
-pub fn store_compaction(
-    _session_id: &str,
-    _attempt: CompactionAttempt,
-    _history: Vec<ResponsesInputItem>,
-) -> bool {
-    false
-}
-pub fn activate_compaction(
-    _session_id: Option<&str>,
-    _attempt: Option<CompactionAttempt>,
-    _model: &str,
-    _output: &[ResponsesInputItem],
-) -> bool {
-    false
-}
-pub fn apply_compaction_replay(
-    _session_id: Option<&str>,
-    _request: &ResponsesRequest,
-) -> Option<CompactionReplay> {
-    None
-}
-pub fn abort_compaction_attempt(_session_id: Option<&str>, _attempt: Option<CompactionAttempt>) {}
-pub fn clear_compaction(_session_id: &str) {}
 
 pub(crate) fn clear_compaction_scoped(scope: &CompactionScope) {
     let mut guard = REGISTRY.lock().unwrap();
     if let Some(registry) = guard.as_mut()
         && registry
-            .states
             .get(&scope.owner)
             .is_some_and(|state| state.scope == *scope)
     {
-        registry.states.remove(&scope.owner);
-        update_total_bytes(registry);
+        registry.remove(&scope.owner);
     }
 }
 
@@ -589,29 +543,22 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn update_total_bytes(registry: &mut CompactionRegistry) {
-    registry.total_bytes = registry
-        .states
+fn evict_states(registry: &mut HashMap<ConversationIdentity, CompactionState>, now: u64) {
+    registry.retain(|_, state| now.saturating_sub(state.updated_at) <= STATE_TTL_MS);
+    let mut total_bytes: usize = registry
         .iter()
-        .map(|(session_id, state)| state_size(session_id, state))
+        .map(|(owner, state)| state_size(owner, state))
         .sum();
-}
-
-fn evict_states(registry: &mut CompactionRegistry, now: u64) {
-    registry
-        .states
-        .retain(|_, state| now.saturating_sub(state.updated_at) <= STATE_TTL_MS);
-    update_total_bytes(registry);
-    while registry.states.len() > MAX_STATES || registry.total_bytes > MAX_TOTAL_STATE_BYTES {
+    while registry.len() > MAX_STATES || total_bytes > MAX_TOTAL_STATE_BYTES {
         let oldest = registry
-            .states
             .iter()
             .min_by_key(|(_, state)| state.updated_at)
             .map(|(session_id, _)| session_id.clone());
         let Some(oldest) = oldest else {
             break;
         };
-        registry.states.remove(&oldest);
-        update_total_bytes(registry);
+        if let Some(state) = registry.remove(&oldest) {
+            total_bytes = total_bytes.saturating_sub(state_size(&oldest, &state));
+        }
     }
 }

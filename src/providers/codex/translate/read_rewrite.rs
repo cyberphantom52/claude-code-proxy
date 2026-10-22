@@ -1,7 +1,6 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 
-use once_cell::sync::Lazy;
 use serde_json::Value;
 
 const MAX_REWRITE_NOTES: usize = 4_096;
@@ -20,8 +19,8 @@ struct RewriteStore {
     entries: HashMap<String, ReadOffsetRewrite>,
 }
 
-static READ_OFFSET_REWRITES: Lazy<Mutex<RewriteStore>> =
-    Lazy::new(|| Mutex::new(RewriteStore::default()));
+static READ_OFFSET_REWRITES: LazyLock<Mutex<RewriteStore>> =
+    LazyLock::new(|| Mutex::new(RewriteStore::default()));
 
 pub fn sanitize_read_args(name: &str, args: &str, call_id: Option<&str>) -> String {
     if name != "Read" || args.is_empty() {
@@ -32,15 +31,12 @@ pub fn sanitize_read_args(name: &str, args: &str, call_id: Option<&str>) -> Stri
         Ok(v) => v,
         Err(_) => return args.to_string(),
     };
-    let obj = match parsed.as_object() {
-        Some(o) => o,
-        None => return args.to_string(),
+    let Value::Object(mut sanitized) = parsed else {
+        return args.to_string();
     };
-
-    let mut sanitized = obj.clone();
     let mut changed = false;
 
-    let has_empty_pages = obj
+    let has_empty_pages = sanitized
         .get("pages")
         .and_then(|v| v.as_str())
         .is_some_and(|s| s.is_empty());
@@ -49,7 +45,7 @@ pub fn sanitize_read_args(name: &str, args: &str, call_id: Option<&str>) -> Stri
         changed = true;
     }
 
-    if let Some(offset) = obj.get("offset").and_then(|v| v.as_i64())
+    if let Some(offset) = sanitized.get("offset").and_then(Value::as_i64)
         && offset >= READ_OFFSET_REWRITE_THRESHOLD
     {
         sanitized.remove("offset");
@@ -59,7 +55,7 @@ pub fn sanitize_read_args(name: &str, args: &str, call_id: Option<&str>) -> Stri
                 call_id,
                 ReadOffsetRewrite {
                     offset,
-                    file_path: obj
+                    file_path: sanitized
                         .get("file_path")
                         .and_then(|v| v.as_str())
                         .map(str::to_string),

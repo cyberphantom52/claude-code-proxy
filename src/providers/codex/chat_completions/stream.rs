@@ -6,7 +6,7 @@ use futures_util::{Stream, StreamExt};
 use http::{HeaderMap, StatusCode};
 use serde_json::{Value, json};
 
-use crate::providers::codex::native::NativeResponseOutcome;
+use crate::providers::codex::native::{NativeResponseOutcome, find_sse_boundary_from};
 use crate::{provider::RequestContext, traffic::MAX_SSE_CAPTURE_BYTES};
 
 use super::{ChatError, response::CompletionState};
@@ -151,7 +151,7 @@ impl StreamState {
     // Parse one frame at a time so a large upstream chunk cannot build an
     // amplified queue of downstream JSON chunks before backpressure is applied.
     fn process_pending_frame(&mut self) -> bool {
-        let Some((end, separator_len)) = find_boundary_from(&self.pending, self.pending_scan)
+        let Some((end, separator_len)) = find_sse_boundary_from(&self.pending, self.pending_scan)
         else {
             self.pending_scan = self.pending.len().saturating_sub(3);
             return false;
@@ -239,7 +239,7 @@ impl StreamState {
             return;
         }
         let terminal = self.chunk(json!([
-            {"index":0,"delta":{},"finish_reason":self.completion.finish_reason}
+            {"index":0,"delta":{},"finish_reason":"stop"}
         ]));
         if let Some(monitor) = self.ctx.monitor.as_ref() {
             monitor.usage_updated(
@@ -299,22 +299,7 @@ impl Drop for StreamState {
 }
 
 fn sse(value: Value) -> Bytes {
-    Bytes::from(format!(
-        "data: {}\n\n",
-        serde_json::to_string(&value).unwrap()
-    ))
-}
-
-fn find_boundary_from(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
-    for index in start.min(bytes.len())..bytes.len() {
-        if bytes[index..].starts_with(b"\r\n\r\n") {
-            return Some((index, 4));
-        }
-        if bytes[index..].starts_with(b"\n\n") || bytes[index..].starts_with(b"\r\r") {
-            return Some((index, 2));
-        }
-    }
-    None
+    Bytes::from(format!("data: {value}\n\n"))
 }
 
 pub fn response_headers(upstream: &HeaderMap) -> HeaderMap {

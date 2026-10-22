@@ -20,8 +20,6 @@ pub struct SearchRequest {
     pub id: String,
     pub model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub input: Option<Value>,
     pub commands: SearchCommands,
     pub settings: SearchSettings,
@@ -56,16 +54,15 @@ pub struct SearchFilters {
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct SearchResponse {
-    pub encrypted_output: Option<String>,
     pub output: String,
     #[serde(default)]
     pub results: Option<Vec<Value>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct SearchResult {
-    title: String,
-    url: String,
+struct SearchResult<'a> {
+    title: &'a str,
+    url: &'a str,
 }
 
 pub fn is_standalone_search_request(req: &MessagesRequest) -> bool {
@@ -107,7 +104,6 @@ pub fn build_search_request(
         SearchRequest {
             id,
             model: model.to_string(),
-            reasoning: None,
             input,
             commands: SearchCommands {
                 search_query: vec![SearchQuery { q: query.clone() }],
@@ -176,7 +172,6 @@ pub fn anthropic_search_response(
 
     let tool_use_id = format!("srvtoolu_ws_{}", uuid::Uuid::new_v4().simple());
     let results = search_results(response);
-    let content = response_content(response, query, &tool_use_id, &results);
     let output_tokens = search_response_output_tokens(response);
     let usage = json!({
         "input_tokens": input_tokens,
@@ -187,6 +182,7 @@ pub fn anthropic_search_response(
     });
 
     if !stream {
+        let content = response_content(response, query, &tool_use_id, &results);
         return (
             http::StatusCode::OK,
             axum::Json(json!({
@@ -422,14 +418,14 @@ fn string_array(value: Option<&Value>) -> Option<Vec<String>> {
     (!values.is_empty()).then_some(values)
 }
 
-fn search_results(response: &SearchResponse) -> Vec<SearchResult> {
+fn search_results(response: &SearchResponse) -> Vec<SearchResult<'_>> {
     let mut results = Vec::new();
     let mut seen = HashSet::new();
     for result in response.results.iter().flatten() {
         let Some(url) = result.get("url").and_then(Value::as_str) else {
             continue;
         };
-        if !seen.insert(url.to_string()) {
+        if !seen.insert(url) {
             continue;
         }
         let title = result
@@ -437,10 +433,7 @@ fn search_results(response: &SearchResponse) -> Vec<SearchResult> {
             .and_then(Value::as_str)
             .or_else(|| result.get("ref_id").and_then(Value::as_str))
             .unwrap_or(url);
-        results.push(SearchResult {
-            title: title.to_string(),
-            url: url.to_string(),
-        });
+        results.push(SearchResult { title, url });
     }
     results
 }
@@ -449,7 +442,7 @@ fn response_content(
     response: &SearchResponse,
     query: &str,
     tool_use_id: &str,
-    results: &[SearchResult],
+    results: &[SearchResult<'_>],
 ) -> Vec<Value> {
     let mut content = vec![
         json!({
@@ -470,7 +463,7 @@ fn response_content(
     content
 }
 
-fn web_search_result_values(results: &[SearchResult]) -> Vec<Value> {
+fn web_search_result_values(results: &[SearchResult<'_>]) -> Vec<Value> {
     results
         .iter()
         .map(|result| {

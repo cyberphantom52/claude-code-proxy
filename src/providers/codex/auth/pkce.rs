@@ -70,21 +70,6 @@ pub fn build_authorize_url(
 // Token exchange
 // ---------------------------------------------------------------------------
 
-pub fn exchange_code_for_tokens(
-    issuer: &str,
-    code: &str,
-    pkce: &PkceCodes,
-    redirect_uri: &str,
-) -> Result<crate::providers::codex::auth::jwt::TokenResponse, anyhow::Error> {
-    exchange_code_for_tokens_until(
-        issuer,
-        code,
-        pkce,
-        redirect_uri,
-        std::time::Instant::now() + std::time::Duration::from_secs(30),
-    )
-}
-
 pub(super) fn exchange_code_for_tokens_until(
     issuer: &str,
     code: &str,

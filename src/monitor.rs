@@ -9,7 +9,7 @@ mod mock;
 pub mod remote;
 pub mod snapshot;
 
-pub use mock::{MockMonitor, mock_state};
+pub use mock::MockMonitor;
 
 const DEFAULT_RECENT_LIMIT: usize = 200;
 pub const SESSION_TOKEN_BUCKET_SECS: u64 = 10;
@@ -68,7 +68,7 @@ impl RequestStatus {
 }
 
 #[derive(Debug, Clone)]
-pub enum MonitorEvent {
+enum MonitorEvent {
     RequestStarted {
         request_id: String,
         session_id: Option<String>,
@@ -278,10 +278,8 @@ impl SessionSummary {
         )
     }
 
-    pub fn label(&self) -> String {
-        self.session_id
-            .clone()
-            .unwrap_or_else(|| "no-session".to_string())
+    pub fn label(&self) -> &str {
+        self.session_id.as_deref().unwrap_or("no-session")
     }
 }
 
@@ -294,7 +292,6 @@ struct MonitorStore {
     recent: VecDeque<CompletedRequest>,
     session_usage: HashMap<Option<String>, SessionUsage>,
     session_output_buckets: HashMap<Option<String>, Vec<(u64, u64)>>,
-    recent_limit: usize,
 }
 
 #[derive(Debug)]
@@ -321,12 +318,6 @@ pub struct MonitorHandle {
 
 impl Default for MonitorHandle {
     fn default() -> Self {
-        Self::new(DEFAULT_RECENT_LIMIT)
-    }
-}
-
-impl MonitorHandle {
-    pub fn new(recent_limit: usize) -> Self {
         Self {
             store: Arc::new(Mutex::new(MonitorStore {
                 started_at: SystemTime::now(),
@@ -336,12 +327,13 @@ impl MonitorHandle {
                 recent: VecDeque::new(),
                 session_usage: HashMap::new(),
                 session_output_buckets: HashMap::new(),
-                recent_limit,
             })),
         }
     }
+}
 
-    pub fn publish(&self, event: MonitorEvent) {
+impl MonitorHandle {
+    fn publish(&self, event: MonitorEvent) {
         if let Ok(mut store) = self.store.lock() {
             store.apply(event);
         }
@@ -835,7 +827,7 @@ impl MonitorStore {
             );
         }
         self.recent.push_front(completed);
-        while self.recent.len() > self.recent_limit {
+        while self.recent.len() > DEFAULT_RECENT_LIMIT {
             self.recent.pop_back();
         }
     }
@@ -949,10 +941,10 @@ fn session_summaries(
         if request.status == RequestStatus::Failed {
             entry.failure_count += 1;
         }
-        entry.project = request.project.clone().or(entry.project.clone());
-        entry.provider = request.provider.clone().or(entry.provider.clone());
-        entry.model = request.model.clone().or(entry.model.clone());
-        entry.effort = request.effort.clone().or(entry.effort.clone());
+        entry.project = request.project.clone().or(entry.project.take());
+        entry.provider = request.provider.clone().or(entry.provider.take());
+        entry.model = request.model.clone().or(entry.model.take());
+        entry.effort = request.effort.clone().or(entry.effort.take());
         entry.last_seen = entry.last_seen.max(request.finished_at);
         if let (Some(tokens), Some(duration)) = (
             request
@@ -991,10 +983,10 @@ fn session_summaries(
             });
         entry.active_count += 1;
         entry.request_count += 1;
-        entry.project = request.project.clone().or(entry.project.clone());
-        entry.provider = request.provider.clone().or(entry.provider.clone());
-        entry.model = request.model.clone().or(entry.model.clone());
-        entry.effort = request.effort.clone().or(entry.effort.clone());
+        entry.project = request.project.clone().or(entry.project.take());
+        entry.provider = request.provider.clone().or(entry.provider.take());
+        entry.model = request.model.clone().or(entry.model.take());
+        entry.effort = request.effort.clone().or(entry.effort.take());
         entry.last_seen = entry.last_seen.max(request.started_at);
         if let (Some(tokens), Some(duration)) = (
             request
@@ -1027,7 +1019,7 @@ fn session_summaries(
     }
 
     let mut out: Vec<_> = sessions.into_values().collect();
-    out.sort_by_key(SessionSummary::label);
+    out.sort_by(|a, b| a.label().cmp(b.label()));
     out
 }
 
@@ -1058,7 +1050,7 @@ fn update_token_count(current: &mut Option<u64>, incoming: Option<u64>) -> u64 {
     incoming.saturating_sub(previous)
 }
 
-pub fn throughput(
+fn throughput(
     output_tokens: Option<u64>,
     streamed_bytes: u64,
     stream_chunks: u64,

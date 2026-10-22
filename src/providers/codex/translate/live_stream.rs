@@ -215,10 +215,6 @@ pub struct LiveStreamTranslator {
 }
 
 impl LiveStreamTranslator {
-    pub fn new(message_id: impl Into<String>, model: impl Into<String>) -> Self {
-        Self::with_estimated_input_tokens(message_id, model, 0)
-    }
-
     pub fn with_estimated_input_tokens(
         message_id: impl Into<String>,
         model: impl Into<String>,

@@ -144,10 +144,6 @@ pub struct ServerConfig {
     pub monitor: Option<MonitorHandle>,
 }
 
-pub async fn serve(config: ServerConfig) -> anyhow::Result<()> {
-    serve_with_shutdown(config, std::future::pending::<()>()).await
-}
-
 pub async fn serve_with_shutdown(
     config: ServerConfig,
     shutdown: impl Future<Output = ()> + Send + 'static,
@@ -202,72 +198,13 @@ pub async fn serve_listener(
     Ok(())
 }
 
-pub fn app(registry: Arc<Registry>) -> Router {
-    app_with_monitor(registry, None)
-}
-
-pub fn app_with_monitor(registry: Arc<Registry>, monitor: Option<MonitorHandle>) -> Router {
-    app_with_features(
-        registry,
-        monitor,
-        AppFeatures {
-            responses_api: crate::config::codex_responses_api(),
-            images_api: crate::config::codex_images_api(),
-            transcriptions_api: crate::config::codex_transcriptions_api(),
-        },
-    )
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct AppFeatures {
-    pub responses_api: bool,
-    pub images_api: bool,
-    pub transcriptions_api: bool,
-}
-
-pub fn app_with_options(
-    registry: Arc<Registry>,
-    monitor: Option<MonitorHandle>,
-    responses_api: bool,
-) -> Router {
-    app_with_features(
-        registry,
-        monitor,
-        AppFeatures {
-            responses_api,
-            images_api: false,
-            transcriptions_api: false,
-        },
-    )
-}
-
-pub fn app_with_features(
-    registry: Arc<Registry>,
-    monitor: Option<MonitorHandle>,
-    features: AppFeatures,
-) -> Router {
-    app_with_discovery_client(
-        registry,
-        monitor,
-        features,
-        Arc::new(CodexHttpClient::new()),
-    )
-}
-
-/// Construct without I/O, with an injectable discovery client for isolated callers.
-pub fn app_with_discovery_client(
-    registry: Arc<Registry>,
-    monitor: Option<MonitorHandle>,
-    features: AppFeatures,
-    discovery: Arc<CodexHttpClient>,
-) -> Router {
-    let native_responses = features
-        .responses_api
-        .then(|| Arc::new(CodexNativeBackend::new()));
-    let chat_completions = features
-        .responses_api
-        .then(|| Arc::new(ChatCompletionsBackend::new()));
-    let images = if features.images_api {
+fn app_with_monitor(registry: Arc<Registry>, monitor: Option<MonitorHandle>) -> Router {
+    let responses_api = crate::config::codex_responses_api();
+    let images_api = crate::config::codex_images_api();
+    let transcriptions_api = crate::config::codex_transcriptions_api();
+    let native_responses = responses_api.then(|| Arc::new(CodexNativeBackend::new()));
+    let chat_completions = responses_api.then(|| Arc::new(ChatCompletionsBackend::new()));
+    let images = if images_api {
         match CodexImagesBackend::new() {
             Ok(backend) => Some(Arc::new(backend)),
             Err(error) => {
@@ -281,11 +218,9 @@ pub fn app_with_discovery_client(
     } else {
         None
     };
-    let transcriptions = features
-        .transcriptions_api
-        .then(|| Arc::new(CodexTranscriptionBackend::new()));
+    let transcriptions = transcriptions_api.then(|| Arc::new(CodexTranscriptionBackend::new()));
     let state = Arc::new(AppState {
-        discovery,
+        discovery: Arc::new(CodexHttpClient::new()),
         registry,
         monitor,
         native_responses,
@@ -297,7 +232,7 @@ pub fn app_with_discovery_client(
         .route("/v1/messages", post(handler_messages))
         .route("/v1/messages/count_tokens", post(handler_count_tokens))
         .route("/v1/models", get(handler_models));
-    let router = if features.responses_api {
+    let router = if responses_api {
         router
             .route("/v1/responses", post(handler_responses))
             .route("/v1/chat/completions", post(handler_chat_completions))
@@ -311,7 +246,7 @@ pub fn app_with_discovery_client(
         ))
         .route("/healthz", get(healthz))
         .route("/monitor", get(handler_monitor));
-    let router = if features.images_api {
+    let router = if images_api {
         router
             .route("/v1/images/generations", post(handler_image_generation))
             .route(
@@ -321,7 +256,7 @@ pub fn app_with_discovery_client(
     } else {
         router
     };
-    let router = if features.transcriptions_api {
+    let router = if transcriptions_api {
         router.route(
             "/v1/audio/transcriptions",
             post(handler_transcription)
@@ -1063,7 +998,6 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
         session_id: session_id.clone(),
         session_seq: current.as_ref().map(|session| session.seq),
         provider: Some(provider.name().to_string()),
-        state_dir_override: None,
     })
     .map(Arc::new);
     if let Some(capture) = traffic.as_ref() {
@@ -1203,7 +1137,7 @@ async fn handler_chat_completions(
         .response();
         return monitor_response_body(response, request_guard);
     };
-    let translated = match translate_request(body.clone()) {
+    let translated = match translate_request(&body) {
         Ok(translated) => translated,
         Err(error) => return monitor_response_body(error.response(), request_guard),
     };
@@ -1221,7 +1155,6 @@ async fn handler_chat_completions(
         session_id: session_id.clone(),
         session_seq: current.as_ref().map(|session| session.seq),
         provider: Some(provider.name().to_string()),
-        state_dir_override: None,
     })
     .map(Arc::new);
     if let Some(capture) = traffic.as_ref() {
@@ -1533,11 +1466,7 @@ async fn dispatch_request(
 
     let mut normalized_model = normalize_incoming_model(model);
     body.model = Some(normalized_model.clone());
-    let session_state = if let Some(session_id) = session_id.as_deref() {
-        session::existing_session(Some(session_id), now)
-    } else {
-        None
-    };
+    let session_state = session::existing_session(session_id.as_deref(), now);
     let original_provider = state.registry.provider_for_model(&normalized_model);
     let configured_auto_review_model = crate::config::auto_review_model();
     let auto_review_route = original_provider.as_ref().and_then(|_| {
@@ -1654,7 +1583,6 @@ async fn dispatch_request(
         session_id: session_id.clone(),
         session_seq: current.as_ref().map(|s| s.seq),
         provider: Some(provider.name().to_string()),
-        state_dir_override: None,
     })
     .map(Arc::new);
 

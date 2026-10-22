@@ -35,8 +35,8 @@ pub struct ImageSource {
 
 pub fn flatten_system_text(system_val: Option<&Value>) -> Option<String> {
     let system = system_val?;
-    let texts: Vec<String> = match system {
-        Value::String(s) => vec![s.clone()],
+    let texts: Vec<&str> = match system {
+        Value::String(s) => return Some(s.clone()),
         Value::Array(arr) => arr
             .iter()
             .filter_map(|b| {
@@ -44,7 +44,7 @@ pub fn flatten_system_text(system_val: Option<&Value>) -> Option<String> {
                 if text.starts_with("x-anthropic-billing-header:") {
                     None
                 } else {
-                    Some(text.to_string())
+                    Some(text)
                 }
             })
             .collect(),

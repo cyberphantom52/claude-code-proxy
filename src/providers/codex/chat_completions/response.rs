@@ -33,7 +33,6 @@ pub struct CompletionState {
     pub model: String,
     pub text: String,
     pub usage: Usage,
-    pub finish_reason: &'static str,
     pub completed: bool,
     pub service_tier: Option<String>,
     identity_frozen: bool,
@@ -47,7 +46,6 @@ impl CompletionState {
             model: model.to_string(),
             text: String::new(),
             usage: Usage::default(),
-            finish_reason: "stop",
             completed: false,
             service_tier: None,
             identity_frozen: false,
@@ -58,7 +56,7 @@ impl CompletionState {
         self.identity_frozen = true;
     }
 
-    pub fn observe(&mut self, event: &Value) -> Result<Option<String>, ChatError> {
+    pub fn observe<'a>(&mut self, event: &'a Value) -> Result<Option<&'a str>, ChatError> {
         let kind = event.get("type").and_then(Value::as_str);
         if let Some(failure) = classify_event_failure(event) {
             let status =
@@ -89,16 +87,13 @@ impl CompletionState {
                     ));
                 }
                 self.text.push_str(delta);
-                return Ok(Some(delta.to_string()));
+                return Ok(Some(delta));
             }
             Some("response.completed" | "response.done") => {
                 let response = event.get("response").ok_or_else(|| {
                     ChatError::upstream("Codex completion event did not contain a response")
                 })?;
                 self.update_metadata(response);
-                if response.get("status").and_then(Value::as_str) == Some("failed") {
-                    return Err(event_error(event));
-                }
                 self.completed = true;
             }
             _ => {
@@ -196,7 +191,7 @@ pub fn completion_value(state: &CompletionState) -> Value {
         "choices": [{
             "index": 0,
             "message": {"role":"assistant", "content":state.text},
-            "finish_reason": state.finish_reason,
+            "finish_reason": "stop",
         }],
         "usage": state.usage.value(),
     });

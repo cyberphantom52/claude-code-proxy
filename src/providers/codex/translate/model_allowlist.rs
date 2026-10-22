@@ -80,18 +80,6 @@ pub fn is_allowed_model(model: &str) -> bool {
             .any(|character| character.is_whitespace() || character.is_control())
 }
 
-/// Catalog IDs for listings/error hints, with bootstrap IDs only when offline.
-/// This list is not used to authorize requests.
-pub fn allowed_models() -> Vec<String> {
-    let mut out: Vec<String> = catalog_models()
-        .into_iter()
-        .map(|model| model.slug)
-        .collect();
-    out.sort_unstable();
-    out.dedup();
-    out
-}
-
 /// Models visible in the subscription picker. Hidden entries remain requestable.
 pub fn listed_catalog_models() -> Vec<String> {
     catalog_models()
@@ -99,10 +87,6 @@ pub fn listed_catalog_models() -> Vec<String> {
         .filter(|entry| entry.listed)
         .map(|entry| entry.slug)
         .collect()
-}
-
-pub fn allowed_models_display() -> String {
-    allowed_models().join(", ")
 }
 
 /// Local tier-suffixed names advertised next to a registered model.
@@ -346,17 +330,6 @@ fn resolve_tier_model_alias(model: &str) -> ResolvedModel {
     }
 }
 
-pub fn resolve_model_request(model: &str) -> ResolvedModel {
-    resolve_model_request_with_config_override(model, true)
-}
-
-pub fn resolve_model_request_with_config_override(
-    model: &str,
-    _apply_config_override: bool,
-) -> ResolvedModel {
-    resolve_requested_model(model)
-}
-
 /// An operator pin may agree with a request, but must never silently redirect it.
 pub fn validate_model_configuration(model: &str, apply_override: bool) -> anyhow::Result<()> {
     let configured = apply_override.then(config::codex_model).flatten();
@@ -365,8 +338,8 @@ pub fn validate_model_configuration(model: &str, apply_override: bool) -> anyhow
 
 fn validate_model_override(model: &str, configured: Option<&str>) -> anyhow::Result<()> {
     if let Some(configured) = configured.filter(|value| !value.is_empty()) {
-        let requested = resolve_requested_model(model);
-        let forced = resolve_requested_model(configured);
+        let requested = resolve_model_request(model);
+        let forced = resolve_model_request(configured);
         if requested.model != forced.model
             || (forced.service_tier.is_some() && requested.service_tier != forced.service_tier)
         {
@@ -407,7 +380,7 @@ pub fn is_anthropic_alias(model: &str) -> bool {
     anthropic_alias_target(model).is_some()
 }
 
-fn resolve_requested_model(model: &str) -> ResolvedModel {
+pub fn resolve_model_request(model: &str) -> ResolvedModel {
     if !is_allowed_model(model) {
         return ResolvedModel {
             model: model.to_string(),
@@ -428,10 +401,6 @@ fn resolve_requested_model(model: &str) -> ResolvedModel {
         };
     }
     resolve_tier_model_alias(model)
-}
-
-pub fn resolve_model(model: &str) -> String {
-    resolve_model_request(model).model
 }
 
 #[derive(Debug, Clone)]
