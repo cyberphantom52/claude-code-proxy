@@ -37,6 +37,23 @@ pub fn server_tool_use_id_from_codex_web_search_id(id: &str) -> String {
     format!("srvtoolu_{suffix}")
 }
 
+pub(super) fn web_search_query(item: &Value) -> String {
+    let Some(action) = item.get("action") else {
+        return String::new();
+    };
+    action
+        .get("query")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            action
+                .get("queries")
+                .and_then(Value::as_array)
+                .and_then(|queries| queries.iter().find_map(Value::as_str))
+        })
+        .unwrap_or("")
+        .to_string()
+}
+
 fn extract_web_search_results_from_text(text: &str) -> Vec<WebSearchResult> {
     let mut results: Vec<WebSearchResult> = Vec::new();
     let mut seen_urls: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -160,6 +177,29 @@ fn fallback_title(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn query_prefers_explicit_string_then_first_string_in_queries() {
+        for (action, expected) in [
+            (serde_json::json!(null), ""),
+            (serde_json::json!({}), ""),
+            (
+                serde_json::json!({"query":"direct","queries":["other"]}),
+                "direct",
+            ),
+            (serde_json::json!({"query":"","queries":["other"]}), ""),
+            (
+                serde_json::json!({"query":7,"queries":[null,7,"first","second"]}),
+                "first",
+            ),
+        ] {
+            assert_eq!(
+                web_search_query(&serde_json::json!({"action":action})),
+                expected
+            );
+        }
+        assert_eq!(web_search_query(&serde_json::json!({})), "");
+    }
 
     #[test]
     fn server_tool_use_id_format() {

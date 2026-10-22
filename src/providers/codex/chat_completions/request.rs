@@ -91,7 +91,7 @@ fn translate_request_with_override(
 
     let request_effort = match object.get("reasoning_effort") {
         None | Some(Value::Null) => None,
-        Some(Value::String(value)) => parse_effort(value)?,
+        Some(Value::String(value)) => to_codex_effort(Some(value)),
         Some(_) => {
             return Err(ChatError::invalid(
                 "'reasoning_effort' must be a string",
@@ -397,10 +397,6 @@ fn translate_content(content: Option<&Value>, index: usize) -> Result<Vec<Value>
         }
     };
     Ok(parts)
-}
-
-fn parse_effort(value: &str) -> Result<Option<Effort>, ChatError> {
-    Ok(to_codex_effort(Some(value)))
 }
 
 fn translate_response_format(value: Option<&Value>) -> Result<Option<Value>, ChatError> {

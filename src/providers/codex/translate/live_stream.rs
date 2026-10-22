@@ -10,6 +10,7 @@ use super::reducer::{
     CodexRateLimits, CodexUsage, STOP_END_TURN, STOP_TOOL_USE, map_codex_usage_to_anthropic,
     parse_codex_rate_limits, parse_codex_usage,
 };
+use super::web_search_compat::web_search_query;
 
 pub(crate) const BUFFERED_TOOL_MAX_ARGS_BYTES: usize = 5_000_000;
 
@@ -1281,23 +1282,6 @@ impl LiveStreamTranslator {
             }),
         );
     }
-}
-
-fn web_search_query(item: &serde_json::Value) -> String {
-    let Some(action) = item.get("action") else {
-        return String::new();
-    };
-    action
-        .get("query")
-        .and_then(|v| v.as_str())
-        .or_else(|| {
-            action
-                .get("queries")
-                .and_then(|v| v.as_array())
-                .and_then(|queries| queries.iter().find_map(|query| query.as_str()))
-        })
-        .unwrap_or("")
-        .to_string()
 }
 
 fn output_index(payload: &serde_json::Value) -> usize {

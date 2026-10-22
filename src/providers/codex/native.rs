@@ -23,7 +23,7 @@ use super::translate::model_allowlist::{
     resolve_model_effort, resolve_model_request_with_config_override, resolve_service_tier_value,
     uses_responses_lite, validate_hosted_web_search, validate_input_modalities,
 };
-use super::translate::request::{Effort, ServiceTier, effort_wire_value};
+use super::translate::request::{Effort, effort_wire_value};
 
 pub struct CodexNativeBackend {
     client: Arc<CodexHttpClient>,
@@ -96,8 +96,8 @@ pub fn validate_native_request_model(body: &Value) -> Result<String, Response> {
                 None,
             )
         })?;
-    let (resolved, _) = resolve_native_model(&requested);
-    if let Err(error) = assert_allowed_model(&resolved) {
+    let resolved = resolve_model_request_with_config_override(&requested, false);
+    if let Err(error) = assert_allowed_model(&resolved.model) {
         return Err(openai_error(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
@@ -116,7 +116,8 @@ fn shape_native_request(body: &mut Value) -> Result<NativeResolved, Response> {
         .as_object_mut()
         .expect("validated native Responses body must be an object");
 
-    let (model, service_tier) = resolve_native_model(&requested);
+    let resolved = resolve_model_request_with_config_override(&requested, false);
+    let model = resolved.model;
 
     let hosted_web_search = has_native_hosted_web_search(object);
     if hosted_web_search {
@@ -124,7 +125,7 @@ fn shape_native_request(body: &mut Value) -> Result<NativeResolved, Response> {
     }
     let use_responses_lite = uses_responses_lite(&model) && !hosted_web_search;
     object.insert("model".to_string(), Value::String(model.clone()));
-    if let Some(tier) = service_tier
+    if let Some(tier) = resolved.service_tier
         && !object.contains_key("service_tier")
     {
         object.insert("service_tier".to_string(), json!(tier));
@@ -139,11 +140,6 @@ fn shape_native_request(body: &mut Value) -> Result<NativeResolved, Response> {
             .and_then(Value::as_bool)
             .unwrap_or(false),
     })
-}
-
-fn resolve_native_model(requested: &str) -> (String, Option<ServiceTier>) {
-    let resolved = resolve_model_request_with_config_override(requested, false);
-    (resolved.model, resolved.service_tier)
 }
 
 fn invalid_capability(param: &str, error: impl std::fmt::Display) -> Response {

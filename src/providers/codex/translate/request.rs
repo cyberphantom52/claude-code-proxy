@@ -371,10 +371,6 @@ pub(crate) fn to_codex_effort(effort: Option<&str>) -> Option<Effort> {
     effort.map(|value| Effort::from(value.to_string()))
 }
 
-fn resolve_effort(effort: Option<Effort>) -> Result<Option<Effort>, anyhow::Error> {
-    resolve_effort_override(effort, config::codex_effort().as_deref())
-}
-
 pub(crate) fn resolve_effort_override(
     effort: Option<Effort>,
     override_effort: Option<&str>,
@@ -551,31 +547,6 @@ pub fn translate_request(
     req: &MessagesRequest,
     opts: TranslateOptions,
 ) -> Result<ResponsesRequest, anyhow::Error> {
-    translate_request_inner(req, opts, true)
-}
-
-pub fn translate_openai_compatible_request(
-    req: &MessagesRequest,
-    model: String,
-    session_id: Option<String>,
-) -> Result<ResponsesRequest, anyhow::Error> {
-    translate_request_inner(
-        req,
-        TranslateOptions {
-            session_id,
-            service_tier: None,
-            model,
-            use_responses_lite: false,
-        },
-        false,
-    )
-}
-
-fn translate_request_inner(
-    req: &MessagesRequest,
-    opts: TranslateOptions,
-    apply_codex_config: bool,
-) -> Result<ResponsesRequest, anyhow::Error> {
     if has_hosted_web_search(req) {
         validate_hosted_web_search(&opts.model)?;
     }
@@ -694,12 +665,7 @@ fn translate_request_inner(
         out.prompt_cache_key = Some(key);
     }
 
-    if apply_codex_config {
-        let service_tier = resolve_service_tier(req, opts.service_tier, &out.model)?;
-        if let Some(ref tier) = service_tier {
-            out.service_tier = Some(tier.clone());
-        }
-    }
+    out.service_tier = resolve_service_tier(req, opts.service_tier, &out.model)?;
 
     let effort = match req
         .extra
@@ -710,16 +676,12 @@ fn translate_request_inner(
         Some(Value::String(effort)) => Some(effort.as_str()),
         Some(_) => anyhow::bail!("output_config.effort must be a string"),
     };
-    let codex_effort = to_codex_effort(effort);
-    let mut resolved_effort = if apply_codex_config {
-        resolve_effort(codex_effort)?
-    } else {
-        codex_effort
-    };
+    let mut resolved_effort =
+        resolve_effort_override(to_codex_effort(effort), config::codex_effort().as_deref())?;
     let resolved_string = resolved_effort.as_ref().map(ToString::to_string);
     resolved_effort =
         resolve_model_effort(&out.model, resolved_string.as_deref())?.map(Effort::from);
-    if apply_codex_config && is_compact {
+    if is_compact {
         let capped = apply_compact_effort_cap(resolved_effort.clone(), compact_effort_cap());
         // A local compaction optimization must not invent an unadvertised level.
         if let Ok(effort) = resolve_model_effort(
@@ -734,10 +696,7 @@ fn translate_request_inner(
         let summary = if wants_reasoning && !req.omit_reasoning_artifacts {
             model_reasoning_summary(
                 &out.model,
-                apply_codex_config
-                    .then(config::codex_reasoning_summary)
-                    .flatten()
-                    .as_deref(),
+                config::codex_reasoning_summary().as_deref(),
                 Some("auto"),
             )?
         } else {
@@ -1129,7 +1088,7 @@ fn build_input(req: &MessagesRequest) -> Vec<ResponsesInputItem> {
     let mut read_tool_uses_with_offset = HashSet::new();
 
     for msg in &req.messages {
-        let blocks = normalize_content(&msg.content, Value::Null);
+        let blocks = normalize_content(&msg.content);
         match msg.role.as_str() {
             "user" => {
                 let mut parts: Vec<ResponsesContentPart> = Vec::new();
@@ -2117,8 +2076,6 @@ mod tests {
             .remove("pattern");
 
         let normal = translate_request(&req, opts()).unwrap();
-        let compatible =
-            translate_openai_compatible_request(&req, "gpt-5.5".to_string(), None).unwrap();
         let lite = translate_request(
             &req,
             TranslateOptions {
@@ -2127,7 +2084,7 @@ mod tests {
             },
         )
         .unwrap();
-        for out in [normal, compatible, lite] {
+        for out in [normal, lite] {
             let wire = serde_json::to_value(out).unwrap();
             let tool = if wire["tools"].is_array() {
                 &wire["tools"][0]

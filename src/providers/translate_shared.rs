@@ -66,7 +66,7 @@ pub fn parallel_tool_calls(req: &MessagesRequest) -> Option<bool> {
         .map(|disabled| !disabled)
 }
 
-pub fn normalize_content(content: &Value, missing_tool_input: Value) -> Vec<ContentBlock> {
+pub fn normalize_content(content: &Value) -> Vec<ContentBlock> {
     match content {
         Value::String(s) => {
             vec![ContentBlock::Text { text: s.clone() }]
@@ -74,7 +74,7 @@ pub fn normalize_content(content: &Value, missing_tool_input: Value) -> Vec<Cont
         Value::Array(arr) => {
             let mut blocks = Vec::new();
             for item in arr {
-                if let Some(block) = parse_content_block(item, missing_tool_input.clone()) {
+                if let Some(block) = parse_content_block(item) {
                     blocks.push(block);
                 }
             }
@@ -92,7 +92,7 @@ pub fn image_source_to_url(source: &ImageSource) -> String {
     }
 }
 
-fn parse_content_block(value: &Value, missing_tool_input: Value) -> Option<ContentBlock> {
+fn parse_content_block(value: &Value) -> Option<ContentBlock> {
     let kind = value.get("type").and_then(|v| v.as_str())?;
     match kind {
         "text" => {
@@ -140,7 +140,7 @@ fn parse_content_block(value: &Value, missing_tool_input: Value) -> Option<Conte
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let input = value.get("input").cloned().unwrap_or(missing_tool_input);
+            let input = value.get("input").cloned().unwrap_or(Value::Null);
             Some(ContentBlock::ToolUse { id, name, input })
         }
         "tool_result" => {
@@ -176,5 +176,29 @@ fn parse_content_block(value: &Value, missing_tool_input: Value) -> Option<Conte
             })
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn tool_inputs_preserve_null_default_and_explicit_values() {
+        for (block, expected) in [
+            (json!({"type":"tool_use"}), Value::Null),
+            (json!({"type":"tool_use","input":null}), Value::Null),
+            (
+                json!({"type":"tool_use","input":{"path":"a"}}),
+                json!({"path":"a"}),
+            ),
+        ] {
+            let blocks = normalize_content(&json!([block]));
+            let ContentBlock::ToolUse { input, .. } = &blocks[0] else {
+                panic!("expected tool_use");
+            };
+            assert_eq!(input, &expected);
+        }
     }
 }

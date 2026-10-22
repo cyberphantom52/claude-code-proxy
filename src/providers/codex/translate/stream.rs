@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use crate::anthropic::sse::encode_sse_event;
 use crate::traffic::TrafficCapture;
 
@@ -7,13 +5,6 @@ use super::reducer::{
     ReducerEvent, UpstreamStreamError, map_codex_usage_to_anthropic, reduce_upstream_bytes,
 };
 use super::web_search_compat::build_web_search_compat_blocks;
-
-#[allow(dead_code)]
-enum OpenBlock {
-    Thinking,
-    Text,
-    Tool { id: String, name: String },
-}
 
 struct MessageMetadata<'a> {
     id: &'a str,
@@ -71,14 +62,12 @@ fn emit_content_event(
     out: &mut Vec<u8>,
     traffic: Option<&TrafficCapture>,
     message_started: &mut bool,
-    open_blocks: &mut BTreeMap<usize, OpenBlock>,
     message: &MessageMetadata<'_>,
     event: &ReducerEvent,
 ) -> bool {
     match event {
         ReducerEvent::ThinkingStart { index } => {
             ensure_message_start(out, traffic, message_started, message);
-            open_blocks.insert(*index, OpenBlock::Thinking);
             emit(
                 out,
                 traffic,
@@ -118,7 +107,6 @@ fn emit_content_event(
             true
         }
         ReducerEvent::ThinkingStop { index } => {
-            open_blocks.remove(index);
             emit(
                 out,
                 traffic,
@@ -132,7 +120,6 @@ fn emit_content_event(
         }
         ReducerEvent::TextStart { index } => {
             ensure_message_start(out, traffic, message_started, message);
-            open_blocks.insert(*index, OpenBlock::Text);
             emit(
                 out,
                 traffic,
@@ -159,7 +146,6 @@ fn emit_content_event(
             true
         }
         ReducerEvent::TextStop { index } => {
-            open_blocks.remove(index);
             emit(
                 out,
                 traffic,
@@ -173,13 +159,6 @@ fn emit_content_event(
         }
         ReducerEvent::ToolStart { index, id, name } => {
             ensure_message_start(out, traffic, message_started, message);
-            open_blocks.insert(
-                *index,
-                OpenBlock::Tool {
-                    id: id.clone(),
-                    name: name.clone(),
-                },
-            );
             emit(
                 out,
                 traffic,
@@ -217,7 +196,6 @@ fn emit_content_event(
             true
         }
         ReducerEvent::ToolStop { index } => {
-            open_blocks.remove(index);
             emit(
                 out,
                 traffic,
@@ -278,7 +256,6 @@ pub fn translate_stream_bytes_with_traffic(
 
     let mut out = Vec::new();
     let mut message_started = false;
-    let mut open_blocks: BTreeMap<usize, OpenBlock> = BTreeMap::new();
     let mut web_search_events: Vec<ReducerEvent> = Vec::new();
     let mut deferred_content_events: Vec<ReducerEvent> = Vec::new();
     let message = MessageMetadata {
@@ -297,14 +274,7 @@ pub fn translate_stream_bytes_with_traffic(
             continue;
         }
 
-        if emit_content_event(
-            &mut out,
-            traffic,
-            &mut message_started,
-            &mut open_blocks,
-            &message,
-            event,
-        ) {
+        if emit_content_event(&mut out, traffic, &mut message_started, &message, event) {
             continue;
         }
 
@@ -419,14 +389,7 @@ pub fn translate_stream_bytes_with_traffic(
 
                 // Emit deferred content
                 for deferred in &deferred_content_events {
-                    emit_content_event(
-                        &mut out,
-                        traffic,
-                        &mut message_started,
-                        &mut open_blocks,
-                        &message,
-                        deferred,
-                    );
+                    emit_content_event(&mut out, traffic, &mut message_started, &message, deferred);
                 }
 
                 ensure_message_start(&mut out, traffic, &mut message_started, &message);
