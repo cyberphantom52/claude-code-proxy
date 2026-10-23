@@ -558,16 +558,17 @@ pub fn has_hosted_web_search(req: &MessagesRequest) -> bool {
 }
 
 pub fn translate_request(
-    req: &MessagesRequest,
+    mut req: MessagesRequest,
     opts: TranslateOptions,
 ) -> Result<ResponsesRequest, anyhow::Error> {
-    if has_hosted_web_search(req) {
+    if has_hosted_web_search(&req) {
         validate_hosted_web_search(&opts.model)?;
     }
     let instructions = flatten_system_text(req.extra.get("system"));
-    let is_compact = is_compact_messages_request(req);
-    let input = build_input(req)?;
-    let tools = read_tools(req)?;
+    let is_compact = is_compact_messages_request(&req);
+    let input = build_input(&req)?;
+    let tools = read_tools(&mut req)?;
+    let req = &req;
     let tool_choice = map_tool_choice(req)?;
     validate_input_modalities_iter(
         &opts.model,
@@ -890,16 +891,12 @@ fn append_loaded_tools(
     *input = out;
 }
 
-fn read_tools(req: &MessagesRequest) -> Result<Option<Vec<ResponsesTool>>, anyhow::Error> {
-    let Some(tools) = req.extra.get("tools") else {
+fn read_tools(req: &mut MessagesRequest) -> Result<Option<Vec<ResponsesTool>>, anyhow::Error> {
+    let Some(tools) = req.extra.get_mut("tools").and_then(Value::as_array_mut) else {
         return Ok(None);
     };
-    let tools_arr = match tools {
-        Value::Array(a) => a,
-        _ => return Ok(None),
-    };
     let mut out = Vec::new();
-    for tool in tools_arr {
+    for tool in tools {
         let tool_type = tool
             .get("type")
             .and_then(|v| v.as_str())
@@ -943,9 +940,10 @@ fn read_tools(req: &MessagesRequest) -> Result<Option<Vec<ResponsesTool>>, anyho
                 .get("description")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
+            // Keep names and deferred-loading metadata in the request.
             let parameters = tool
-                .get("input_schema")
-                .cloned()
+                .get_mut("input_schema")
+                .map(std::mem::take)
                 .unwrap_or(serde_json::json!({}));
             let description = codex_tool_description(&name, description);
             let parameters = codex_tool_parameters(&name, parameters);
@@ -1171,22 +1169,17 @@ fn build_input(req: &MessagesRequest) -> anyhow::Result<Vec<ResponsesInputItem>>
                             if is_error.unwrap_or(false) {
                                 rendered.prepend_text("[tool execution error]".to_string());
                             }
-                            let mut joined_text = rendered.joined_text();
-                            if let Some(note) =
-                                rewritten_read_offset_note(&joined_text, tool_use_id)
-                            {
-                                rendered.push_text(format!("\n{note}"), &mut joined_text);
+                            if let Some(note) = rewritten_read_offset_note(&rendered, tool_use_id) {
+                                rendered.push_text(format!("\n{note}"));
                             }
                             if should_append_read_offset_guidance(
-                                &joined_text,
+                                &rendered,
                                 read_tool_uses_with_offset.contains(tool_use_id),
                                 is_error.unwrap_or(false),
                             ) {
-                                rendered.push_text(
-                                    format!("\n{}", read_offset_guidance()),
-                                    &mut joined_text,
-                                );
+                                rendered.push_text(format!("\n{}", read_offset_guidance()));
                             }
+                            let joined_text = rendered.joined_text();
                             out.push(ResponsesInputItem::FunctionCallOutput {
                                 call_id: tool_use_id.to_string(),
                                 output: function_call_output(rendered, joined_text),
@@ -1278,7 +1271,10 @@ fn is_read_tool_use_with_offset(name: &str, input: &Value) -> bool {
     name == "Read" && input.get("offset").is_some()
 }
 
-fn rewritten_read_offset_note(output: &str, tool_use_id: &str) -> Option<String> {
+fn rewritten_read_offset_note(
+    output: &RenderedToolResult<'_>,
+    tool_use_id: &str,
+) -> Option<String> {
     if output.contains("Proxy Read offset note:") {
         return None;
     }
@@ -1304,7 +1300,7 @@ fn read_offset_rewrite_note(rewrite: &ReadOffsetRewrite) -> String {
 }
 
 fn should_append_read_offset_guidance(
-    output: &str,
+    output: &RenderedToolResult<'_>,
     read_call_had_offset: bool,
     is_error: bool,
 ) -> bool {
@@ -1314,17 +1310,17 @@ fn should_append_read_offset_guidance(
         && (is_error || looks_like_read_offset_warning(output))
 }
 
-fn looks_like_read_offset_result(output: &str) -> bool {
-    let lower = output.to_ascii_lowercase();
-    lower.contains("offset")
-        && (lower.contains("file has")
-            || lower.contains("out of range")
-            || (lower.contains("line") && lower.contains("requested")))
+fn looks_like_read_offset_result(output: &RenderedToolResult<'_>) -> bool {
+    output.contains_ignore_ascii_case("offset")
+        && (output.contains_ignore_ascii_case("file has")
+            || output.contains_ignore_ascii_case("out of range")
+            || (output.contains_ignore_ascii_case("line")
+                && output.contains_ignore_ascii_case("requested")))
 }
 
-fn looks_like_read_offset_warning(output: &str) -> bool {
-    let lower = output.to_ascii_lowercase();
-    lower.contains("warning") || lower.contains("system-reminder")
+fn looks_like_read_offset_warning(output: &RenderedToolResult<'_>) -> bool {
+    output.contains_ignore_ascii_case("warning")
+        || output.contains_ignore_ascii_case("system-reminder")
 }
 
 fn read_offset_guidance() -> &'static str {
@@ -1356,15 +1352,29 @@ impl RenderedToolResult<'_> {
             .any(|part| matches!(part, RenderedToolResultPart::Image(_)))
     }
 
+    fn text_parts(&self) -> impl Iterator<Item = &str> {
+        self.parts.iter().filter_map(|part| match part {
+            RenderedToolResultPart::Text(text) => Some(text.as_ref()),
+            RenderedToolResultPart::Image(_) => None,
+        })
+    }
+
+    // All recognition needles exclude newlines, so joining text parts with '\n'
+    // cannot create a match that is absent from the individual parts.
+    fn contains(&self, needle: &str) -> bool {
+        self.text_parts().any(|text| text.contains(needle))
+    }
+
+    fn contains_ignore_ascii_case(&self, needle: &str) -> bool {
+        self.text_parts().any(|text| {
+            text.as_bytes()
+                .windows(needle.len())
+                .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+        })
+    }
+
     fn joined_text(&self) -> String {
-        self.parts
-            .iter()
-            .filter_map(|part| match part {
-                RenderedToolResultPart::Text(text) => Some(text.as_ref()),
-                RenderedToolResultPart::Image(_) => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+        self.text_parts().collect::<Vec<_>>().join("\n")
     }
 
     fn prepend_text(&mut self, text: String) {
@@ -1372,15 +1382,7 @@ impl RenderedToolResult<'_> {
             .insert(0, RenderedToolResultPart::Text(text.into()));
     }
 
-    fn push_text(&mut self, text: String, joined_text: &mut String) {
-        if self
-            .parts
-            .iter()
-            .any(|part| matches!(part, RenderedToolResultPart::Text(_)))
-        {
-            joined_text.push('\n');
-        }
-        joined_text.push_str(&text);
+    fn push_text(&mut self, text: String) {
         self.parts.push(RenderedToolResultPart::Text(text.into()));
     }
 }

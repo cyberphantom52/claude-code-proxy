@@ -89,6 +89,22 @@ impl TrafficCapture {
         self.write_json_event_with_type(name, None, value);
     }
 
+    pub fn write_json_event_envelope(&self, name: &str, event: &str, data: &Value) {
+        let path = self.next_event_path(name);
+        let _ = write_json(
+            path,
+            &RedactedEventEnvelope {
+                data: Redacted {
+                    value: data,
+                    // The envelope is depth 0, so its data starts at depth 1.
+                    depth: 1,
+                    event: None,
+                },
+                event: RedactedText(event),
+            },
+        );
+    }
+
     pub fn write_json_event_with_type(&self, name: &str, event: Option<&str>, value: &Value) {
         let path = self.next_event_path(name);
         let _ = write_json(
@@ -175,6 +191,12 @@ pub fn redacted(value: &Value) -> impl Serialize + '_ {
         depth: 0,
         event: None,
     }
+}
+
+#[derive(Serialize)]
+struct RedactedEventEnvelope<'a> {
+    data: Redacted<'a>,
+    event: RedactedText<'a>,
 }
 
 struct Redacted<'a> {

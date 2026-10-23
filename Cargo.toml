@@ -7,7 +7,16 @@ authors = ["Claude Code Proxy contributors"]
 license = "MIT"
 publish = false
 
+[features]
+dhat-heap = ["dep:dhat"]
+
+[profile.dhat]
+inherits = "release"
+debug = 1
+strip = false
+
 [dependencies]
+dhat = { version = "0.3.3", optional = true }
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

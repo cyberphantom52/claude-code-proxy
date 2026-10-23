@@ -472,13 +472,7 @@ impl LiveStreamTranslator {
         data: &serde_json::Value,
     ) {
         if let Some(traffic) = traffic {
-            traffic.write_json_event(
-                "050-downstream-event",
-                &serde_json::json!({
-                    "event": event,
-                    "data": data,
-                }),
-            );
+            traffic.write_json_event_envelope("050-downstream-event", event, data);
         }
         append_json_sse_event(out, event, data);
     }

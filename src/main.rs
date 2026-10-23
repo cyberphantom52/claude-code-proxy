@@ -10,6 +10,10 @@ use claude_code_proxy::{
 };
 use std::io::IsTerminal;
 
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static ALLOCATOR: dhat::Alloc = dhat::Alloc;
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Parser)]
@@ -64,6 +68,9 @@ enum ProviderGroup {
 }
 
 fn main() -> Result<()> {
+    #[cfg(feature = "dhat-heap")]
+    let _profiler = dhat::Profiler::new_heap();
+
     let cli = Cli::parse();
 
     if cli.version_flag {

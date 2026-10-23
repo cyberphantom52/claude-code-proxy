@@ -60,7 +60,9 @@ use self::translate::live_stream::LiveStreamTranslator;
 use self::translate::model_allowlist::{
     assert_allowed_model, resolve_model_request, uses_responses_lite, validate_hosted_web_search,
 };
-use self::translate::reducer::finish_metadata_from_upstream;
+use self::translate::reducer::{
+    ReducerEvent, finish_metadata_from_upstream, reduce_upstream_bytes,
+};
 use self::translate::request::{
     TranslateOptions, has_hosted_web_search, is_compact_messages_request, translate_request,
 };
@@ -114,7 +116,7 @@ impl CodexProvider {
         let message_id = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
         let want_stream = incoming.stream;
         let (resolved, mut translated, compact_boundary, use_responses_lite, model) = {
-            let body = incoming;
+            let mut body = incoming;
             let model = body.model.as_deref().unwrap_or("gpt-6-sol");
             if body.model.is_some()
                 && let Err(error) = self::translate::model_allowlist::validate_model_configuration(
@@ -234,8 +236,10 @@ impl CodexProvider {
                 monitor.model_resolved(&ctx.req_id, &resolved.model);
             }
 
+            let compact_boundary = is_compact_messages_request(&body);
+            let model = body.model.take().unwrap_or_else(|| "gpt-6-sol".to_string());
             let translated = match translate_request(
-                &body,
+                body,
                 TranslateOptions {
                     session_id: ctx.session_id.clone(),
                     service_tier: resolved.service_tier.clone(),
@@ -253,13 +257,12 @@ impl CodexProvider {
                 }
             };
 
-            let compact_boundary = is_compact_messages_request(&body);
             (
                 resolved,
                 translated,
                 compact_boundary,
                 use_responses_lite,
-                body.model.unwrap_or_else(|| "gpt-6-sol".to_string()),
+                model,
             )
         };
 
@@ -437,7 +440,7 @@ impl CodexProvider {
         let mut request_continuation = continuation.clone();
         let mut continuation = Some(continuation);
         let mut attempt = 0_u32;
-        let upstream = loop {
+        let (upstream, reduction) = loop {
             let result = match await_empty_retry(
                 client.post_codex_for_owner(&translated, &ctx, continuation.as_ref()),
                 attempt > 0,
@@ -489,8 +492,9 @@ impl CodexProvider {
                     return map_codex_error_to_response(&e);
                 }
             };
-            if !is_empty_codex_success_completion(&response.body) {
-                break response;
+            match reduce_upstream_bytes(&response.body) {
+                Ok(events) if is_empty_codex_success_completion(&events) => {}
+                reduction => break (response, reduction),
             }
             // A successful terminal event with no output would translate into
             // an empty end_turn; retry with full context instead.
@@ -548,7 +552,7 @@ impl CodexProvider {
         );
 
         match accumulate_response_and_metadata_with_traffic(
-            &upstream.body,
+            reduction,
             &message_id,
             &model,
             ctx.traffic.as_deref(),
@@ -660,7 +664,7 @@ impl CodexProvider {
         }
 
         let translated = match translate_request(
-            &body,
+            body,
             TranslateOptions {
                 session_id: None,
                 service_tier: resolved.service_tier.clone(),
@@ -1868,14 +1872,11 @@ fn empty_buffered_completion_error() -> client::CodexError {
 
 /// True when the buffered upstream body ended in a successful terminal event
 /// without ever producing semantic output (text, thinking, tool, web search).
-fn is_empty_codex_success_completion(upstream_sse: &[u8]) -> bool {
-    use self::translate::reducer::{ReducerEvent, TERM_COMPLETED, TERM_DONE};
+fn is_empty_codex_success_completion(events: &[ReducerEvent]) -> bool {
+    use self::translate::reducer::{TERM_COMPLETED, TERM_DONE};
 
-    let Ok(events) = self::translate::reducer::reduce_upstream_bytes(upstream_sse) else {
-        return false;
-    };
     let mut saw_success_terminal = false;
-    for event in &events {
+    for event in events {
         match event {
             ReducerEvent::TextDelta { text, .. } if !text.is_empty() => return false,
             ReducerEvent::ThinkingStart { .. }
@@ -1939,6 +1940,7 @@ fn retryable_live_message(message: &str) -> bool {
         "timed out",
         "connection closed",
         "connection reset",
+        "no route to host",
         "broken pipe",
         "epipe",
     ]

@@ -1,5 +1,7 @@
 use serde_json::Value;
 
+use crate::anthropic::sse::sse_events;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CodexFailureKind {
     RateLimit,
@@ -313,9 +315,9 @@ pub(crate) fn usage_limit_from_response(
     headers: &[(String, String)],
 ) -> Option<CodexUsageLimit> {
     let direct = serde_json::from_slice::<Value>(body).ok().into_iter();
-    let events = crate::anthropic::sse::parse_sse_events(body)
-        .into_iter()
-        .filter_map(|event| serde_json::from_str::<Value>(&event.data).ok());
+    let text = String::from_utf8_lossy(body);
+    let events =
+        sse_events(&text).filter_map(|event| serde_json::from_str::<Value>(&event.data).ok());
     direct
         .chain(events)
         .find_map(|payload| usage_limit_from_payload_with_headers(&payload, headers))
@@ -483,7 +485,8 @@ pub(crate) fn first_retryable_failure(body: &[u8]) -> Option<CodexEventFailure> 
 }
 
 pub(crate) fn first_event_failure(body: &[u8]) -> Option<CodexEventFailure> {
-    for event in crate::anthropic::sse::parse_sse_events(body) {
+    let text = String::from_utf8_lossy(body);
+    for event in sse_events(&text) {
         if event.data == "[DONE]" {
             continue;
         }

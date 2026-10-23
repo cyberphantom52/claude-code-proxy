@@ -15,17 +15,22 @@ pub fn accumulate_response_with_traffic(
     model: &str,
     traffic: Option<&TrafficCapture>,
 ) -> Result<Value, anyhow::Error> {
-    accumulate_response_and_metadata_with_traffic(upstream, message_id, model, traffic)
-        .map(|(response, _)| response)
+    accumulate_response_and_metadata_with_traffic(
+        reduce_upstream_bytes(upstream),
+        message_id,
+        model,
+        traffic,
+    )
+    .map(|(response, _)| response)
 }
 
 pub fn accumulate_response_and_metadata_with_traffic(
-    upstream: &[u8],
+    reduction: Result<Vec<ReducerEvent>, UpstreamStreamError>,
     message_id: &str,
     model: &str,
     traffic: Option<&TrafficCapture>,
 ) -> Result<(Value, Option<FinishMetadata>), anyhow::Error> {
-    let events = match reduce_upstream_bytes(upstream) {
+    let events = match reduction {
         Ok(events) => events,
         Err(err) => {
             write_reducer_error_capture(traffic, &err);

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -434,7 +435,7 @@ fn decode_http_sse_frame(frame: &[u8]) -> Result<Option<DecodedHttpSseEvent>, Co
     let frame = std::str::from_utf8(frame)
         .map_err(|_| http_sse_error("Codex SSE frame contains invalid UTF-8"))?;
     let mut event = None;
-    let mut data = Vec::new();
+    let mut data: Option<Cow<'_, str>> = None;
     for line in frame.lines() {
         if line.starts_with(':') {
             continue;
@@ -443,14 +444,20 @@ fn decode_http_sse_frame(frame: &[u8]) -> Result<Option<DecodedHttpSseEvent>, Co
         let value = value.strip_prefix(' ').unwrap_or(value);
         match field {
             "event" => event = Some(value.to_owned()),
-            "data" => data.push(value),
+            "data" => match &mut data {
+                Some(data) => {
+                    let data = data.to_mut();
+                    data.push('\n');
+                    data.push_str(value);
+                }
+                None => data = Some(Cow::Borrowed(value)),
+            },
             _ => {}
         }
     }
-    if data.is_empty() {
+    let Some(data) = data else {
         return Ok(None);
-    }
-    let data = data.join("\n");
+    };
     if data == "[DONE]" {
         return Ok(Some(DecodedHttpSseEvent {
             event,
@@ -793,7 +800,7 @@ impl CodexHttpClient {
         ctx: &RequestContext,
     ) -> Result<reqwest::Response, CodexError> {
         let body_json = serde_json::to_vec(body)
-            .map(Bytes::from)
+            .map(|body| Bytes::from(body.into_boxed_slice()))
             .map_err(|error| CodexError {
                 status: 500,
                 message: "Failed to serialize image request".to_string(),
@@ -879,7 +886,7 @@ impl CodexHttpClient {
         stream: bool,
     ) -> Result<reqwest::Response, CodexError> {
         let body_json = serde_json::to_vec(body)
-            .map(Bytes::from)
+            .map(|body| Bytes::from(body.into_boxed_slice()))
             .map_err(|err| CodexError {
                 status: 500,
                 message: "Failed to serialize native Responses request".to_string(),
@@ -993,7 +1000,7 @@ impl CodexHttpClient {
             origin: CodexErrorOrigin::Auth,
         })?;
         let body_json = serde_json::to_vec(body)
-            .map(Bytes::from)
+            .map(|body| Bytes::from(body.into_boxed_slice()))
             .map_err(|e| CodexError {
                 status: 500,
                 message: "Failed to serialize search request".to_string(),
@@ -1074,7 +1081,7 @@ impl CodexHttpClient {
         }
 
         let body_json = serde_json::to_vec(body)
-            .map(Bytes::from)
+            .map(|body| Bytes::from(body.into_boxed_slice()))
             .map_err(|e| CodexError {
                 status: 500,
                 message: "Failed to serialize request".to_string(),
@@ -1689,7 +1696,7 @@ impl CodexHttpClient {
                 return Ok(Bytes::clone(body_json));
             }
             let body_json = serde_json::to_vec(body)
-                .map(Bytes::from)
+                .map(|body| Bytes::from(body.into_boxed_slice()))
                 .map_err(|e| CodexError {
                     status: 500,
                     message: "Failed to serialize request".to_string(),
@@ -3439,6 +3446,7 @@ fn is_retryable_transport_error(err: &CodexError) -> bool {
     message.contains("timed out waiting")
         || message.contains("transport error")
         || message.contains("connection reset")
+        || message.contains("no route to host")
         || message.contains("connection closed")
         || message.contains("timed out")
         || message.contains("econnreset")
