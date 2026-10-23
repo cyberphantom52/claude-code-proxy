@@ -55,7 +55,7 @@ use self::continuation::{
 };
 use self::count_tokens::count_translated_tokens;
 use self::native::NativeResponseOutcome;
-use self::translate::accumulate::accumulate_response_with_traffic;
+use self::translate::accumulate::accumulate_response_and_metadata_with_traffic;
 use self::translate::live_stream::LiveStreamTranslator;
 use self::translate::model_allowlist::{
     assert_allowed_model, resolve_model_request, uses_responses_lite, validate_hosted_web_search,
@@ -107,44 +107,121 @@ fn transport_for_request(
 impl CodexProvider {
     async fn handle_messages_inner(
         &self,
-        body: MessagesRequest,
+        incoming: MessagesRequest,
         ctx: RequestContext,
         conversation_identity: Option<ConversationIdentity>,
     ) -> Response {
         let message_id = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
-        let want_stream = body.stream;
-        let model = body.model.as_deref().unwrap_or("gpt-6-sol");
-        if body.model.is_some()
-            && let Err(error) = self::translate::model_allowlist::validate_model_configuration(
-                model,
-                !body.bypass_provider_model_override,
-            )
-        {
-            return json_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                error.to_string(),
-            );
-        }
-
-        let resolved = resolve_model_request(model);
-        if let Err(e) = assert_allowed_model(&resolved.model) {
-            return json_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                e.to_string(),
-            );
-        }
-        if search::is_standalone_search_request(&body) {
-            if let Some(monitor) = ctx.monitor.as_ref() {
-                monitor.model_resolved(&ctx.req_id, &resolved.model);
+        let want_stream = incoming.stream;
+        let (resolved, mut translated, compact_boundary, use_responses_lite, model) = {
+            let body = incoming;
+            let model = body.model.as_deref().unwrap_or("gpt-6-sol");
+            if body.model.is_some()
+                && let Err(error) = self::translate::model_allowlist::validate_model_configuration(
+                    model,
+                    !body.bypass_provider_model_override,
+                )
+            {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    error.to_string(),
+                );
             }
-            let (search_request, query) = match search::build_search_request(
-                &body,
-                &resolved.model,
-                conversation_identity.as_ref(),
-            ) {
-                Ok(request) => request,
+
+            let resolved = resolve_model_request(model);
+            if let Err(e) = assert_allowed_model(&resolved.model) {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    e.to_string(),
+                );
+            }
+            if search::is_standalone_search_request(&body) {
+                if let Some(monitor) = ctx.monitor.as_ref() {
+                    monitor.model_resolved(&ctx.req_id, &resolved.model);
+                }
+                let (search_request, query, model) = {
+                    let search_body = body;
+                    let (search_request, query) = match search::build_search_request(
+                        &search_body,
+                        &resolved.model,
+                        conversation_identity.as_ref(),
+                    ) {
+                        Ok(request) => request,
+                        Err(error) => {
+                            return json_error(
+                                StatusCode::BAD_REQUEST,
+                                "invalid_request_error",
+                                error.to_string(),
+                            );
+                        }
+                    };
+                    (
+                        search_request,
+                        query,
+                        search_body.model.unwrap_or_else(|| "gpt-6-sol".to_string()),
+                    )
+                };
+                let log = create_logger("codex");
+                let started_at = Instant::now();
+                log.info(
+                    "codex_standalone_search_started",
+                    Some(serde_json::Map::from_iter([
+                        ("reqId".to_string(), serde_json::json!(&ctx.req_id)),
+                        ("model".to_string(), serde_json::json!(&resolved.model)),
+                        ("stream".to_string(), serde_json::json!(want_stream)),
+                    ])),
+                );
+                if let Some(monitor) = ctx.monitor.as_ref() {
+                    monitor.upstream_started(&ctx.req_id);
+                }
+                let search_response = match self.client.post_search(&search_request, &ctx).await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        log.warn(
+                            "codex_standalone_search_failed",
+                            Some(serde_json::Map::from_iter([
+                                ("reqId".to_string(), serde_json::json!(&ctx.req_id)),
+                                ("model".to_string(), serde_json::json!(&resolved.model)),
+                                ("status".to_string(), serde_json::json!(error.status)),
+                                (
+                                    "ms".to_string(),
+                                    serde_json::json!(started_at.elapsed().as_millis()),
+                                ),
+                            ])),
+                        );
+                        return map_codex_error_to_response(&error);
+                    }
+                };
+                log.info(
+                    "codex_standalone_search_completed",
+                    Some(serde_json::Map::from_iter([
+                        ("reqId".to_string(), serde_json::json!(&ctx.req_id)),
+                        ("model".to_string(), serde_json::json!(&resolved.model)),
+                        (
+                            "resultCount".to_string(),
+                            serde_json::json!(search_response.results.as_ref().map(Vec::len)),
+                        ),
+                        (
+                            "ms".to_string(),
+                            serde_json::json!(started_at.elapsed().as_millis()),
+                        ),
+                    ])),
+                );
+                let input_tokens = search::search_request_input_tokens(&search_request);
+                return search::anthropic_search_response(
+                    &search_response,
+                    &query,
+                    &message_id,
+                    &model,
+                    want_stream,
+                    input_tokens,
+                    ctx.traffic.as_deref(),
+                );
+            }
+            let use_responses_lite = match apply_model_lane_for_request(&resolved.model, &body) {
+                Ok(lite) => lite,
                 Err(error) => {
                     return json_error(
                         StatusCode::BAD_REQUEST,
@@ -153,98 +230,40 @@ impl CodexProvider {
                     );
                 }
             };
-            let log = create_logger("codex");
-            let started_at = Instant::now();
-            log.info(
-                "codex_standalone_search_started",
-                Some(serde_json::Map::from_iter([
-                    ("reqId".to_string(), serde_json::json!(&ctx.req_id)),
-                    ("model".to_string(), serde_json::json!(&resolved.model)),
-                    ("stream".to_string(), serde_json::json!(want_stream)),
-                ])),
-            );
             if let Some(monitor) = ctx.monitor.as_ref() {
-                monitor.upstream_started(&ctx.req_id);
+                monitor.model_resolved(&ctx.req_id, &resolved.model);
             }
-            let search_response = match self.client.post_search(&search_request, &ctx).await {
-                Ok(response) => response,
-                Err(error) => {
-                    log.warn(
-                        "codex_standalone_search_failed",
-                        Some(serde_json::Map::from_iter([
-                            ("reqId".to_string(), serde_json::json!(&ctx.req_id)),
-                            ("model".to_string(), serde_json::json!(&resolved.model)),
-                            ("status".to_string(), serde_json::json!(error.status)),
-                            (
-                                "ms".to_string(),
-                                serde_json::json!(started_at.elapsed().as_millis()),
-                            ),
-                        ])),
+
+            let translated = match translate_request(
+                &body,
+                TranslateOptions {
+                    session_id: ctx.session_id.clone(),
+                    service_tier: resolved.service_tier.clone(),
+                    model: resolved.model.clone(),
+                    use_responses_lite,
+                },
+            ) {
+                Ok(t) => t,
+                Err(e) => {
+                    return json_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request_error",
+                        e.to_string(),
                     );
-                    return map_codex_error_to_response(&error);
                 }
             };
-            log.info(
-                "codex_standalone_search_completed",
-                Some(serde_json::Map::from_iter([
-                    ("reqId".to_string(), serde_json::json!(&ctx.req_id)),
-                    ("model".to_string(), serde_json::json!(&resolved.model)),
-                    (
-                        "resultCount".to_string(),
-                        serde_json::json!(search_response.results.as_ref().map(Vec::len)),
-                    ),
-                    (
-                        "ms".to_string(),
-                        serde_json::json!(started_at.elapsed().as_millis()),
-                    ),
-                ])),
-            );
-            let input_tokens = search::search_request_input_tokens(&search_request);
-            return search::anthropic_search_response(
-                &search_response,
-                &query,
-                &message_id,
-                model,
-                want_stream,
-                input_tokens,
-                ctx.traffic.as_deref(),
-            );
-        }
-        let use_responses_lite = match apply_model_lane_for_request(&resolved.model, &body) {
-            Ok(lite) => lite,
-            Err(error) => {
-                return json_error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_request_error",
-                    error.to_string(),
-                );
-            }
-        };
-        if let Some(monitor) = ctx.monitor.as_ref() {
-            monitor.model_resolved(&ctx.req_id, &resolved.model);
-        }
 
-        let mut translated = match translate_request(
-            &body,
-            TranslateOptions {
-                session_id: ctx.session_id.clone(),
-                service_tier: resolved.service_tier.clone(),
-                model: resolved.model.clone(),
+            let compact_boundary = is_compact_messages_request(&body);
+            (
+                resolved,
+                translated,
+                compact_boundary,
                 use_responses_lite,
-            },
-        ) {
-            Ok(t) => t,
-            Err(e) => {
-                return json_error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_request_error",
-                    e.to_string(),
-                );
-            }
+                body.model.unwrap_or_else(|| "gpt-6-sol".to_string()),
+            )
         };
 
         let mut portable_request = None;
-        let compact_boundary = is_compact_messages_request(&body);
         let server_compaction_enabled = config::codex_server_compaction();
         let scope = conversation_identity
             .as_ref()
@@ -381,18 +400,17 @@ impl CodexProvider {
             monitor.upstream_started(&ctx.req_id);
         }
         if want_stream {
-            let stream_request = translated.clone();
             let response = live_stream_response(
                 client,
                 message_id,
-                model,
+                &model,
                 ctx,
-                stream_request,
+                Arc::new(translated),
                 continuation,
                 LiveStreamCompaction {
                     compact_boundary,
                     attempt: compaction_attempt,
-                    portable_request,
+                    portable_request: portable_request.map(Arc::new),
                 },
                 configured_transport,
             )
@@ -529,19 +547,19 @@ impl CodexProvider {
             ])),
         );
 
-        match accumulate_response_with_traffic(
+        match accumulate_response_and_metadata_with_traffic(
             &upstream.body,
             &message_id,
-            model,
+            &model,
             ctx.traffic.as_deref(),
         ) {
-            Ok(json) => {
-                update_continuation_from_upstream(
+            Ok((json, finish)) => {
+                update_continuation_from_finish(
                     compaction_scope(&request_continuation).as_ref(),
                     &request_continuation,
                     compaction_attempt,
                     &translated,
-                    &upstream.body,
+                    finish.as_ref(),
                     upstream.socket_id,
                     upstream.provenance.as_ref(),
                     compact_boundary,
@@ -771,7 +789,7 @@ enum LiveStreamStart {
 struct LiveStreamCompaction {
     compact_boundary: bool,
     attempt: Option<CompactionAttempt>,
-    portable_request: Option<translate::request::ResponsesRequest>,
+    portable_request: Option<Arc<translate::request::ResponsesRequest>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -780,7 +798,7 @@ async fn live_stream_response(
     message_id: String,
     model: &str,
     ctx: RequestContext,
-    mut request_body: translate::request::ResponsesRequest,
+    mut request_body: Arc<translate::request::ResponsesRequest>,
     continuation: ContinuationReservation,
     mut compaction: LiveStreamCompaction,
     transport: config::CodexTransport,
@@ -807,7 +825,7 @@ async fn live_stream_response(
                 config::CodexTransport::WebSocket => {
                     client
                         .stream_codex_websocket_events_for_owner(
-                            &request_body,
+                            request_body.clone(),
                             &ctx,
                             continuation.as_ref(),
                         )
@@ -816,7 +834,7 @@ async fn live_stream_response(
                 config::CodexTransport::Auto => {
                     client
                         .stream_codex_auto_events_for_owner(
-                            &request_body,
+                            request_body.clone(),
                             &ctx,
                             continuation.as_ref(),
                         )
@@ -1143,7 +1161,7 @@ async fn live_stream_response_once(
     model: &str,
     ctx: RequestContext,
     request_continuation: ContinuationReservation,
-    request_body: translate::request::ResponsesRequest,
+    request_body: Arc<translate::request::ResponsesRequest>,
     compaction: LiveStreamCompaction,
 ) -> LiveStreamStart {
     let estimated_input_tokens = count_translated_tokens(&request_body);
@@ -1451,7 +1469,7 @@ fn remaining_live_stream_response(
     first_chunk: Vec<u8>,
     ctx: RequestContext,
     request_continuation: ContinuationReservation,
-    request_body: translate::request::ResponsesRequest,
+    request_body: Arc<translate::request::ResponsesRequest>,
     mut upstream_sse_body: Option<Vec<u8>>,
     compaction: LiveStreamCompaction,
 ) -> Response {
@@ -1656,7 +1674,7 @@ fn remaining_live_stream_response(
                                 reconnect
                                     .client
                                     .stream_codex_websocket_events_for_owner(
-                                        &request_body,
+                                        request_body.clone(),
                                         &ctx,
                                         Some(&retry_continuation),
                                     )
@@ -1971,12 +1989,36 @@ fn update_continuation_from_upstream(
     actual_provenance: Option<&models::OperationProvenance>,
     compact_boundary: bool,
 ) {
+    let finish = finish_metadata_from_upstream(upstream_body).ok().flatten();
+    update_continuation_from_finish(
+        scope,
+        continuation,
+        compaction_attempt,
+        request_body,
+        finish.as_ref(),
+        socket_id,
+        actual_provenance,
+        compact_boundary,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_continuation_from_finish(
+    scope: Option<&CompactionScope>,
+    continuation: &ContinuationReservation,
+    compaction_attempt: Option<CompactionAttempt>,
+    request_body: &translate::request::ResponsesRequest,
+    finish: Option<&translate::reducer::FinishMetadata>,
+    socket_id: Option<u64>,
+    actual_provenance: Option<&models::OperationProvenance>,
+    compact_boundary: bool,
+) {
     if actual_provenance.is_none() || actual_provenance != continuation.provenance() {
         abort_request_state(scope, continuation, compaction_attempt);
         return;
     }
-    match finish_metadata_from_upstream(upstream_body) {
-        Ok(Some(finish)) if finish.continuation_eligible => {
+    match finish {
+        Some(finish) if finish.continuation_eligible => {
             if compact_boundary {
                 activate_compaction(
                     scope,

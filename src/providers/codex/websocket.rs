@@ -48,7 +48,8 @@ pub const WEBSOCKET_CONTINUATION_SOCKET_MISSING_DETAIL: &str =
     "websocket_continuation_socket_missing";
 pub(super) const WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL: &str = "websocket_proxy_tunnel_rejected";
 
-const POOL_IDLE_TTL_MS: u64 = 30 * 60 * 1000;
+// Match HTTP's idle connection retention; response/read timeouts are independent.
+const POOL_IDLE_TTL_MS: u64 = 90_000;
 const MAX_POOL_ENTRIES: usize = 10_000;
 const POOL_CONNECT_CLEANUP_THRESHOLD: usize = 50;
 const POOL_CONNECT_CLEANUP_TARGET: usize = 40;
@@ -292,7 +293,7 @@ struct PoolEntry {
     provenance: Option<super::models::OperationProvenance>,
     ws: Arc<AsyncMutex<CodexWebSocketStream>>,
     socket_id: u64,
-    created_at: u64,
+    last_used_at: AtomicU64,
     last_activity: AtomicU64,
 }
 
@@ -305,12 +306,13 @@ impl PoolEntry {
             provenance,
             ws: Arc::new(AsyncMutex::new(ws)),
             socket_id: next_monotonic_nonzero(&NEXT_SOCKET_ID, "WebSocket ID"),
-            created_at: now_ms(),
+            last_used_at: AtomicU64::new(now_ms()),
             last_activity: AtomicU64::new(next_pool_activity()),
         }
     }
 
     fn touch(&self) {
+        self.last_used_at.fetch_max(now_ms(), Ordering::Relaxed);
         self.last_activity
             .fetch_max(next_pool_activity(), Ordering::Relaxed);
     }
@@ -471,19 +473,46 @@ pub(super) fn invalidate_codex_websocket_pool_socket(
     }
 }
 
+fn pool_entry_is_idle(entry: &Arc<PoolEntry>) -> bool {
+    Arc::strong_count(entry) == 1
+        && Arc::strong_count(&entry.ws) == 1
+        && entry.ws.try_lock().is_ok()
+}
+
+fn prune_idle_pool(pool: &mut HashMap<ConversationIdentity, Arc<PoolEntry>>) {
+    let now = now_ms();
+    pool.retain(|_, entry| {
+        now.saturating_sub(entry.last_used_at.load(Ordering::Relaxed)) < POOL_IDLE_TTL_MS
+            || !pool_entry_is_idle(entry)
+    });
+}
+
+pub(crate) fn prune_idle_state() {
+    super::continuation::prune_idle_state();
+    super::compaction::prune_idle_state();
+    let mut pool = WS_POOL.lock().unwrap();
+    prune_idle_pool(&mut pool);
+    pool.shrink_to_fit();
+}
+
 fn pool_insert_if_vacant_or_same(owner: ConversationIdentity, entry: Arc<PoolEntry>) -> bool {
     entry.touch();
     let mut guard = WS_POOL.lock().unwrap();
     if let Some(existing) = guard.get(&owner) {
         return Arc::ptr_eq(existing, &entry);
     }
-    if guard.len() >= MAX_POOL_ENTRIES
-        && let Some(oldest_owner) = guard.keys().next().cloned()
-    {
+    prune_idle_pool(&mut guard);
+    if guard.len() >= MAX_POOL_ENTRIES {
+        let oldest_owner = guard
+            .iter()
+            .filter(|(_, pooled)| pool_entry_is_idle(pooled))
+            .min_by_key(|(_, pooled)| pooled.last_activity.load(Ordering::Relaxed))
+            .map(|(owner, _)| owner.clone());
+        let Some(oldest_owner) = oldest_owner else {
+            return false;
+        };
         guard.remove(&oldest_owner);
     }
-    let now = now_ms();
-    guard.retain(|_, pooled| now.saturating_sub(pooled.created_at) < POOL_IDLE_TTL_MS);
     guard.insert(owner, entry);
     true
 }
@@ -498,7 +527,7 @@ fn cleanup_pool_before_connect() {
         let remove_count = guard.len() - POOL_CONNECT_CLEANUP_TARGET;
         let mut candidates: Vec<_> = guard
             .iter()
-            .filter(|(_, entry)| Arc::strong_count(entry) == 1)
+            .filter(|(_, entry)| pool_entry_is_idle(entry))
             .map(|(owner, entry)| (owner.clone(), entry.last_activity.load(Ordering::Relaxed)))
             .collect();
         candidates.sort_unstable_by_key(|(_, activity)| *activity);

@@ -1,7 +1,9 @@
+use std::borrow::Cow;
+
 use bytes::Bytes; // EFFICIENCY: avoid memcpy on multipart upload
 use http::StatusCode;
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde::Deserialize;
+use serde_json::{Value, json};
 
 use crate::monitor::TokenUsage;
 
@@ -75,7 +77,7 @@ struct ImageResponse<'a> {
 #[derive(Debug, Deserialize)]
 struct ImageResponseItem<'a> {
     #[serde(borrow)]
-    b64_json: &'a str,
+    b64_json: Cow<'a, str>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -86,7 +88,7 @@ struct ImageUsage {
     output_tokens: Option<u64>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GenerationRequest {
     prompt: String,
@@ -102,13 +104,13 @@ struct GenerationRequest {
     size: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ImageUrl {
     image_url: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EditRequest {
     prompt: String,
@@ -404,12 +406,7 @@ fn prepare_generation_request(bytes: &[u8]) -> Result<PreparedImageRequest, Imag
         &mut request.size,
     )?;
     let model = request.model.clone().expect("model defaulted");
-    let body = serde_json::to_value(request).map_err(|error| ImageRequestError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        message: format!("Failed to serialize image request: {error}"),
-        param: None,
-        code: Some("internal_error"),
-    })?;
+    let body = generation_body(request);
     Ok(PreparedImageRequest {
         body,
         model,
@@ -525,17 +522,43 @@ fn prepare_edit_value(mut request: EditRequest) -> Result<PreparedImageRequest, 
     )?;
     let model = request.model.clone().expect("model defaulted");
     let image_count = request.images.len();
-    let body = serde_json::to_value(request).map_err(|error| ImageRequestError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        message: format!("Failed to serialize image edit request: {error}"),
-        param: None,
-        code: Some("internal_error"),
-    })?;
+    let mut body = generation_body(GenerationRequest {
+        prompt: request.prompt,
+        model: request.model,
+        background: request.background,
+        n: request.n,
+        quality: request.quality,
+        size: request.size,
+    });
+    body["images"] = Value::Array(
+        request
+            .images
+            .into_iter()
+            .map(|image| {
+                let mut value = json!({"image_url":null});
+                value["image_url"] = Value::String(image.image_url);
+                value
+            })
+            .collect(),
+    );
     Ok(PreparedImageRequest {
         body,
         model,
         image_count,
     })
+}
+
+fn generation_body(request: GenerationRequest) -> Value {
+    let mut body = json!({"prompt":null,"model":null,"background":null,"quality":null,"size":null});
+    body["prompt"] = Value::String(request.prompt);
+    body["model"] = request.model.map_or(Value::Null, Value::String);
+    body["background"] = request.background.map_or(Value::Null, Value::String);
+    body["quality"] = request.quality.map_or(Value::Null, Value::String);
+    body["size"] = request.size.map_or(Value::Null, Value::String);
+    if let Some(n) = request.n {
+        body["n"] = json!(n);
+    }
+    body
 }
 
 fn validate_data_url(value: &str) -> Result<usize, ImageRequestError> {

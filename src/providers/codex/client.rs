@@ -1,7 +1,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::anthropic::sse::parse_sse_events;
+use bytes::Bytes;
+
+use crate::anthropic::sse::sse_events;
 use crate::config;
 use crate::logging::create_logger;
 use crate::provider::RequestContext;
@@ -299,7 +301,10 @@ fn build_websocket_request(
     body: &ResponsesRequest,
     continuation: Option<&super::continuation::ContinuationCandidate>,
 ) -> serde_json::Value {
-    let mut payload = serde_json::to_value(body).unwrap_or_default();
+    let input = continuation
+        .and_then(|candidate| candidate.input_delta.as_deref())
+        .unwrap_or(&body.input);
+    let mut payload = serde_json::to_value(body.with_input(input)).unwrap_or_default();
     let obj = payload.as_object_mut().expect("request must be an object");
 
     // Omit the stream field for WebSocket transport
@@ -307,19 +312,13 @@ fn build_websocket_request(
     obj.insert("type".to_string(), serde_json::json!("response.create"));
 
     // Apply continuation if available
-    if let Some(candidate) = continuation {
-        if let Some(ref prev_id) = candidate.previous_response_id {
-            obj.insert(
-                "previous_response_id".to_string(),
-                serde_json::json!(prev_id),
-            );
-        }
-        if let Some(ref delta) = candidate.input_delta {
-            obj.insert(
-                "input".to_string(),
-                serde_json::to_value(delta).unwrap_or_default(),
-            );
-        }
+    if let Some(candidate) = continuation
+        && let Some(ref prev_id) = candidate.previous_response_id
+    {
+        obj.insert(
+            "previous_response_id".to_string(),
+            serde_json::json!(prev_id),
+        );
     }
 
     payload
@@ -366,8 +365,8 @@ struct HttpEventStreamState {
     resp: reqwest::Response,
     response_headers: Vec<(String, String)>,
     started_at: Instant,
-    body_json: String,
-    auth: OperationAuth,
+    body_json: Bytes,
+    auth: Arc<OperationAuth>,
     auth_refresh_attempted: bool,
     use_responses_lite: bool,
     retries: u32,
@@ -741,7 +740,7 @@ impl CodexHttpClient {
         headers: &http::HeaderMap,
         input: &super::transcription::PreparedTranscription,
     ) -> Result<reqwest::Response, CodexError> {
-        let part = reqwest::multipart::Part::bytes(input.audio.to_vec())
+        let part = reqwest::multipart::Part::stream(input.audio.clone())
             .file_name(input.filename.clone())
             .mime_str(&input.content_type)
             .map_err(|error| CodexError {
@@ -793,14 +792,16 @@ impl CodexHttpClient {
         body: &serde_json::Value,
         ctx: &RequestContext,
     ) -> Result<reqwest::Response, CodexError> {
-        let body_json = serde_json::to_vec(body).map_err(|error| CodexError {
-            status: 500,
-            message: "Failed to serialize image request".to_string(),
-            detail: Some(error.to_string()),
-            retry_after: None,
-            usage_limit: None,
-            origin: CodexErrorOrigin::Http,
-        })?;
+        let body_json = serde_json::to_vec(body)
+            .map(Bytes::from)
+            .map_err(|error| CodexError {
+                status: 500,
+                message: "Failed to serialize image request".to_string(),
+                detail: Some(error.to_string()),
+                retry_after: None,
+                usage_limit: None,
+                origin: CodexErrorOrigin::Http,
+            })?;
         let url = format!(
             "{}/{}",
             base_url.trim_end_matches('/'),
@@ -838,7 +839,7 @@ impl CodexHttpClient {
         &self,
         url: &str,
         headers: &http::HeaderMap,
-        body_json: Vec<u8>,
+        body_json: Bytes,
     ) -> Result<reqwest::Response, CodexError> {
         let mut request = self.native_client.post(url);
         for (key, value) in headers {
@@ -877,14 +878,16 @@ impl CodexHttpClient {
         use_responses_lite: bool,
         stream: bool,
     ) -> Result<reqwest::Response, CodexError> {
-        let body_json = serde_json::to_string(body).map_err(|err| CodexError {
-            status: 500,
-            message: "Failed to serialize native Responses request".to_string(),
-            detail: Some(err.to_string()),
-            retry_after: None,
-            usage_limit: None,
-            origin: CodexErrorOrigin::Http,
-        })?;
+        let body_json = serde_json::to_vec(body)
+            .map(Bytes::from)
+            .map_err(|err| CodexError {
+                status: 500,
+                message: "Failed to serialize native Responses request".to_string(),
+                detail: Some(err.to_string()),
+                retry_after: None,
+                usage_limit: None,
+                origin: CodexErrorOrigin::Http,
+            })?;
         let mut auth = self.operation_auth().await.map_err(|err| CodexError {
             status: 401,
             message: "Auth error".to_string(),
@@ -905,7 +908,8 @@ impl CodexHttpClient {
                 })
             })
         {
-            auth.require_opaque_provenance(&self.base_url)
+            Arc::make_mut(&mut auth)
+                .require_opaque_provenance(&self.base_url)
                 .map_err(auth_refresh_error)?;
         }
 
@@ -942,7 +946,7 @@ impl CodexHttpClient {
     async fn attempt_native_responses(
         &self,
         headers: &http::HeaderMap,
-        body_json: String,
+        body_json: Bytes,
     ) -> Result<reqwest::Response, CodexError> {
         let mut request = self.native_client.post(&self.base_url);
         for (key, value) in headers {
@@ -988,14 +992,16 @@ impl CodexHttpClient {
             usage_limit: None,
             origin: CodexErrorOrigin::Auth,
         })?;
-        let body_json = serde_json::to_string(body).map_err(|e| CodexError {
-            status: 500,
-            message: "Failed to serialize search request".to_string(),
-            detail: Some(e.to_string()),
-            retry_after: None,
-            usage_limit: None,
-            origin: CodexErrorOrigin::Http,
-        })?;
+        let body_json = serde_json::to_vec(body)
+            .map(Bytes::from)
+            .map_err(|e| CodexError {
+                status: 500,
+                message: "Failed to serialize search request".to_string(),
+                detail: Some(e.to_string()),
+                retry_after: None,
+                usage_limit: None,
+                origin: CodexErrorOrigin::Http,
+            })?;
         let mut auth_refresh_attempted = false;
         let mut retries = 0_u32;
 
@@ -1062,18 +1068,21 @@ impl CodexHttpClient {
                     | super::translate::request::ResponsesInputItem::CompactionTrigger
             )
         }) {
-            auth.require_opaque_provenance(&self.base_url)
+            Arc::make_mut(&mut auth)
+                .require_opaque_provenance(&self.base_url)
                 .map_err(auth_refresh_error)?;
         }
 
-        let body_json = serde_json::to_string(body).map_err(|e| CodexError {
-            status: 500,
-            message: "Failed to serialize request".to_string(),
-            detail: Some(e.to_string()),
-            retry_after: None,
-            usage_limit: None,
-            origin: CodexErrorOrigin::Http,
-        })?;
+        let body_json = serde_json::to_vec(body)
+            .map(Bytes::from)
+            .map_err(|e| CodexError {
+                status: 500,
+                message: "Failed to serialize request".to_string(),
+                detail: Some(e.to_string()),
+                retry_after: None,
+                usage_limit: None,
+                origin: CodexErrorOrigin::Http,
+            })?;
         let mut auth_refresh_attempted = false;
         let use_responses_lite = body.client_metadata.is_some();
         let mut retries = 0_u32;
@@ -1163,8 +1172,8 @@ impl CodexHttpClient {
 
     async fn start_http_event_attempt(
         &self,
-        auth: &mut OperationAuth,
-        body_json: &str,
+        auth: &mut Arc<OperationAuth>,
+        body_json: &Bytes,
         ctx: &RequestContext,
         use_responses_lite: bool,
         auth_refresh_attempted: &mut bool,
@@ -1206,16 +1215,16 @@ impl CodexHttpClient {
 
     pub(crate) async fn stream_codex_auto_events_for_owner(
         self: &Arc<Self>,
-        body: &ResponsesRequest,
+        body: Arc<ResponsesRequest>,
         ctx: &RequestContext,
         continuation: Option<&super::continuation::ContinuationReservation>,
     ) -> Result<super::websocket::CodexWebSocketEventStream, CodexError> {
         let mut websocket = self
-            .stream_codex_websocket_events_for_owner(body, ctx, continuation)
+            .stream_codex_websocket_events_for_owner(Arc::clone(&body), ctx, continuation)
             .await?;
         match websocket.recv().await {
             Some(Err(err)) if should_fallback_to_http(&err) => {
-                self.stream_codex_http_events_for_owner(body, ctx).await
+                self.stream_codex_http_events_for_owner(&body, ctx).await
             }
             Some(item) => {
                 let (tx, rx) = tokio::sync::mpsc::channel(1);
@@ -1656,7 +1665,8 @@ impl CodexHttpClient {
                     | super::translate::request::ResponsesInputItem::CompactionTrigger
             )
         }) {
-            auth.require_opaque_provenance(&self.base_url)
+            Arc::make_mut(&mut auth)
+                .require_opaque_provenance(&self.base_url)
                 .map_err(auth_refresh_error)?;
         }
 
@@ -1673,17 +1683,28 @@ impl CodexHttpClient {
         let mut active_continuation = continuation.cloned();
         let mut auth_refresh_attempted = false;
         let mut transport_failures = 0u32;
+        let mut http_body_json = None;
+        let mut serialize_http_body = || -> Result<Bytes, CodexError> {
+            if let Some(body_json) = &http_body_json {
+                return Ok(Bytes::clone(body_json));
+            }
+            let body_json = serde_json::to_vec(body)
+                .map(Bytes::from)
+                .map_err(|e| CodexError {
+                    status: 500,
+                    message: "Failed to serialize request".to_string(),
+                    detail: Some(e.to_string()),
+                    retry_after: None,
+                    usage_limit: None,
+                    origin: CodexErrorOrigin::Http,
+                })?;
+            http_body_json = Some(body_json.clone());
+            Ok(body_json)
+        };
         loop {
             let result = match transport {
                 CodexTransport::Http => {
-                    let body_json = serde_json::to_string(body).map_err(|e| CodexError {
-                        status: 500,
-                        message: "Failed to serialize request".to_string(),
-                        detail: Some(e.to_string()),
-                        retry_after: None,
-                        usage_limit: None,
-                        origin: CodexErrorOrigin::Http,
-                    })?;
+                    let body_json = serialize_http_body()?;
                     self.attempt_post_http(&auth, &body_json, ctx, body.client_metadata.is_some())
                         .await
                         .map(|response| OwnerAwareCodexResponse::new(response, None))
@@ -1731,15 +1752,7 @@ impl CodexHttpClient {
                                 && should_fallback_to_http(&err) =>
                         {
                             // Fall back to HTTP only if WebSocket failed before sending
-                            let body_json =
-                                serde_json::to_string(body).map_err(|e| CodexError {
-                                    status: 500,
-                                    message: "Failed to serialize request".to_string(),
-                                    detail: Some(e.to_string()),
-                                    retry_after: None,
-                                    usage_limit: None,
-                                    origin: CodexErrorOrigin::Http,
-                                })?;
+                            let body_json = serialize_http_body()?;
                             self.attempt_post_http(
                                 &auth,
                                 &body_json,
@@ -1755,7 +1768,8 @@ impl CodexHttpClient {
             };
 
             if let Ok(response) = &result {
-                for event in parse_sse_events(&response.body) {
+                let text = String::from_utf8_lossy(&response.body);
+                for event in sse_events(&text) {
                     if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&event.data) {
                         super::record_upstream_telemetry(ctx, &payload);
                     }
@@ -1999,7 +2013,7 @@ impl CodexHttpClient {
 
     pub(crate) async fn stream_codex_websocket_events_for_owner(
         self: &Arc<Self>,
-        body: &ResponsesRequest,
+        body: Arc<ResponsesRequest>,
         ctx: &RequestContext,
         continuation: Option<&super::continuation::ContinuationReservation>,
     ) -> Result<super::websocket::CodexWebSocketEventStream, CodexError> {
@@ -2018,7 +2032,8 @@ impl CodexHttpClient {
                     | super::translate::request::ResponsesInputItem::CompactionTrigger
             )
         }) {
-            auth.require_opaque_provenance(&self.base_url)
+            Arc::make_mut(&mut auth)
+                .require_opaque_provenance(&self.base_url)
                 .map_err(auth_refresh_error)?;
         }
 
@@ -2030,7 +2045,6 @@ impl CodexHttpClient {
         }
 
         let client = self.clone();
-        let body = body.clone();
         let ctx = ctx.clone();
         let continuation = continuation.cloned();
         let (tx, rx) = tokio::sync::mpsc::channel(1);
@@ -2055,10 +2069,10 @@ impl CodexHttpClient {
     #[allow(clippy::too_many_arguments)]
     async fn coordinate_live_websocket_events(
         &self,
-        body: ResponsesRequest,
+        body: Arc<ResponsesRequest>,
         ctx: RequestContext,
         mut continuation: Option<super::continuation::ContinuationReservation>,
-        mut auth: OperationAuth,
+        mut auth: Arc<OperationAuth>,
         tx: tokio::sync::mpsc::Sender<Result<serde_json::Value, CodexError>>,
         socket_id_publisher: super::websocket::CodexWebSocketSocketIdPublisher,
     ) {
@@ -2085,81 +2099,83 @@ impl CodexHttpClient {
                     return;
                 }
             };
-            let ws_body = build_websocket_request(
-                &body,
-                continuation
-                    .as_ref()
-                    .map(super::continuation::ContinuationReservation::candidate),
-            );
-            let start = super::websocket::codex_websocket_event_stream(
-                &self.websocket_client,
-                &self.websocket_proxy_config,
-                &self.base_url,
-                &ws_headers,
-                &ws_body,
-                ctx.traffic.clone(),
-                super::websocket::WEBSOCKET_CONNECT_TIMEOUT_MS,
-                super::websocket::WEBSOCKET_IDLE_TIMEOUT_MS,
-                continuation.as_ref(),
-                auth.provenance(&self.base_url),
-            );
-            let mut stream = tokio::select! {
-                biased;
-                _ = tx.closed() => {
-                    abort_abandoned_live_continuation(
-                        continuation.as_ref(),
-                        &socket_id_publisher,
-                    );
-                    return;
-                }
-                result = start => match result {
-                    Ok(stream) => stream,
-                    Err(err) if err.status == 401 && !auth_refresh_attempted && !forwarded_any => {
-                        auth_refresh_attempted = true;
-                        invalidate_live_continuation_pool(continuation.as_ref());
-                        let refresh = self.refresh_operation_auth(&auth);
-                        auth = match refresh.await {
-                            Ok(auth) => {
-                                if tx.is_closed() {
-                                    abort_abandoned_live_continuation(
-                                        continuation.as_ref(),
-                                        &socket_id_publisher,
-                                    );
+            let mut stream = {
+                let ws_body = build_websocket_request(
+                    &body,
+                    continuation
+                        .as_ref()
+                        .map(super::continuation::ContinuationReservation::candidate),
+                );
+                let start = super::websocket::codex_websocket_event_stream(
+                    &self.websocket_client,
+                    &self.websocket_proxy_config,
+                    &self.base_url,
+                    &ws_headers,
+                    &ws_body,
+                    ctx.traffic.clone(),
+                    super::websocket::WEBSOCKET_CONNECT_TIMEOUT_MS,
+                    super::websocket::WEBSOCKET_IDLE_TIMEOUT_MS,
+                    continuation.as_ref(),
+                    auth.provenance(&self.base_url),
+                );
+                tokio::select! {
+                    biased;
+                    _ = tx.closed() => {
+                        abort_abandoned_live_continuation(
+                            continuation.as_ref(),
+                            &socket_id_publisher,
+                        );
+                        return;
+                    }
+                    result = start => match result {
+                        Ok(stream) => stream,
+                        Err(err) if err.status == 401 && !auth_refresh_attempted && !forwarded_any => {
+                            auth_refresh_attempted = true;
+                            invalidate_live_continuation_pool(continuation.as_ref());
+                            let refresh = self.refresh_operation_auth(&auth);
+                            auth = match refresh.await {
+                                Ok(auth) => {
+                                    if tx.is_closed() {
+                                        abort_abandoned_live_continuation(
+                                            continuation.as_ref(),
+                                            &socket_id_publisher,
+                                        );
+                                        return;
+                                    }
+                                    auth
+                                },
+                                Err(refresh_err) => {
+                                    if tx.send(Err(auth_refresh_error(refresh_err))).await.is_err() {
+                                        abort_abandoned_live_continuation(
+                                            continuation.as_ref(),
+                                            &socket_id_publisher,
+                                        );
+                                    }
                                     return;
                                 }
-                                auth
-                            },
-                            Err(refresh_err) => {
-                                if tx.send(Err(auth_refresh_error(refresh_err))).await.is_err() {
-                                    abort_abandoned_live_continuation(
-                                        continuation.as_ref(),
-                                        &socket_id_publisher,
-                                    );
-                                }
-                                return;
+                            };
+                            if continuation_retry_available {
+                                socket_id_publisher.mark_full_context_retry();
                             }
-                        };
-                        if continuation_retry_available {
+                            continuation = full_context_continuation(continuation.as_ref());
+                            continuation_retry_available = false;
+                            continue 'attempt;
+                        }
+                        Err(err) if continuation_retry_available && is_continuation_retry_error(&err) => {
                             socket_id_publisher.mark_full_context_retry();
+                            continuation = full_context_continuation(continuation.as_ref());
+                            continuation_retry_available = false;
+                            continue 'attempt;
                         }
-                        continuation = full_context_continuation(continuation.as_ref());
-                        continuation_retry_available = false;
-                        continue 'attempt;
-                    }
-                    Err(err) if continuation_retry_available && is_continuation_retry_error(&err) => {
-                        socket_id_publisher.mark_full_context_retry();
-                        continuation = full_context_continuation(continuation.as_ref());
-                        continuation_retry_available = false;
-                        continue 'attempt;
-                    }
-                    Err(err) => {
-                        if tx.send(Err(err)).await.is_err() {
-                            abort_abandoned_live_continuation(
-                                continuation.as_ref(),
-                                &socket_id_publisher,
-                            );
+                        Err(err) => {
+                            if tx.send(Err(err)).await.is_err() {
+                                abort_abandoned_live_continuation(
+                                    continuation.as_ref(),
+                                    &socket_id_publisher,
+                                );
+                            }
+                            return;
                         }
-                        return;
                     }
                 }
             };
@@ -2346,7 +2362,7 @@ impl CodexHttpClient {
     async fn attempt_post_http(
         &self,
         auth: &StoredAuth,
-        body_json: &str,
+        body_json: &Bytes,
         ctx: &RequestContext,
         use_responses_lite: bool,
     ) -> Result<CodexResponse, CodexError> {
@@ -2359,7 +2375,7 @@ impl CodexHttpClient {
     async fn start_post_http(
         &self,
         auth: &StoredAuth,
-        body_json: &str,
+        body_json: &Bytes,
         ctx: &RequestContext,
         use_responses_lite: bool,
     ) -> Result<(reqwest::Response, Instant), CodexError> {
@@ -2379,7 +2395,7 @@ impl CodexHttpClient {
         // Apply header timeout
         let started_at = Instant::now();
         super::rate_limits::record(Vec::new());
-        let send_fut = req_builder.body(body_json.to_string()).send();
+        let send_fut = req_builder.body(body_json.clone()).send();
         let header_timeout_dur = Duration::from_millis(self.header_timeout_ms);
 
         let resp = tokio::time::timeout(header_timeout_dur, send_fut)
@@ -2503,7 +2519,7 @@ impl CodexHttpClient {
     async fn attempt_post_search(
         &self,
         auth: &StoredAuth,
-        body_json: &str,
+        body_json: &Bytes,
         ctx: &RequestContext,
         search_session_id: &str,
     ) -> Result<CodexResponse, CodexError> {
@@ -2521,7 +2537,7 @@ impl CodexHttpClient {
         let started_at = Instant::now();
         let mut response = tokio::time::timeout(
             Duration::from_millis(self.header_timeout_ms),
-            request.body(body_json.to_string()).send(),
+            request.body(body_json.clone()).send(),
         )
         .await
         .map_err(|_| CodexError {
@@ -2662,9 +2678,12 @@ impl PendingHttpEvents {
         payload: serde_json::Value,
         pending_tool_bytes: usize,
     ) -> Result<(), CodexError> {
-        let payload_bytes = serde_json::to_vec(&payload)
+        let payload_bytes = super::request_summary::serialized_json_bytes(&payload);
+        if payload_bytes == u64::MAX {
+            return Err(pending_http_event_buffer_error("event encoding"));
+        }
+        let payload_bytes = usize::try_from(payload_bytes)
             .map_err(|_| pending_http_event_buffer_error("event encoding"))?
-            .len()
             .max(MIN_PENDING_HTTP_EVENT_BYTES);
         let next_event_bytes = self.event_bytes.saturating_add(payload_bytes);
         ensure_pending_http_buffer_budget(next_event_bytes, pending_tool_bytes)?;
@@ -2797,18 +2816,16 @@ impl PendingHttpProvisionalTools {
                     .map_err(provisional_tool_validation_error)?;
                     if let Some(arguments) = &call.arguments_done {
                         let arguments_done =
-                            super::translate::live_stream::validate_completed_function_call(
-                                &serde_json::json!({
-                                    "call_id": completed.call_id,
-                                    "name": completed.name,
-                                    "arguments": arguments,
-                                }),
+                            super::translate::live_stream::validate_completed_function_call_fields(
+                                Some(completed.call_id),
+                                Some(completed.name),
+                                Some(arguments),
                             )
                             .map_err(provisional_tool_validation_error)?;
                         super::translate::live_stream::validate_streamed_function_call(
                             &completed,
-                            &arguments_done.call_id,
-                            &arguments_done.name,
+                            arguments_done.call_id,
+                            arguments_done.name,
                             &arguments_done.arguments,
                         )
                         .map_err(provisional_tool_validation_error)?;
@@ -2820,13 +2837,14 @@ impl PendingHttpProvisionalTools {
                         || payload["item"]["id"]
                             .as_str()
                             .is_some_and(|id| call.item_id.as_deref() == Some(id))
-                        || call.call_id.as_deref() == Some(completed.call_id.as_str())
+                        || call.call_id.as_deref() == Some(completed.call_id)
                 }) {
                     return Err(http_sse_protocol_error(
                         "completed function call disagrees with provisional identity",
                     ));
                 }
-                payload["item"]["arguments"] = serde_json::Value::String(completed.arguments);
+                let arguments = completed.arguments.into_owned();
+                payload["item"]["arguments"] = serde_json::Value::String(arguments);
                 return Ok(PendingHttpProvisionalToolEvent::AuthoritativeDone);
             }
             Some("response.completed") if !self.calls.is_empty() => {
@@ -3122,9 +3140,9 @@ fn write_codex_http_request_capture(
     traffic: &TrafficCapture,
     url: &str,
     headers: &http::HeaderMap,
-    body_json: &str,
+    body_json: &[u8],
 ) {
-    let body = serde_json::from_str(body_json).unwrap_or_else(|_| {
+    let body = serde_json::from_slice(body_json).unwrap_or_else(|_| {
         serde_json::json!({
             "unparseable": true,
             "bytes": body_json.len(),
@@ -3196,19 +3214,12 @@ fn write_codex_http_sse_event_capture(
     event: Option<&str>,
     payload: &serde_json::Value,
 ) {
-    let mut payload = payload.clone();
-    if let Some(event) = event
-        && let Some(object) = payload.as_object_mut()
-    {
-        object
-            .entry("_sse_event")
-            .or_insert_with(|| serde_json::json!(event));
-    }
-    traffic.write_json_event("040-upstream-event", &payload);
+    traffic.write_json_event_with_type("040-upstream-event", event, payload);
 }
 
 fn write_codex_sse_event_capture(traffic: &TrafficCapture, body: &[u8]) {
-    for event in parse_sse_events(body) {
+    let text = String::from_utf8_lossy(body);
+    for event in sse_events(&text) {
         if event.data == "[DONE]" {
             traffic.write_json_event(
                 "040-upstream-event",
@@ -3221,13 +3232,8 @@ fn write_codex_sse_event_capture(traffic: &TrafficCapture, body: &[u8]) {
         }
 
         match serde_json::from_str::<serde_json::Value>(&event.data) {
-            Ok(mut value) => {
-                if let Some(name) = event.event
-                    && let Some(obj) = value.as_object_mut()
-                {
-                    obj.entry("_sse_event").or_insert(serde_json::json!(name));
-                }
-                traffic.write_json_event("040-upstream-event", &value);
+            Ok(value) => {
+                traffic.write_json_event_with_type("040-upstream-event", event.event, &value);
             }
             Err(_) => {
                 traffic.write_json_event(
@@ -3264,10 +3270,10 @@ fn headers_to_json_from_pairs(headers: &[(String, String)]) -> serde_json::Value
 
 pub(super) fn summarize_json_request_size(
     body: &serde_json::Value,
-    body_json: &str,
+    body_json: impl AsRef<[u8]>,
 ) -> serde_json::Value {
     serde_json::json!({
-        "bytes": body_json.len(),
+        "bytes": body_json.as_ref().len(),
         "inputCount": body
             .get("input")
             .and_then(|v| v.as_array())
@@ -3339,7 +3345,8 @@ fn codex_status_error_message(body: &[u8]) -> Option<String> {
                 .map(str::to_string)
         })
         .or_else(|| {
-            parse_sse_events(body).into_iter().find_map(|event| {
+            let text = String::from_utf8_lossy(body);
+            sse_events(&text).find_map(|event| {
                 let payload = serde_json::from_str::<serde_json::Value>(&event.data).ok()?;
                 super::events::classify_event_failure(&payload).map(|failure| failure.message)
             })

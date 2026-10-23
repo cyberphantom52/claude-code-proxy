@@ -67,9 +67,10 @@ pub fn is_allowed_model(model: &str) -> bool {
 /// Models visible in the subscription picker. Hidden entries remain requestable.
 pub fn listed_catalog_models() -> Vec<String> {
     catalog_models()
-        .into_iter()
+        .models
+        .iter()
         .filter(|entry| entry.listed)
-        .map(|entry| entry.slug)
+        .map(|entry| entry.slug.clone())
         .collect()
 }
 
@@ -104,12 +105,14 @@ pub fn resolve_service_tier_value(model: &str, tier: &str) -> anyhow::Result<Ser
         anyhow::bail!("Invalid service_tier '{tier}'");
     }
     if !standard && advertised == Some(false) {
-        let allowed = catalog_model(model)
-            .and_then(|entry| entry.service_tiers)
+        let metadata = catalog_model(model);
+        let allowed = metadata
+            .as_ref()
+            .and_then(|entry| entry.service_tiers.as_ref())
             .map(|tiers| {
                 tiers
-                    .into_iter()
-                    .map(|entry| entry.id)
+                    .iter()
+                    .map(|entry| entry.id.as_str())
                     .collect::<Vec<_>>()
                     .join(", ")
             })
@@ -269,6 +272,13 @@ pub fn model_parallel_tool_calls(
 
 /// Inspect only content containers, never schemas or arbitrary function arguments.
 pub fn validate_input_modalities(model: &str, input: &serde_json::Value) -> anyhow::Result<()> {
+    validate_input_modalities_iter(model, std::iter::once(input))
+}
+
+pub(super) fn validate_input_modalities_iter<'a>(
+    model: &str,
+    mut input: impl Iterator<Item = &'a serde_json::Value>,
+) -> anyhow::Result<()> {
     fn has_images(value: &serde_json::Value) -> bool {
         match value {
             serde_json::Value::Array(values) => values.iter().any(has_images),
@@ -283,8 +293,9 @@ pub fn validate_input_modalities(model: &str, input: &serde_json::Value) -> anyh
             _ => false,
         }
     }
-    if has_images(input)
-        && let Some(modalities) = catalog_model(model).and_then(|entry| entry.input_modalities)
+    if input.any(has_images)
+        && let Some(metadata) = catalog_model(model)
+        && let Some(modalities) = &metadata.input_modalities
         && !modalities.iter().any(|modality| modality == "image")
     {
         anyhow::bail!(

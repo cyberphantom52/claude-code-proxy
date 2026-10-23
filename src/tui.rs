@@ -8,9 +8,10 @@ use layout::{
 };
 
 use std::{
+    borrow::Cow,
     collections::HashMap,
     io::{self, Stdout},
-    sync::mpsc,
+    sync::{Arc, mpsc},
     time::{Duration, SystemTime},
 };
 
@@ -32,7 +33,7 @@ use tokio::sync::oneshot;
 
 use crate::{
     monitor::{
-        MockMonitor, MonitorHandle, SESSION_TOKEN_BUCKET_SECS,
+        MockMonitor, MonitorHandle, SESSION_TOKEN_BUCKET_SECS, bounded_error_message,
         snapshot::{
             ActiveSnapshot, CompletedSnapshot, MonitorSnapshot, SessionSnapshot, SnapshotUpdate,
         },
@@ -77,7 +78,7 @@ pub fn run_monitor(
     config: MonitorUiConfig<'_>,
 ) -> Result<MonitorExit, anyhow::Error> {
     run_monitor_loop(
-        || SnapshotUpdate::Live(handle.snapshot().into()),
+        || SnapshotUpdate::Live(Arc::new(handle.snapshot().into())),
         UiSession::from(config),
     )
 }
@@ -103,7 +104,7 @@ pub fn run_attached_monitor(
 pub fn run_mock_monitor(port: u16, registry: &Registry) -> Result<(), anyhow::Error> {
     let mut monitor = MockMonitor::new();
     run_monitor_loop(
-        move || SnapshotUpdate::Live(monitor.snapshot().into()),
+        move || SnapshotUpdate::Live(Arc::new(monitor.snapshot().into())),
         UiSession {
             listen_url: "mock://tui-demo".to_string(),
             setup_text: mock_setup_text(port, registry),
@@ -187,8 +188,11 @@ fn run_monitor_events(
                     1,
                 );
                 frame.render_widget(
-                    Paragraph::new(format!("Reconnecting; showing last snapshot: {error}"))
-                        .style(Style::default().fg(YELLOW).bg(BG)),
+                    Paragraph::new(Line::from(vec![
+                        Span::raw("Reconnecting; showing last snapshot: "),
+                        Span::raw(bounded_error_message(error)),
+                    ]))
+                    .style(Style::default().fg(YELLOW).bg(BG)),
                     banner,
                 );
             }
@@ -582,15 +586,15 @@ fn render_empty_table_state(
     );
 }
 
-fn muted_cell(value: impl Into<String>) -> Cell<'static> {
+fn muted_cell<'a>(value: impl Into<Cow<'a, str>>) -> Cell<'a> {
     Cell::from(Span::styled(value.into(), Style::default().fg(DIM)))
 }
 
-fn text_cell(value: impl Into<String>) -> Cell<'static> {
+fn text_cell<'a>(value: impl Into<Cow<'a, str>>) -> Cell<'a> {
     Cell::from(Span::styled(value.into(), Style::default().fg(DIM_WHITE)))
 }
 
-fn model_cell(value: Option<&str>, width: usize) -> Cell<'static> {
+fn model_cell(value: Option<&str>, width: usize) -> Cell<'_> {
     text_cell(ellipsize(value.unwrap_or("-"), width))
 }
 
@@ -604,19 +608,21 @@ fn table_column_widths(area: Rect, widths: &[Constraint]) -> Vec<usize> {
         .collect()
 }
 
-fn ellipsize(value: &str, width: usize) -> String {
-    if value.chars().count() <= width {
-        return value.to_string();
+fn ellipsize(value: &str, width: usize) -> Cow<'_, str> {
+    if value.chars().nth(width).is_none() {
+        return Cow::Borrowed(value);
     }
     if width == 0 {
-        return String::new();
+        return Cow::Borrowed("");
     }
 
-    value
-        .chars()
-        .take(width.saturating_sub(1))
-        .chain(std::iter::once('…'))
-        .collect()
+    Cow::Owned(
+        value
+            .chars()
+            .take(width.saturating_sub(1))
+            .chain(std::iter::once('…'))
+            .collect(),
+    )
 }
 
 fn display_session_id(session_id: Option<&str>) -> &str {
@@ -631,15 +637,15 @@ fn display_session_id(session_id: Option<&str>) -> &str {
     session_id
 }
 
-fn number_cell(value: impl Into<String>) -> Cell<'static> {
+fn number_cell<'a>(value: impl Into<Cow<'a, str>>) -> Cell<'a> {
     Cell::from(
         Line::from(Span::styled(value.into(), Style::default().fg(DIM_WHITE)))
             .alignment(Alignment::Right),
     )
 }
 
-fn status_cell(value: &str) -> Cell<'static> {
-    Cell::from(Span::styled(value.to_string(), status_style(value)))
+fn status_cell(value: &str) -> Cell<'_> {
+    Cell::from(Span::styled(value, status_style(value)))
 }
 
 fn status_style(value: &str) -> Style {
@@ -685,21 +691,24 @@ fn rate_cell(value: String) -> Cell<'static> {
     )
 }
 
-fn provider_cell(value: Option<&str>) -> Cell<'static> {
+fn provider_cell(value: Option<&str>) -> Cell<'_> {
     let value = value.unwrap_or("-");
     let color = match value {
         "codex" => TEAL,
         "-" => DIM,
         _ => DIM_WHITE,
     };
-    Cell::from(Span::styled(value.to_string(), Style::default().fg(color)))
+    Cell::from(Span::styled(value, Style::default().fg(color)))
 }
 
-fn detail_cell(value: &str) -> Cell<'static> {
+fn detail_cell(value: &str) -> Cell<'_> {
     if value.is_empty() || value == "-" {
         Cell::from(Span::styled("", Style::default().fg(DIM)))
     } else {
-        Cell::from(Span::styled(value.to_string(), Style::default().fg(YELLOW)))
+        Cell::from(Span::styled(
+            bounded_error_message(value),
+            Style::default().fg(YELLOW),
+        ))
     }
 }
 
@@ -809,7 +818,16 @@ fn column_header<K>(columns: &[ColumnSpec<K>]) -> Row<'static> {
 fn target_cell(provider: Option<&str>, model: Option<&str>, width: usize) -> Cell<'static> {
     let provider = provider.unwrap_or("-");
     let model = model.unwrap_or("-");
-    text_cell(ellipsize(&format!("{provider}/{model}"), width))
+    let mut chars = provider
+        .chars()
+        .chain(std::iter::once('/'))
+        .chain(model.chars());
+    let mut target: String = chars.by_ref().take(width).collect();
+    if chars.next().is_some() && width > 0 {
+        target.pop();
+        target.push('…');
+    }
+    text_cell(target)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1109,19 +1127,24 @@ fn render_active(
     let widths = column_constraints(columns);
     let column_widths = table_column_widths(area, &widths);
     let rows = active.iter().map(|request| {
-        let status = if request.status == crate::monitor::RequestStatus::Compacting {
-            format!("{}{}", spinner(tick), request.status.label())
-        } else {
-            format!("{} {}", spinner(tick), request.status.label())
-        };
         let cells = columns.iter().enumerate().map(|(column_index, column)| {
             let width = column_widths[column_index];
             match column.key {
                 ActiveColumn::Started => muted_cell(format_system_time(request.started_at)),
-                ActiveColumn::Status => Cell::from(Span::styled(
-                    status.clone(),
-                    status_style(request.status.label()),
-                )),
+                ActiveColumn::Status => Cell::from(
+                    Line::from(vec![
+                        Span::raw(spinner(tick)),
+                        Span::raw(
+                            if request.status == crate::monitor::RequestStatus::Compacting {
+                                ""
+                            } else {
+                                " "
+                            },
+                        ),
+                        Span::raw(request.status.label()),
+                    ])
+                    .style(status_style(request.status.label())),
+                ),
                 ActiveColumn::Project => {
                     text_cell(ellipsize(request.project.as_deref().unwrap_or("-"), width))
                 }
@@ -1516,7 +1539,7 @@ fn render_request_detail(
 ) {
     let lines = if let Some(request) = state.recent.get(selected) {
         let mut lines = vec![
-            detail_line("request", request.request_id.clone(), WHITE),
+            detail_line("request", request.request_id.as_str(), WHITE),
             detail_line(
                 "session",
                 display_session_id(request.session_id.as_deref()),
@@ -1582,14 +1605,10 @@ fn render_request_detail(
             ),
         ];
         if let Some(error) = request.error.as_deref().filter(|error| !error.is_empty()) {
-            lines.push(detail_line("detail", error, YELLOW));
+            lines.push(detail_line("detail", bounded_error_message(error), YELLOW));
         }
         if let Some(path) = &request.traffic_capture_path {
-            lines.push(detail_line(
-                "capture",
-                path.to_string_lossy().into_owned(),
-                DIM_WHITE,
-            ));
+            lines.push(detail_line("capture", path.to_string_lossy(), DIM_WHITE));
         }
         lines
     } else {
@@ -1606,7 +1625,11 @@ fn render_request_detail(
     );
 }
 
-fn detail_line<'a>(label: &'static str, value: impl Into<String>, value_color: Color) -> Line<'a> {
+fn detail_line<'a>(
+    label: &'static str,
+    value: impl Into<Cow<'a, str>>,
+    value_color: Color,
+) -> Line<'a> {
     Line::from(vec![
         Span::styled(format!("  {label:<16}"), Style::default().fg(DIM)),
         Span::styled(value.into(), Style::default().fg(value_color)),
@@ -1796,7 +1819,7 @@ fn render_setup_overlay(frame: &mut ratatui::Frame<'_>, area: Rect, setup_text: 
             } else {
                 Style::default().fg(DIM_WHITE)
             };
-            Line::from(vec![Span::raw("  "), Span::styled(line.to_string(), style)])
+            Line::from(vec![Span::raw("  "), Span::styled(line, style)])
         })
         .collect::<Vec<_>>();
     lines.push(Line::from(""));

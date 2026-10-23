@@ -29,7 +29,7 @@ pub fn streaming_response(
         pending_scan: 0,
         received_bytes: 0,
         output: VecDeque::new(),
-        completion: CompletionState::new(&model),
+        completion: CompletionState::new(&model, false),
         role_sent: false,
         include_usage,
         ended: false,
@@ -165,7 +165,8 @@ impl StreamState {
         let frame = self.pending.split_to(end + separator_len);
         self.pending_scan = 0;
         let mut event_count = 0;
-        for event in crate::anthropic::sse::parse_sse_events(&frame) {
+        let text = String::from_utf8_lossy(&frame);
+        for event in crate::anthropic::sse::sse_events(&text) {
             event_count += 1;
             self.observe_event(&event.data);
             if self.ended {
@@ -235,7 +236,7 @@ impl StreamState {
         if self.ended {
             return;
         }
-        if self.completion.text.is_empty() {
+        if self.completion.output_bytes == 0 {
             self.fail(ChatError::upstream("Codex completed without output text"));
             return;
         }

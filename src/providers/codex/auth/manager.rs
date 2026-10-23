@@ -44,11 +44,11 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
         self.refresh(None).await
     }
 
-    pub async fn force_refresh_snapshot(
+    pub async fn force_refresh_revision(
         &self,
-        rejected: &AuthSnapshot<StoredAuth>,
+        rejected_revision: &str,
     ) -> Result<AuthSnapshot<StoredAuth>, anyhow::Error> {
-        self.refresh(Some(&rejected.revision)).await
+        self.refresh(Some(rejected_revision)).await
     }
 
     async fn refresh(
@@ -84,9 +84,9 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
         }
 
         let form = [
-            ("client_id", CLIENT_ID.to_string()),
-            ("grant_type", "refresh_token".to_string()),
-            ("refresh_token", current.refresh.clone()),
+            ("client_id", CLIENT_ID),
+            ("grant_type", "refresh_token"),
+            ("refresh_token", current.refresh.as_str()),
         ];
 
         let resp = self

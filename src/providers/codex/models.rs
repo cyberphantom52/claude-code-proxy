@@ -27,7 +27,7 @@ const MAX_ETAG_BYTES: usize = 1024;
 /// Debug intentionally exposes neither credentials nor account identifiers.
 pub struct ModelContext {
     endpoint: String,
-    auth: Option<OperationAuth>,
+    auth: Option<Arc<OperationAuth>>,
     catalog: Arc<CatalogSnapshot>,
 }
 
@@ -303,7 +303,8 @@ impl CodexHttpClient {
             .get_auth_snapshot()
             .await
             .ok()
-            .and_then(|snapshot| OperationAuth::from_snapshot(snapshot).ok());
+            .and_then(|snapshot| OperationAuth::from_snapshot(snapshot).ok())
+            .map(Arc::new);
         let deadline = Instant::now() + DISCOVERY_TIMEOUT;
         let catalog = if crate::config::codex_model_discovery() {
             if let Some(auth) = auth.as_mut() {
@@ -317,13 +318,13 @@ impl CodexHttpClient {
         Arc::new(ModelContext {
             endpoint: self.base_url.clone(),
             auth,
-            catalog: catalog.unwrap_or_else(|| Arc::new(model_catalog::fallback_snapshot())),
+            catalog: catalog.unwrap_or_else(model_catalog::fallback_snapshot),
         })
     }
 
     async fn discover_catalog(
         &self,
-        auth: &mut OperationAuth,
+        auth: &mut Arc<OperationAuth>,
         deadline: Instant,
     ) -> Option<Arc<CatalogSnapshot>> {
         let endpoint = models_endpoint(&self.base_url)?;
@@ -362,7 +363,7 @@ impl CodexHttpClient {
 
     async fn fetch_catalog(
         &self,
-        auth: &mut OperationAuth,
+        auth: &mut Arc<OperationAuth>,
         endpoint: reqwest::Url,
         etag: Option<&http::HeaderValue>,
         mut deadline: Instant,
@@ -444,7 +445,7 @@ impl CodexHttpClient {
         ))
     }
 
-    pub(super) async fn operation_auth(&self) -> anyhow::Result<OperationAuth> {
+    pub(super) async fn operation_auth(&self) -> anyhow::Result<Arc<OperationAuth>> {
         if let Some(context) = current_model_context() {
             anyhow::ensure!(
                 context.endpoint == self.base_url,
@@ -457,19 +458,17 @@ impl CodexHttpClient {
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("Not authenticated"));
         }
-        OperationAuth::from_snapshot(self.auth_manager.get_auth_snapshot().await?)
+        OperationAuth::from_snapshot(self.auth_manager.get_auth_snapshot().await?).map(Arc::new)
     }
 
     pub(super) async fn refresh_operation_auth(
         &self,
         rejected: &OperationAuth,
-    ) -> anyhow::Result<OperationAuth> {
-        let snapshot = crate::auth::AuthSnapshot {
-            value: Some(rejected.auth.clone()),
-            revision: rejected.revision.clone(),
-        };
+    ) -> anyhow::Result<Arc<OperationAuth>> {
         let mut refreshed = OperationAuth::from_snapshot(
-            self.auth_manager.force_refresh_snapshot(&snapshot).await?,
+            self.auth_manager
+                .force_refresh_revision(&rejected.revision)
+                .await?,
         )?;
         anyhow::ensure!(
             same_account(rejected, &refreshed),
@@ -483,6 +482,6 @@ impl CodexHttpClient {
             );
             refreshed.opaque_endpoint = Some(endpoint.clone());
         }
-        Ok(refreshed)
+        Ok(Arc::new(refreshed))
     }
 }

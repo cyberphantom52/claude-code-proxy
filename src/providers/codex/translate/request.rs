@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use base64::Engine;
@@ -13,7 +14,7 @@ use crate::providers::translate_shared::{
 use super::model_allowlist::{
     KNOWN_EFFORTS, model_parallel_tool_calls, model_reasoning_summary, model_verbosity,
     resolve_model_effort, resolve_service_tier_value, validate_hosted_web_search,
-    validate_input_modalities,
+    validate_input_modalities_iter,
 };
 use super::read_rewrite::{ReadOffsetRewrite, read_offset_rewrite};
 use super::reasoning_signature::decode_reasoning_signature;
@@ -177,11 +178,11 @@ pub enum ResponsesToolChoice {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResponsesRequest {
+pub struct ResponsesRequest<I = Vec<ResponsesInputItem>> {
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
-    pub input: Vec<ResponsesInputItem>,
+    pub input: I,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ResponsesTool>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -200,6 +201,27 @@ pub struct ResponsesRequest {
     pub text: ResponsesText,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<ResponsesReasoning>,
+}
+
+impl ResponsesRequest {
+    pub(crate) fn with_input<I>(&self, input: I) -> ResponsesRequest<I> {
+        ResponsesRequest {
+            model: self.model.clone(),
+            instructions: self.instructions.clone(),
+            input,
+            tools: self.tools.clone(),
+            tool_choice: self.tool_choice.clone(),
+            store: self.store,
+            stream: self.stream,
+            parallel_tool_calls: self.parallel_tool_calls,
+            include: self.include.clone(),
+            client_metadata: self.client_metadata.clone(),
+            service_tier: self.service_tier.clone(),
+            prompt_cache_key: self.prompt_cache_key.clone(),
+            text: self.text.clone(),
+            reasoning: self.reasoning.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -234,7 +256,7 @@ pub enum ResponsesTextFormat {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum ResponsesInputItem {
     #[serde(rename = "additional_tools")]
@@ -274,14 +296,14 @@ pub enum ResponsesInputItem {
     CompactionTrigger,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum ResponsesFunctionCallOutput {
     Text(String),
     ContentItems(Vec<ResponsesFunctionCallOutputContentPart>),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponsesFunctionCallOutputContentPart {
     InputText {
@@ -294,7 +316,7 @@ pub enum ResponsesFunctionCallOutputContentPart {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum ResponsesContentPart {
     #[serde(rename = "input_text")]
@@ -547,7 +569,10 @@ pub fn translate_request(
     let input = build_input(req)?;
     let tools = read_tools(req)?;
     let tool_choice = map_tool_choice(req)?;
-    validate_input_modalities(&opts.model, &serde_json::to_value(&req.messages)?)?;
+    validate_input_modalities_iter(
+        &opts.model,
+        req.messages.iter().map(|message| &message.content),
+    )?;
     // Claude's disable_parallel_tool_use=false is permission, not an explicit
     // requirement for parallel execution; preserve omissions on serial models.
     let requested_parallel = match req.extra.get("parallel_tool_calls") {
@@ -596,7 +621,7 @@ pub fn translate_request(
         out.parallel_tool_calls = false;
 
         let mut prefix = Vec::new();
-        if let Some(ref tools) = tools
+        if let Some(tools) = tools
             && !tools.is_empty()
         {
             let loads = tool_reference_loads(req);
@@ -799,19 +824,28 @@ fn tool_reference_loads(req: &MessagesRequest) -> HashMap<String, Vec<String>> {
 /// before a compaction) stay in the prefix so they remain callable.
 fn split_loaded_deferred_tools(
     req: &MessagesRequest,
-    tools: &[ResponsesTool],
+    tools: Vec<ResponsesTool>,
     loads: &HashMap<String, Vec<String>>,
 ) -> Result<(Vec<Value>, HashMap<String, Value>), anyhow::Error> {
     let deferred = deferred_tool_names(req);
     let loaded: HashSet<&str> = loads.values().flatten().map(String::as_str).collect();
     let mut prefix = Vec::new();
     let mut appended = HashMap::new();
-    for tool in tools {
-        if is_deferred_placeholder(tool, &deferred) {
+    for mut tool in tools {
+        if is_deferred_placeholder(&tool, &deferred) {
             continue;
         }
-        let value = serde_json::to_value(tool)?;
-        match responses_tool_name(tool) {
+        // Serialize the existing tool schema, then move its potentially large
+        // parameters tree into the same field instead of serializing a copy.
+        let parameters = match &mut tool {
+            ResponsesTool::Function(function) => Some(std::mem::take(&mut function.parameters)),
+            ResponsesTool::WebSearch(_) => None,
+        };
+        let mut value = serde_json::to_value(&tool)?;
+        if let Some(parameters) = parameters {
+            value["parameters"] = parameters;
+        }
+        match responses_tool_name(&tool) {
             Some(name) if deferred.contains(name) && loaded.contains(name) => {
                 appended.insert(name.to_string(), value);
             }
@@ -1112,7 +1146,9 @@ fn build_input(req: &MessagesRequest) -> anyhow::Result<Vec<ResponsesInputItem>>
                 for block in blocks {
                     match block {
                         ContentBlock::Text { text } => {
-                            parts.push(ResponsesContentPart::InputText { text });
+                            parts.push(ResponsesContentPart::InputText {
+                                text: text.to_string(),
+                            });
                         }
                         ContentBlock::Image { source } => {
                             parts.push(ResponsesContentPart::InputImage {
@@ -1135,21 +1171,25 @@ fn build_input(req: &MessagesRequest) -> anyhow::Result<Vec<ResponsesInputItem>>
                             if is_error.unwrap_or(false) {
                                 rendered.prepend_text("[tool execution error]".to_string());
                             }
+                            let mut joined_text = rendered.joined_text();
                             if let Some(note) =
-                                rewritten_read_offset_note(&rendered.joined_text(), &tool_use_id)
+                                rewritten_read_offset_note(&joined_text, tool_use_id)
                             {
-                                rendered.push_text(format!("\n{note}"));
+                                rendered.push_text(format!("\n{note}"), &mut joined_text);
                             }
                             if should_append_read_offset_guidance(
-                                &rendered.joined_text(),
-                                read_tool_uses_with_offset.contains(&tool_use_id),
+                                &joined_text,
+                                read_tool_uses_with_offset.contains(tool_use_id),
                                 is_error.unwrap_or(false),
                             ) {
-                                rendered.push_text(format!("\n{}", read_offset_guidance()));
+                                rendered.push_text(
+                                    format!("\n{}", read_offset_guidance()),
+                                    &mut joined_text,
+                                );
                             }
                             out.push(ResponsesInputItem::FunctionCallOutput {
-                                call_id: tool_use_id,
-                                output: function_call_output(rendered),
+                                call_id: tool_use_id.to_string(),
+                                output: function_call_output(rendered, joined_text),
                             });
                         }
                         _ => {}
@@ -1166,9 +1206,9 @@ fn build_input(req: &MessagesRequest) -> anyhow::Result<Vec<ResponsesInputItem>>
                 let parts: Vec<ResponsesContentPart> = blocks
                     .into_iter()
                     .filter_map(|b| match b {
-                        ContentBlock::Text { text } => {
-                            Some(ResponsesContentPart::InputText { text })
-                        }
+                        ContentBlock::Text { text } => Some(ResponsesContentPart::InputText {
+                            text: text.to_string(),
+                        }),
                         _ => None,
                     })
                     .collect();
@@ -1194,24 +1234,25 @@ fn build_input(req: &MessagesRequest) -> anyhow::Result<Vec<ResponsesInputItem>>
                 for block in blocks {
                     match block {
                         ContentBlock::Text { text } => {
-                            text_parts.push(ResponsesContentPart::OutputText { text });
+                            text_parts.push(ResponsesContentPart::OutputText {
+                                text: text.to_string(),
+                            });
                         }
                         ContentBlock::ToolUse { id, name, input } => {
                             flush_text(&mut out, &mut text_parts);
-                            if is_read_tool_use_with_offset(&name, &input) {
-                                read_tool_uses_with_offset.insert(id.clone());
+                            if is_read_tool_use_with_offset(name, input) {
+                                read_tool_uses_with_offset.insert(id);
                             }
                             let args =
-                                serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string());
+                                serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
                             out.push(ResponsesInputItem::FunctionCall {
-                                call_id: id,
-                                name,
+                                call_id: id.to_string(),
+                                name: name.to_string(),
                                 arguments: args,
                             });
                         }
-                        ContentBlock::Thinking { signature, .. } => {
-                            let Some(replay) =
-                                signature.as_deref().and_then(decode_reasoning_signature)
+                        ContentBlock::Thinking { signature } => {
+                            let Some(replay) = signature.and_then(decode_reasoning_signature)
                             else {
                                 continue;
                             };
@@ -1299,16 +1340,16 @@ fn read_offset_guidance() -> &'static str {
 // Tool result rendering
 // ---------------------------------------------------------------------------
 
-enum RenderedToolResultPart {
-    Text(String),
+enum RenderedToolResultPart<'a> {
+    Text(Cow<'a, str>),
     Image(String),
 }
 
-struct RenderedToolResult {
-    parts: Vec<RenderedToolResultPart>,
+struct RenderedToolResult<'a> {
+    parts: Vec<RenderedToolResultPart<'a>>,
 }
 
-impl RenderedToolResult {
+impl RenderedToolResult<'_> {
     fn has_images(&self) -> bool {
         self.parts
             .iter()
@@ -1319,7 +1360,7 @@ impl RenderedToolResult {
         self.parts
             .iter()
             .filter_map(|part| match part {
-                RenderedToolResultPart::Text(text) => Some(text.as_str()),
+                RenderedToolResultPart::Text(text) => Some(text.as_ref()),
                 RenderedToolResultPart::Image(_) => None,
             })
             .collect::<Vec<_>>()
@@ -1327,51 +1368,62 @@ impl RenderedToolResult {
     }
 
     fn prepend_text(&mut self, text: String) {
-        self.parts.insert(0, RenderedToolResultPart::Text(text));
+        self.parts
+            .insert(0, RenderedToolResultPart::Text(text.into()));
     }
 
-    fn push_text(&mut self, text: String) {
-        self.parts.push(RenderedToolResultPart::Text(text));
+    fn push_text(&mut self, text: String, joined_text: &mut String) {
+        if self
+            .parts
+            .iter()
+            .any(|part| matches!(part, RenderedToolResultPart::Text(_)))
+        {
+            joined_text.push('\n');
+        }
+        joined_text.push_str(&text);
+        self.parts.push(RenderedToolResultPart::Text(text.into()));
     }
 }
 
-fn render_tool_result(content: &Value) -> RenderedToolResult {
+fn render_tool_result(content: &Value) -> RenderedToolResult<'_> {
     let parts = match content {
-        Value::String(text) => vec![RenderedToolResultPart::Text(text.clone())],
+        Value::String(text) => vec![RenderedToolResultPart::Text(Cow::Borrowed(text))],
         Value::Array(blocks) => blocks.iter().map(render_tool_result_block).collect(),
         _ => Vec::new(),
     };
     RenderedToolResult { parts }
 }
 
-fn render_tool_result_block(block: &Value) -> RenderedToolResultPart {
+fn render_tool_result_block(block: &Value) -> RenderedToolResultPart<'_> {
     match block.get("type").and_then(Value::as_str) {
         Some("text") => block
             .get("text")
             .and_then(Value::as_str)
-            .map(|text| RenderedToolResultPart::Text(text.to_string()))
+            .map(|text| RenderedToolResultPart::Text(Cow::Borrowed(text)))
             .unwrap_or_else(|| {
-                RenderedToolResultPart::Text(unsupported_tool_result_block_to_string(block))
+                RenderedToolResultPart::Text(unsupported_tool_result_block_to_string(block).into())
             }),
         Some("image") => render_tool_result_image(block),
         Some("tool_reference") => match block.get("tool_name").and_then(Value::as_str) {
-            Some(name) => RenderedToolResultPart::Text(format!("Tool loaded: {name}")),
-            None => RenderedToolResultPart::Text(unsupported_tool_result_block_to_string(block)),
+            Some(name) => RenderedToolResultPart::Text(format!("Tool loaded: {name}").into()),
+            None => {
+                RenderedToolResultPart::Text(unsupported_tool_result_block_to_string(block).into())
+            }
         },
-        Some(other) => {
-            RenderedToolResultPart::Text(format!("[unsupported content block omitted: {other}]"))
-        }
-        None => RenderedToolResultPart::Text(unsupported_tool_result_block_to_string(block)),
+        Some(other) => RenderedToolResultPart::Text(
+            format!("[unsupported content block omitted: {other}]").into(),
+        ),
+        None => RenderedToolResultPart::Text(unsupported_tool_result_block_to_string(block).into()),
     }
 }
 
-fn render_tool_result_image(block: &Value) -> RenderedToolResultPart {
+fn render_tool_result_image(block: &Value) -> RenderedToolResultPart<'_> {
     let Some(source) = block.get("source").and_then(Value::as_object) else {
-        return RenderedToolResultPart::Text(unsupported_tool_result_block_to_string(block));
+        return RenderedToolResultPart::Text(unsupported_tool_result_block_to_string(block).into());
     };
     match source.get("type").and_then(Value::as_str) {
         Some("url") if source.get("url").and_then(Value::as_str).is_some() => {
-            RenderedToolResultPart::Text("[image omitted: url]".to_string())
+            RenderedToolResultPart::Text(Cow::Borrowed("[image omitted: url]"))
         }
         Some("base64") => {
             let media_type = source.get("media_type").and_then(Value::as_str);
@@ -1381,12 +1433,12 @@ fn render_tool_result_image(block: &Value) -> RenderedToolResultPart {
                 .and_then(|(media_type, data)| validated_image_data_url(media_type, data))
             {
                 Some(image_url) => RenderedToolResultPart::Image(image_url),
-                None => {
-                    RenderedToolResultPart::Text(unsupported_tool_result_block_to_string(block))
-                }
+                None => RenderedToolResultPart::Text(
+                    unsupported_tool_result_block_to_string(block).into(),
+                ),
             }
         }
-        _ => RenderedToolResultPart::Text(unsupported_tool_result_block_to_string(block)),
+        _ => RenderedToolResultPart::Text(unsupported_tool_result_block_to_string(block).into()),
     }
 }
 
@@ -1413,9 +1465,12 @@ fn validated_image_data_url(media_type: &str, data: &str) -> Option<String> {
     Some(format!("data:{media_type};base64,{canonical}"))
 }
 
-fn function_call_output(rendered: RenderedToolResult) -> ResponsesFunctionCallOutput {
+fn function_call_output(
+    rendered: RenderedToolResult<'_>,
+    joined_text: String,
+) -> ResponsesFunctionCallOutput {
     if !rendered.has_images() {
-        return ResponsesFunctionCallOutput::Text(rendered.joined_text());
+        return ResponsesFunctionCallOutput::Text(joined_text);
     }
 
     ResponsesFunctionCallOutput::ContentItems(
@@ -1424,7 +1479,9 @@ fn function_call_output(rendered: RenderedToolResult) -> ResponsesFunctionCallOu
             .into_iter()
             .map(|part| match part {
                 RenderedToolResultPart::Text(text) => {
-                    ResponsesFunctionCallOutputContentPart::InputText { text }
+                    ResponsesFunctionCallOutputContentPart::InputText {
+                        text: text.into_owned(),
+                    }
                 }
                 RenderedToolResultPart::Image(image_url) => {
                     ResponsesFunctionCallOutputContentPart::InputImage {

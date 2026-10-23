@@ -7,6 +7,7 @@ use super::{
 use serde::{Deserialize, Serialize};
 use std::{
     path::PathBuf,
+    sync::Arc,
     time::{Duration, SystemTime},
 };
 
@@ -29,9 +30,9 @@ impl From<MonitorState> for MonitorResponse {
 
 #[derive(Debug, Clone)]
 pub enum SnapshotUpdate {
-    Live(MonitorSnapshot),
+    Live(Arc<MonitorSnapshot>),
     Disconnected {
-        snapshot: MonitorSnapshot,
+        snapshot: Arc<MonitorSnapshot>,
         error: String,
     },
 }

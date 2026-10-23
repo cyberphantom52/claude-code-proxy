@@ -1,6 +1,8 @@
+use serde::Serialize;
+use serde::ser::{SerializeMap, SerializeSeq};
 use serde_json::{Map, Value};
 use std::fs::{self, File, create_dir_all};
-use std::io::{self, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -64,12 +66,8 @@ impl TrafficCapture {
     }
 
     pub fn write_json(&self, name: &str, value: &Value) {
-        let value = redact_traffic(value);
-        let payload = serde_json::to_string_pretty(&value)
-            .unwrap_or_else(|_| "{}".to_string())
-            .into_bytes();
         let path = self.next_artifact_path(name, true);
-        let _ = write_bytes(path, &payload);
+        let _ = write_json(path, &redacted(value));
     }
 
     pub fn write_text(&self, name: &str, text: &str) {
@@ -88,12 +86,19 @@ impl TrafficCapture {
     }
 
     pub fn write_json_event(&self, name: &str, value: &Value) {
-        let value = redact_traffic(value);
-        let payload = serde_json::to_string_pretty(&value)
-            .unwrap_or_else(|_| "{}".to_string())
-            .into_bytes();
+        self.write_json_event_with_type(name, None, value);
+    }
+
+    pub fn write_json_event_with_type(&self, name: &str, event: Option<&str>, value: &Value) {
         let path = self.next_event_path(name);
-        let _ = write_bytes(path, &payload);
+        let _ = write_json(
+            path,
+            &Redacted {
+                value,
+                depth: 0,
+                event,
+            },
+        );
     }
 
     fn next_artifact_path(&self, name: &str, ensure_ext_json: bool) -> PathBuf {
@@ -120,21 +125,24 @@ impl TrafficCapture {
     }
 }
 
-fn write_bytes(path: PathBuf, value: &[u8]) -> io::Result<()> {
+fn capture_file(path: &Path) -> io::Result<File> {
     if let Some(parent) = path.parent() {
         create_dir_all(parent)?;
         set_mode(parent, 0o700);
     }
-    let mut out = File::create(&path)?;
-    out.write_all(value)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perm = out.metadata()?.permissions();
-        perm.set_mode(0o600);
-        let _ = fs::set_permissions(&path, perm);
-    }
-    Ok(())
+    let file = File::create(path)?;
+    set_mode(path, 0o600);
+    Ok(file)
+}
+
+fn write_bytes(path: PathBuf, value: &[u8]) -> io::Result<()> {
+    capture_file(&path)?.write_all(value)
+}
+
+fn write_json(path: PathBuf, value: &impl Serialize) -> io::Result<()> {
+    let mut out = BufWriter::new(capture_file(&path)?);
+    serde_json::to_writer_pretty(&mut out, value).map_err(io::Error::other)?;
+    out.flush()
 }
 
 pub fn sanitize_path_part(input: &str) -> String {
@@ -158,80 +166,125 @@ pub fn sanitize_path_part(input: &str) -> String {
 }
 
 pub fn redact_traffic(value: &Value) -> Value {
-    redact_traffic_with_depth(value, 0)
+    serde_json::to_value(redacted(value)).expect("redacted JSON value serializes")
 }
 
-fn redact_traffic_with_depth(value: &Value, depth: u16) -> Value {
-    if depth > 100 {
-        return Value::String("[depth-limit]".to_string());
+pub fn redacted(value: &Value) -> impl Serialize + '_ {
+    Redacted {
+        value,
+        depth: 0,
+        event: None,
     }
+}
 
-    match value {
-        Value::Object(map) => {
-            let mut out = Map::new();
-            for (key, value) in map {
-                let normalized = key.to_lowercase();
-                if normalized == "image_url" {
-                    // OpenAI `input_image` parts carry data URLs; never
-                    // persist the payload in traffic captures.
-                    out.insert(key.clone(), redact_traffic_value(value));
-                } else if normalized == "data" && looks_like_image_source(map) {
-                    // Anthropic image blocks carry raw base64 under
-                    // `source.data`; redact it for the same reason.
-                    out.insert(key.clone(), redact_traffic_value(value));
-                } else if normalized == "encrypted_content" {
-                    // Codex `compaction` and `reasoning` items carry an opaque
-                    // blob that replays a whole conversation's context; it is
-                    // bulk payload, not debug signal, so only its size stays.
-                    out.insert(key.clone(), redact_traffic_value(value));
-                } else if normalized == "signature"
-                    && value.as_str().is_some_and(is_proxy_reasoning_signature)
-                {
-                    // The Codex translator replays reasoning as an Anthropic
-                    // thinking signature of the form
-                    // `ccp:codex:v1:<encoded-id>:<encrypted_content>`, which
-                    // carries the same opaque conversation handle as the
-                    // `encrypted_content` key. Only proxy-owned signatures are
-                    // touched; foreign ones (for example, real Anthropic
-                    // signatures) are preserved.
-                    out.insert(key.clone(), redact_traffic_value(value));
-                } else if REDACT_KEYS.contains(&normalized.as_str())
-                    || matches!(
-                        normalized.as_str(),
-                        "token"
-                            | "bearer_token"
-                            | "oauth_token"
-                            | "oauth_access_token"
-                            | "oauth_refresh_token"
-                            | "client_secret"
-                            | "secret"
-                            | "password"
-                            | "email"
-                            | "user_id"
-                            | "account_id"
-                            | "identity"
-                            | "identity_id"
-                            | "subject"
-                            | "sub"
-                    )
-                {
-                    out.insert(key.clone(), redact_traffic_value(value));
-                } else {
-                    out.insert(key.clone(), redact_traffic_with_depth(value, depth + 1));
+struct Redacted<'a> {
+    value: &'a Value,
+    depth: u16,
+    event: Option<&'a str>,
+}
+
+impl Serialize for Redacted<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.depth > 100 {
+            return serializer.serialize_str("[depth-limit]");
+        }
+        match self.value {
+            Value::Object(fields) => {
+                let event = self.event.filter(|_| !fields.contains_key("_sse_event"));
+                let mut out =
+                    serializer.serialize_map(Some(fields.len() + usize::from(event.is_some())))?;
+                let mut event_pending = event;
+                for (key, value) in fields {
+                    if key.as_str() > "_sse_event"
+                        && let Some(event) = event_pending.take()
+                    {
+                        out.serialize_entry("_sse_event", &RedactedText(event))?;
+                    }
+                    let normalized = key.to_lowercase();
+                    if should_redact_field(fields, &normalized, value) {
+                        out.serialize_entry(key, &RedactedField(value))?;
+                    } else {
+                        out.serialize_entry(
+                            key,
+                            &Redacted {
+                                value,
+                                depth: self.depth + 1,
+                                event: None,
+                            },
+                        )?;
+                    }
                 }
+                if let Some(event) = event_pending {
+                    out.serialize_entry("_sse_event", &RedactedText(event))?;
+                }
+                out.end()
             }
-            Value::Object(out)
+            Value::Array(values) => {
+                let mut out = serializer.serialize_seq(Some(values.len()))?;
+                for value in values {
+                    out.serialize_element(&Redacted {
+                        value,
+                        depth: self.depth + 1,
+                        event: None,
+                    })?;
+                }
+                out.end()
+            }
+            Value::String(text) => RedactedText(text).serialize(serializer),
+            value => value.serialize(serializer),
         }
-        Value::Array(values) => Value::Array(
-            values
-                .iter()
-                .map(|value| redact_traffic_with_depth(value, depth + 1))
-                .collect(),
-        ),
-        Value::String(text) if is_data_url(text) => {
-            Value::String(format!("[redacted data-url len={}]", text.len()))
+    }
+}
+
+fn should_redact_field(fields: &Map<String, Value>, normalized: &str, value: &Value) -> bool {
+    normalized == "image_url"
+        || (normalized == "data" && looks_like_image_source(fields))
+        || normalized == "encrypted_content"
+        || (normalized == "signature" && value.as_str().is_some_and(is_proxy_reasoning_signature))
+        || REDACT_KEYS.contains(&normalized)
+        || matches!(
+            normalized,
+            "token"
+                | "bearer_token"
+                | "oauth_token"
+                | "oauth_access_token"
+                | "oauth_refresh_token"
+                | "client_secret"
+                | "secret"
+                | "password"
+                | "email"
+                | "user_id"
+                | "account_id"
+                | "identity"
+                | "identity_id"
+                | "subject"
+                | "sub"
+        )
+}
+
+struct RedactedText<'a>(&'a str);
+
+impl Serialize for RedactedText<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if is_data_url(self.0) {
+            serializer.collect_str(&format_args!("[redacted data-url len={}]", self.0.len()))
+        } else {
+            serializer.serialize_str(self.0)
         }
-        _ => value.clone(),
+    }
+}
+
+struct RedactedField<'a>(&'a Value);
+
+impl Serialize for RedactedField<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.0 {
+            Value::String(text) => {
+                serializer.collect_str(&format_args!("[redacted len={}]", text.len()))
+            }
+            Value::Object(_) | Value::Array(_) => redacted(self.0).serialize(serializer),
+            _ => serializer.serialize_str("[redacted]"),
+        }
     }
 }
 
@@ -261,16 +314,6 @@ fn looks_like_image_source(map: &Map<String, Value>) -> bool {
     match map.get("media_type").and_then(Value::as_str) {
         Some(media_type) => media_type.to_ascii_lowercase().starts_with("image/"),
         None => true,
-    }
-}
-
-fn redact_traffic_value(value: &Value) -> Value {
-    match value {
-        Value::String(s) => Value::String(format!("[redacted len={}]", s.len())),
-        // Structured values (e.g. `{url: ...}` image_url) keep their
-        // shape so captures stay parseable; only the payload leaves.
-        Value::Object(_) | Value::Array(_) => redact_traffic(value),
-        _ => Value::String("[redacted]".to_string()),
     }
 }
 

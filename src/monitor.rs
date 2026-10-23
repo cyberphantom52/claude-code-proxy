@@ -12,6 +12,11 @@ pub mod snapshot;
 pub use mock::MockMonitor;
 
 const DEFAULT_RECENT_LIMIT: usize = 200;
+pub(crate) const MAX_ERROR_MESSAGE_BYTES: usize = 4096;
+
+pub(crate) fn bounded_error_message(message: &str) -> &str {
+    &message[..message.floor_char_boundary(MAX_ERROR_MESSAGE_BYTES.min(message.len()))]
+}
 pub const SESSION_TOKEN_BUCKET_SECS: u64 = 10;
 pub const SESSION_OUTPUT_HISTORY_BUCKETS: u64 = 60 * 60 / SESSION_TOKEN_BUCKET_SECS;
 const SESSION_USAGE_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
@@ -732,14 +737,25 @@ impl MonitorStore {
             cached_input_tokens: active.cached_input_tokens,
             output_tokens: active.output_tokens,
             output_history_at: None,
-            error: error.or(active.error),
+            error: error.or(active.error).map(|error| {
+                if error.len() > MAX_ERROR_MESSAGE_BYTES {
+                    bounded_error_message(&error).to_owned()
+                } else {
+                    error
+                }
+            }),
             traffic_capture_path: active.traffic_capture_path,
         };
         if let Some(tokens) = completed.output_tokens.filter(|tokens| *tokens > 0) {
             let timestamp = completed
                 .generation_finished_at
                 .unwrap_or(completed.finished_at);
-            self.record_session_output(completed.session_id.clone(), timestamp, (0, tokens));
+            Self::record_session_output(
+                &mut self.session_output_buckets,
+                &completed.session_id,
+                timestamp,
+                (0, tokens),
+            );
             completed.output_history_at = Some(timestamp);
         }
         self.recent.push_front(completed);
@@ -762,7 +778,7 @@ impl MonitorStore {
                     active.generation_duration = Some(started.elapsed());
                 }
                 (
-                    active.session_id.clone(),
+                    &active.session_id,
                     update_token_count(&mut active.input_tokens, usage.input_tokens),
                     update_token_count(&mut active.cached_input_tokens, usage.cached_input_tokens),
                     update_token_count(&mut active.output_tokens, usage.output_tokens),
@@ -791,7 +807,7 @@ impl MonitorStore {
                     completed.output_history_at = Some(timestamp);
                 }
                 (
-                    completed.session_id.clone(),
+                    &completed.session_id,
                     update_token_count(&mut completed.input_tokens, usage.input_tokens),
                     update_token_count(
                         &mut completed.cached_input_tokens,
@@ -802,21 +818,40 @@ impl MonitorStore {
             } else {
                 return;
             };
-        self.record_session_usage(session_id.clone(), input, cached, output);
+        Self::record_session_usage(&mut self.session_usage, session_id, input, cached, output);
         if let Some((previous, timestamp)) = history_update {
-            self.record_session_output(session_id.clone(), previous, (output.0, 0));
-            self.record_session_output(session_id, timestamp, (0, output.1));
+            Self::record_session_output(
+                &mut self.session_output_buckets,
+                session_id,
+                previous,
+                (output.0, 0),
+            );
+            Self::record_session_output(
+                &mut self.session_output_buckets,
+                session_id,
+                timestamp,
+                (0, output.1),
+            );
         }
     }
 
     fn record_session_usage(
-        &mut self,
-        session_id: Option<String>,
+        session_usage: &mut HashMap<Option<String>, SessionUsage>,
+        session_id: &Option<String>,
         input: (u64, u64),
         cached: (u64, u64),
         output: (u64, u64),
     ) {
-        let usage = self.session_usage.entry(session_id).or_default();
+        if input.0 == input.1 && cached.0 == cached.1 && output.0 == output.1 {
+            if let Some(usage) = session_usage.get_mut(session_id) {
+                usage.last_seen = SystemTime::now();
+            }
+            return;
+        }
+        let usage = match session_usage.get_mut(session_id) {
+            Some(usage) => usage,
+            None => session_usage.entry(session_id.clone()).or_default(),
+        };
         usage.input_tokens = usage
             .input_tokens
             .saturating_sub(input.0)
@@ -833,8 +868,8 @@ impl MonitorStore {
     }
 
     fn record_session_output(
-        &mut self,
-        session_id: Option<String>,
+        session_output_buckets: &mut HashMap<Option<String>, Vec<(u64, u64)>>,
+        session_id: &Option<String>,
         timestamp: SystemTime,
         tokens: (u64, u64),
     ) {
@@ -842,7 +877,13 @@ impl MonitorStore {
             return;
         }
         let bucket = session_token_bucket(timestamp);
-        let buckets = self.session_output_buckets.entry(session_id).or_default();
+        let buckets = match session_output_buckets.get_mut(session_id) {
+            Some(buckets) => buckets,
+            None if tokens.1 > 0 => session_output_buckets
+                .entry(session_id.clone())
+                .or_default(),
+            None => return,
+        };
         match buckets.binary_search_by_key(&bucket, |(bucket, _)| *bucket) {
             Ok(index) => {
                 buckets[index].1 = buckets[index]
@@ -865,8 +906,8 @@ impl MonitorStore {
         let retained_sessions: HashSet<_> = self
             .active
             .values()
-            .map(|request| request.session_id.clone())
-            .chain(self.recent.iter().map(|request| request.session_id.clone()))
+            .map(|request| &request.session_id)
+            .chain(self.recent.iter().map(|request| &request.session_id))
             .collect();
         self.session_usage.retain(|session_id, usage| {
             let retained_by_age = match now.duration_since(usage.last_seen) {
@@ -913,36 +954,54 @@ fn session_summaries(
     session_output_buckets: &HashMap<Option<String>, Vec<(u64, u64)>>,
     now: SystemTime,
 ) -> Vec<SessionSummary> {
-    let mut sessions: HashMap<Option<String>, SessionSummary> = HashMap::new();
-    for request in recent.iter().rev() {
-        let entry = sessions
-            .entry(request.session_id.clone())
-            .or_insert_with(|| SessionSummary {
-                session_id: request.session_id.clone(),
-                project: request.project.clone(),
-                active_count: 0,
-                request_count: 0,
-                failure_count: 0,
+    struct SessionFold<'a> {
+        project: Option<&'a str>,
+        provider: Option<&'a str>,
+        model: Option<&'a str>,
+        effort: Option<&'a str>,
+        active_count: usize,
+        request_count: usize,
+        failure_count: usize,
+        last_seen: SystemTime,
+        rate_output_tokens: u64,
+        generation_duration: Duration,
+        last_status: &'static str,
+    }
+
+    impl Default for SessionFold<'_> {
+        fn default() -> Self {
+            Self {
+                project: None,
                 provider: None,
                 model: None,
                 effort: None,
-                last_seen: request.finished_at,
-                input_tokens: 0,
-                cached_input_tokens: 0,
-                output_tokens: 0,
-                output_token_samples: Vec::new(),
+                active_count: 0,
+                request_count: 0,
+                failure_count: 0,
+                last_seen: SystemTime::UNIX_EPOCH,
                 rate_output_tokens: 0,
                 generation_duration: Duration::ZERO,
-                last_status: "-".to_string(),
+                last_status: "-",
+            }
+        }
+    }
+
+    let mut sessions: HashMap<&Option<String>, SessionFold<'_>> = HashMap::new();
+    for request in recent.iter().rev() {
+        let entry = sessions
+            .entry(&request.session_id)
+            .or_insert_with(|| SessionFold {
+                last_seen: request.finished_at,
+                ..SessionFold::default()
             });
         entry.request_count += 1;
         if request.status == RequestStatus::Failed {
             entry.failure_count += 1;
         }
-        entry.project = request.project.clone().or(entry.project.take());
-        entry.provider = request.provider.clone().or(entry.provider.take());
-        entry.model = request.model.clone().or(entry.model.take());
-        entry.effort = request.effort.clone().or(entry.effort.take());
+        entry.project = request.project.as_deref().or(entry.project);
+        entry.provider = request.provider.as_deref().or(entry.provider);
+        entry.model = request.model.as_deref().or(entry.model);
+        entry.effort = request.effort.as_deref().or(entry.effort);
         entry.last_seen = entry.last_seen.max(request.finished_at);
         if let (Some(tokens), Some(duration)) = (
             request
@@ -956,36 +1015,22 @@ fn session_summaries(
             entry.rate_output_tokens = entry.rate_output_tokens.saturating_add(tokens);
             entry.generation_duration = entry.generation_duration.saturating_add(duration);
         }
-        entry.last_status = request.status.label().to_string();
+        entry.last_status = request.status.label();
     }
 
     for request in active {
         let entry = sessions
-            .entry(request.session_id.clone())
-            .or_insert_with(|| SessionSummary {
-                session_id: request.session_id.clone(),
-                project: request.project.clone(),
-                active_count: 0,
-                request_count: 0,
-                failure_count: 0,
-                provider: None,
-                model: None,
-                effort: None,
+            .entry(&request.session_id)
+            .or_insert_with(|| SessionFold {
                 last_seen: request.started_at,
-                input_tokens: 0,
-                cached_input_tokens: 0,
-                output_tokens: 0,
-                output_token_samples: Vec::new(),
-                rate_output_tokens: 0,
-                generation_duration: Duration::ZERO,
-                last_status: "-".to_string(),
+                ..SessionFold::default()
             });
         entry.active_count += 1;
         entry.request_count += 1;
-        entry.project = request.project.clone().or(entry.project.take());
-        entry.provider = request.provider.clone().or(entry.provider.take());
-        entry.model = request.model.clone().or(entry.model.take());
-        entry.effort = request.effort.clone().or(entry.effort.take());
+        entry.project = request.project.as_deref().or(entry.project);
+        entry.provider = request.provider.as_deref().or(entry.provider);
+        entry.model = request.model.as_deref().or(entry.model);
+        entry.effort = request.effort.as_deref().or(entry.effort);
         entry.last_seen = entry.last_seen.max(request.started_at);
         if let (Some(tokens), Some(duration)) = (
             request
@@ -999,26 +1044,40 @@ fn session_summaries(
             entry.rate_output_tokens = entry.rate_output_tokens.saturating_add(tokens);
             entry.generation_duration = entry.generation_duration.saturating_add(duration);
         }
-        entry.last_status = request.status.label().to_string();
+        entry.last_status = request.status.label();
     }
 
     let first_bucket = first_session_output_bucket(now);
-    for (session_id, session) in &mut sessions {
-        if let Some(usage) = session_usage.get(session_id) {
-            session.input_tokens = usage.input_tokens;
-            session.cached_input_tokens = usage.cached_input_tokens;
-            session.output_tokens = usage.output_tokens;
-        }
-        if let Some(buckets) = session_output_buckets.get(session_id) {
-            session.output_token_samples = buckets
-                .iter()
-                .filter(|(bucket, _)| *bucket >= first_bucket)
-                .map(|(bucket, tokens)| (session_token_bucket_start(*bucket), *tokens))
-                .collect();
-        }
-    }
-
-    let mut out: Vec<_> = sessions.into_values().collect();
+    let mut out: Vec<_> = sessions
+        .into_iter()
+        .map(|(session_id, session)| {
+            let usage = session_usage.get(session_id);
+            SessionSummary {
+                session_id: session_id.clone(),
+                project: session.project.map(str::to_owned),
+                provider: session.provider.map(str::to_owned),
+                model: session.model.map(str::to_owned),
+                effort: session.effort.map(str::to_owned),
+                active_count: session.active_count,
+                request_count: session.request_count,
+                failure_count: session.failure_count,
+                last_seen: session.last_seen,
+                input_tokens: usage.map_or(0, |usage| usage.input_tokens),
+                cached_input_tokens: usage.map_or(0, |usage| usage.cached_input_tokens),
+                output_tokens: usage.map_or(0, |usage| usage.output_tokens),
+                output_token_samples: session_output_buckets
+                    .get(session_id)
+                    .into_iter()
+                    .flatten()
+                    .filter(|(bucket, _)| *bucket >= first_bucket)
+                    .map(|(bucket, tokens)| (session_token_bucket_start(*bucket), *tokens))
+                    .collect(),
+                rate_output_tokens: session.rate_output_tokens,
+                generation_duration: session.generation_duration,
+                last_status: session.last_status.to_owned(),
+            }
+        })
+        .collect();
     out.sort_by(|a, b| a.label().cmp(b.label()));
     out
 }

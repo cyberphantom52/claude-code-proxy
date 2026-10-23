@@ -38,9 +38,9 @@ pub struct TranslatedRequest {
     pub use_responses_lite: bool,
 }
 
-pub fn translate_request(body: &Value) -> Result<TranslatedRequest, ChatError> {
+pub fn translate_request(mut body: Value) -> Result<TranslatedRequest, ChatError> {
     let object = body
-        .as_object()
+        .as_object_mut()
         .ok_or_else(|| ChatError::invalid("Request body must be a JSON object", None, None))?;
     reject_unsupported_fields(object)?;
 
@@ -64,11 +64,9 @@ pub fn translate_request(body: &Value) -> Result<TranslatedRequest, ChatError> {
             None,
         ));
     }
-    let input = messages
-        .iter()
-        .enumerate()
-        .map(translate_message)
-        .collect::<Result<Vec<_>, _>>()?;
+    for (index, message) in messages.iter().enumerate() {
+        validate_message(index, message)?;
+    }
 
     let stream = optional_bool(object, "stream")?.unwrap_or(false);
     let include_usage = translate_stream_options(object.get("stream_options"))?;
@@ -148,13 +146,13 @@ pub fn translate_request(body: &Value) -> Result<TranslatedRequest, ChatError> {
     if let Some(verbosity) = verbosity {
         text.insert("verbosity".to_string(), json!(verbosity));
     }
-    if let Some(format) = translate_response_format(object.get("response_format"))? {
+    if let Some(format) = translate_response_format(object.get_mut("response_format"))? {
         text.insert("format".to_string(), format);
     }
 
     let mut upstream = Map::from_iter([
         ("model".to_string(), json!(&resolved.model)),
-        ("input".to_string(), Value::Array(input)),
+        ("input".to_string(), Value::Null),
         ("store".to_string(), json!(false)),
         ("stream".to_string(), json!(true)),
         ("parallel_tool_calls".to_string(), json!(parallel)),
@@ -225,6 +223,15 @@ pub fn translate_request(body: &Value) -> Result<TranslatedRequest, ChatError> {
         upstream.insert("safety_identifier".to_string(), json!(user));
     }
 
+    let messages = object.remove("messages").expect("messages validated");
+    let Value::Array(messages) = messages else {
+        unreachable!("messages validated as an array");
+    };
+    upstream.insert(
+        "input".to_string(),
+        Value::Array(messages.into_iter().map(translate_message).collect()),
+    );
+
     Ok(TranslatedRequest {
         upstream: Value::Object(upstream),
         model: resolved.model,
@@ -285,7 +292,7 @@ fn optional_bool(
     }
 }
 
-fn translate_message((index, message): (usize, &Value)) -> Result<Value, ChatError> {
+fn validate_message(index: usize, message: &Value) -> Result<(), ChatError> {
     let param = format!("messages[{index}]");
     let object = message
         .as_object()
@@ -302,10 +309,8 @@ fn translate_message((index, message): (usize, &Value)) -> Result<Value, ChatErr
             None,
         )
     })?;
-    let role = match role {
-        "system" | "developer" => "developer",
-        "user" => "user",
-        "assistant" => "assistant",
+    match role {
+        "system" | "developer" | "user" | "assistant" => {}
         _ => {
             return Err(ChatError::invalid(
                 format!("Unsupported message role: {role}"),
@@ -314,20 +319,15 @@ fn translate_message((index, message): (usize, &Value)) -> Result<Value, ChatErr
             ));
         }
     };
-    let parts = translate_content(object.get("content"), index)?;
-    Ok(json!({"type":"message", "role":role, "content":parts}))
+    validate_content(object.get("content"), index)
 }
 
-fn translate_content(content: Option<&Value>, index: usize) -> Result<Vec<Value>, ChatError> {
+fn validate_content(content: Option<&Value>, index: usize) -> Result<(), ChatError> {
     let param = format!("messages[{index}].content");
-    let parts = match content {
-        Some(Value::String(text)) if !text.is_empty() => {
-            vec![json!({"type":"input_text", "text":text})]
-        }
-        Some(Value::Array(parts)) if !parts.is_empty() => parts
-            .iter()
-            .enumerate()
-            .map(|(part_index, part)| {
+    match content {
+        Some(Value::String(text)) if !text.is_empty() => Ok(()),
+        Some(Value::Array(parts)) if !parts.is_empty() => {
+            parts.iter().enumerate().try_for_each(|(part_index, part)| {
                 let part_param = format!("{param}[{part_index}]");
                 let object = part.as_object().ok_or_else(|| {
                     ChatError::invalid(
@@ -347,18 +347,14 @@ fn translate_content(content: Option<&Value>, index: usize) -> Result<Vec<Value>
                                 None,
                             )
                         })?;
-                    let url = image
+                    image
                         .get("url")
                         .and_then(Value::as_str)
                         .filter(|url| !url.is_empty())
                         .ok_or_else(|| {
                             ChatError::invalid("image_url.url is required", Some(&part_param), None)
                         })?;
-                    let mut part = json!({"type":"input_image", "image_url":url});
-                    if let Some(detail) = image.get("detail") {
-                        part["detail"] = detail.clone();
-                    }
-                    return Ok(part);
+                    return Ok(());
                 }
                 if object.get("type").and_then(Value::as_str) != Some("text") {
                     return Err(ChatError::invalid(
@@ -367,7 +363,7 @@ fn translate_content(content: Option<&Value>, index: usize) -> Result<Vec<Value>
                         Some("unsupported_value"),
                     ));
                 }
-                let text = object
+                object
                     .get("text")
                     .and_then(Value::as_str)
                     .filter(|text| !text.is_empty())
@@ -378,25 +374,59 @@ fn translate_content(content: Option<&Value>, index: usize) -> Result<Vec<Value>
                             None,
                         )
                     })?;
-                Ok(json!({"type":"input_text", "text":text}))
+                Ok(())
             })
-            .collect::<Result<Vec<_>, _>>()?,
-        _ => {
-            return Err(ChatError::invalid(
-                "Message content must contain text",
-                Some(&param),
-                None,
-            ));
         }
-    };
-    Ok(parts)
+        _ => Err(ChatError::invalid(
+            "Message content must contain text",
+            Some(&param),
+            None,
+        )),
+    }
 }
 
-fn translate_response_format(value: Option<&Value>) -> Result<Option<Value>, ChatError> {
+fn translate_message(mut message: Value) -> Value {
+    let role = match message["role"].as_str().expect("message role validated") {
+        "system" | "developer" => "developer",
+        "user" => "user",
+        "assistant" => "assistant",
+        _ => unreachable!("message role validated"),
+    };
+    let parts = match message["content"].take() {
+        Value::String(text) => vec![Value::Object(Map::from_iter([
+            ("type".to_string(), json!("input_text")),
+            ("text".to_string(), Value::String(text)),
+        ]))],
+        Value::Array(parts) => parts
+            .into_iter()
+            .map(|mut part| {
+                if part["type"] == "image_url" {
+                    let image = part["image_url"].as_object_mut().expect("image validated");
+                    let mut translated = json!({"type":"input_image"});
+                    translated["image_url"] = image.remove("url").expect("image URL validated");
+                    if let Some(detail) = image.remove("detail") {
+                        translated["detail"] = detail;
+                    }
+                    translated
+                } else {
+                    let mut translated = json!({"type":"input_text"});
+                    translated["text"] = part["text"].take();
+                    translated
+                }
+            })
+            .collect(),
+        _ => unreachable!("message content validated"),
+    };
+    let mut translated = json!({"type":"message", "role":role});
+    translated["content"] = Value::Array(parts);
+    translated
+}
+
+fn translate_response_format(value: Option<&mut Value>) -> Result<Option<Value>, ChatError> {
     let Some(value) = value.filter(|value| !value.is_null()) else {
         return Ok(None);
     };
-    let object = value.as_object().ok_or_else(|| {
+    let object = value.as_object_mut().ok_or_else(|| {
         ChatError::invalid(
             "'response_format' must be an object",
             Some("response_format"),
@@ -408,8 +438,8 @@ fn translate_response_format(value: Option<&Value>) -> Result<Option<Value>, Cha
         Some("json_object") => Ok(Some(json!({"type":"json_object"}))),
         Some("json_schema") => {
             let format = object
-                .get("json_schema")
-                .and_then(Value::as_object)
+                .get_mut("json_schema")
+                .and_then(Value::as_object_mut)
                 .ok_or_else(|| {
                     ChatError::invalid(
                         "'response_format.json_schema' must be an object",
@@ -417,7 +447,7 @@ fn translate_response_format(value: Option<&Value>) -> Result<Option<Value>, Cha
                         None,
                     )
                 })?;
-            let name = format
+            format
                 .get("name")
                 .and_then(Value::as_str)
                 .filter(|name| !name.is_empty())
@@ -428,7 +458,7 @@ fn translate_response_format(value: Option<&Value>) -> Result<Option<Value>, Cha
                         None,
                     )
                 })?;
-            let schema = format
+            format
                 .get("schema")
                 .filter(|schema| schema.is_object())
                 .ok_or_else(|| {
@@ -451,8 +481,14 @@ fn translate_response_format(value: Option<&Value>) -> Result<Option<Value>, Cha
             };
             let mut translated = Map::from_iter([
                 ("type".to_string(), json!("json_schema")),
-                ("name".to_string(), json!(name)),
-                ("schema".to_string(), schema.clone()),
+                (
+                    "name".to_string(),
+                    format.remove("name").expect("schema name validated"),
+                ),
+                (
+                    "schema".to_string(),
+                    format.remove("schema").expect("schema validated"),
+                ),
             ]);
             if let Some(strict) = strict {
                 translated.insert("strict".to_string(), json!(strict));

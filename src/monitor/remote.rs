@@ -1,10 +1,13 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use reqwest::{Client, Url};
 use tokio::{sync::watch, task::JoinHandle, time::MissedTickBehavior};
 
-use super::snapshot::{MonitorResponse, MonitorSnapshot, PROTOCOL_VERSION, SnapshotUpdate};
+use super::{
+    bounded_error_message,
+    snapshot::{MonitorResponse, MonitorSnapshot, PROTOCOL_VERSION, SnapshotUpdate},
+};
 
 const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -29,7 +32,7 @@ impl RemoteMonitor {
         let initial = fetch_snapshot(&client, &endpoint)
             .await
             .context("cannot attach to proxy monitor")?;
-        let (sender, updates) = watch::channel(SnapshotUpdate::Live(initial));
+        let (sender, updates) = watch::channel(SnapshotUpdate::Live(Arc::new(initial)));
         let poller = tokio::spawn(async move {
             let mut interval = tokio::time::interval(POLL_INTERVAL);
             interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -41,10 +44,15 @@ impl RemoteMonitor {
                     .map_err(|error| error.to_string());
                 sender.send_modify(|current| {
                     *current = match result {
-                        Ok(snapshot) => SnapshotUpdate::Live(snapshot),
+                        Ok(snapshot) => SnapshotUpdate::Live(Arc::new(snapshot)),
                         Err(error) => SnapshotUpdate::Disconnected {
-                            snapshot: current.snapshot().clone(),
-                            error,
+                            snapshot: match current {
+                                SnapshotUpdate::Live(snapshot)
+                                | SnapshotUpdate::Disconnected { snapshot, .. } => {
+                                    Arc::clone(snapshot)
+                                }
+                            },
+                            error: bounded_error_message(&error).to_owned(),
                         },
                     };
                 });
@@ -86,5 +94,21 @@ async fn fetch_snapshot(client: &Client, endpoint: &Url) -> Result<MonitorSnapsh
             PROTOCOL_VERSION
         );
     }
-    Ok(response.snapshot)
+    let mut snapshot = response.snapshot;
+    for error in snapshot
+        .active
+        .iter_mut()
+        .filter_map(|request| request.error.as_mut())
+        .chain(
+            snapshot
+                .recent
+                .iter_mut()
+                .filter_map(|request| request.error.as_mut()),
+        )
+    {
+        if bounded_error_message(error).len() < error.len() {
+            *error = bounded_error_message(error).to_owned();
+        }
+    }
+    Ok(snapshot)
 }

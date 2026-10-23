@@ -1,7 +1,7 @@
 use crate::{
     anthropic::{MAX_ANTHROPIC_REQUEST_BYTES, json_error},
     logging::{Logger, REDACT_KEYS, create_logger},
-    monitor::{EndpointKind, MonitorHandle},
+    monitor::{EndpointKind, MonitorHandle, bounded_error_message},
     openai_compat::{MAX_OPENAI_REQUEST_BYTES, OpenAiError, request::extract_model},
     project,
     provider::RequestContext,
@@ -25,7 +25,7 @@ use crate::{
     registry::Registry,
     request_identity::{CLAUDE_AGENT_HEADER, CLAUDE_PARENT_AGENT_HEADER, ConversationIdentity},
     session,
-    traffic::{TrafficCaptureOptions, create_traffic_capture},
+    traffic::{TrafficCaptureOptions, create_traffic_capture, redacted, traffic_capture_enabled},
 };
 use axum::{
     Json, Router,
@@ -38,18 +38,21 @@ use axum::{
 use http_body_util::{BodyExt, StreamBody};
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
+use std::collections::VecDeque;
 use std::fs::{self, File};
-use std::future::Future;
-use std::io::Write;
+use std::future::{Future, IntoFuture};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
 const CLAUDE_AUTO_REVIEW_SYSTEM_PREFIX: &str =
     "You are a security monitor for autonomous AI coding agents.";
 const CODEX_AUTO_REVIEW_MODEL: &str = "gpt-6-luna";
+const MAX_ERROR_CAPTURE_BYTES: usize = 64 * 1024;
+const MAX_ERROR_CAPTURE_FRAMES: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AutoReviewRoute {
@@ -189,12 +192,24 @@ pub async fn serve_listener(
         ])),
     );
     let app = app_with_monitor(Arc::new(Registry::new()), monitor);
-    axum::serve(
+    let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .with_graceful_shutdown(shutdown)
-    .await?;
+    .into_future();
+    tokio::pin!(server);
+    let mut maintenance = tokio::time::interval(Duration::from_secs(30));
+    maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            result = &mut server => {
+                result?;
+                break;
+            }
+            _ = maintenance.tick() => crate::providers::codex::websocket::prune_idle_state(),
+        }
+    }
     Ok(())
 }
 
@@ -928,39 +943,42 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
         monitor.request_started(&req_id, session_id.clone(), None, EndpointKind::Responses);
     }
     let request_guard = RequestMonitorGuard::new(state.monitor.clone(), req_id.clone());
-    let body_bytes = match axum::body::to_bytes(req.into_body(), MAX_OPENAI_REQUEST_BYTES).await {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            let response = openai_error(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "invalid_request_error",
-                "Request body exceeded the size limit".to_string(),
-                None,
-                Some("request_too_large"),
-            );
-            log_native_request_completed(
-                &log,
-                &req_id,
-                "responses",
-                None,
-                response.status(),
-                started_at,
-            );
-            return monitor_response_body(response, request_guard);
-        }
-    };
-    let body: Value = match parse_native_json_body(&body_bytes) {
-        Ok(body) => body,
-        Err(response) => {
-            log_native_request_completed(
-                &log,
-                &req_id,
-                "responses",
-                None,
-                response.status(),
-                started_at,
-            );
-            return monitor_response_body(response, request_guard);
+    let body = {
+        let body_bytes = match axum::body::to_bytes(req.into_body(), MAX_OPENAI_REQUEST_BYTES).await
+        {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                let response = openai_error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "invalid_request_error",
+                    "Request body exceeded the size limit".to_string(),
+                    None,
+                    Some("request_too_large"),
+                );
+                log_native_request_completed(
+                    &log,
+                    &req_id,
+                    "responses",
+                    None,
+                    response.status(),
+                    started_at,
+                );
+                return monitor_response_body(response, request_guard);
+            }
+        };
+        match parse_native_json_body(&body_bytes) {
+            Ok(body) => body,
+            Err(response) => {
+                log_native_request_completed(
+                    &log,
+                    &req_id,
+                    "responses",
+                    None,
+                    response.status(),
+                    started_at,
+                );
+                return monitor_response_body(response, request_guard);
+            }
         }
     };
     let model = match extract_model(&body) {
@@ -1087,39 +1105,42 @@ async fn handler_chat_completions(
         );
     }
     let request_guard = RequestMonitorGuard::new(state.monitor.clone(), req_id.clone());
-    let body_bytes = match axum::body::to_bytes(req.into_body(), MAX_OPENAI_REQUEST_BYTES).await {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            let response = openai_error(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "invalid_request_error",
-                "Request body exceeded the size limit".to_string(),
-                None,
-                Some("request_too_large"),
-            );
-            log_native_request_completed(
-                &log,
-                &req_id,
-                "chat_completions",
-                None,
-                response.status(),
-                started_at,
-            );
-            return monitor_response_body(response, request_guard);
-        }
-    };
-    let body = match parse_native_json_body(&body_bytes) {
-        Ok(body) => body,
-        Err(response) => {
-            log_native_request_completed(
-                &log,
-                &req_id,
-                "chat_completions",
-                None,
-                response.status(),
-                started_at,
-            );
-            return monitor_response_body(response, request_guard);
+    let body = {
+        let body_bytes = match axum::body::to_bytes(req.into_body(), MAX_OPENAI_REQUEST_BYTES).await
+        {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                let response = openai_error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "invalid_request_error",
+                    "Request body exceeded the size limit".to_string(),
+                    None,
+                    Some("request_too_large"),
+                );
+                log_native_request_completed(
+                    &log,
+                    &req_id,
+                    "chat_completions",
+                    None,
+                    response.status(),
+                    started_at,
+                );
+                return monitor_response_body(response, request_guard);
+            }
+        };
+        match parse_native_json_body(&body_bytes) {
+            Ok(body) => body,
+            Err(response) => {
+                log_native_request_completed(
+                    &log,
+                    &req_id,
+                    "chat_completions",
+                    None,
+                    response.status(),
+                    started_at,
+                );
+                return monitor_response_body(response, request_guard);
+            }
         }
     };
     let model = match extract_model(&body) {
@@ -1139,7 +1160,9 @@ async fn handler_chat_completions(
         .response();
         return monitor_response_body(response, request_guard);
     };
-    let translated = match translate_request(&body) {
+    let request_capture = traffic_capture_enabled()
+        .then(|| serde_json::to_vec_pretty(&redacted(&body)).unwrap_or_else(|_| b"{}".to_vec()));
+    let translated = match translate_request(body) {
         Ok(translated) => translated,
         Err(error) => return monitor_response_body(error.response(), request_guard),
     };
@@ -1180,7 +1203,9 @@ async fn handler_chat_completions(
                 "headers": headers_to_record(&headers),
             }),
         );
-        capture.write_json("010-openai-chat-completions-request", &body);
+        if let Some(request_capture) = request_capture {
+            capture.write_bytes("010-openai-chat-completions-request.json", &request_capture);
+        }
         capture.write_json("020-upstream-request", &translated.upstream);
     }
     let context = RequestContext {
@@ -1326,88 +1351,90 @@ async fn dispatch_request(
     }
     let request_guard = RequestMonitorGuard::new(state.monitor.clone(), req_id.clone());
     let now = current_millis();
-    let body_bytes = match axum::body::to_bytes(req.into_body(), MAX_ANTHROPIC_REQUEST_BYTES).await
-    {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            let response = json_error(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "request_too_large",
-                "Request body exceeded the size limit",
-            );
-            log_request_completed(
-                &log,
-                RequestLogContext {
-                    req_id: &req_id,
-                    provider: None,
-                    model: None,
-                    count_tokens,
-                    status: response.status(),
-                    started_at,
-                },
-            );
-            let (response, details) = record_failed_response(
-                &log,
-                FailedResponseLogContext {
-                    req_id: &req_id,
-                    provider: None,
-                    model: None,
-                    count_tokens,
-                    started_at,
-                },
-                response,
-            )
-            .await;
-            monitor_failed(
-                state.monitor.as_ref(),
-                &req_id,
-                Some(response.status()),
-                details
-                    .as_ref()
-                    .map(|details| details.message.as_str())
-                    .unwrap_or("Invalid JSON"),
-            );
-            return with_request_id(response, &req_id);
-        }
-    };
+    let mut body: crate::anthropic::schema::MessagesRequest = {
+        let body_bytes =
+            match axum::body::to_bytes(req.into_body(), MAX_ANTHROPIC_REQUEST_BYTES).await {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    let response = json_error(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "request_too_large",
+                        "Request body exceeded the size limit",
+                    );
+                    log_request_completed(
+                        &log,
+                        RequestLogContext {
+                            req_id: &req_id,
+                            provider: None,
+                            model: None,
+                            count_tokens,
+                            status: response.status(),
+                            started_at,
+                        },
+                    );
+                    let (response, details) = record_failed_response(
+                        &log,
+                        FailedResponseLogContext {
+                            req_id: &req_id,
+                            provider: None,
+                            model: None,
+                            count_tokens,
+                            started_at,
+                        },
+                        response,
+                    )
+                    .await;
+                    monitor_failed(
+                        state.monitor.as_ref(),
+                        &req_id,
+                        Some(response.status()),
+                        details
+                            .as_ref()
+                            .map(|details| details.message.as_str())
+                            .unwrap_or("Invalid JSON"),
+                    );
+                    return with_request_id(response, &req_id);
+                }
+            };
 
-    let mut body: crate::anthropic::schema::MessagesRequest = match parse_json_body(&body_bytes) {
-        Ok(body) => body,
-        Err(response) => {
-            let status = response.status();
-            log_request_completed(
-                &log,
-                RequestLogContext {
-                    req_id: &req_id,
-                    provider: None,
-                    model: None,
-                    count_tokens,
-                    status: response.status(),
-                    started_at,
-                },
-            );
-            let (response, details) = record_failed_response(
-                &log,
-                FailedResponseLogContext {
-                    req_id: &req_id,
-                    provider: None,
-                    model: None,
-                    count_tokens,
-                    started_at,
-                },
-                *response,
-            )
-            .await;
-            monitor_failed(
-                state.monitor.as_ref(),
-                &req_id,
-                Some(status),
-                details
-                    .as_ref()
-                    .map(|details| details.message.as_str())
-                    .unwrap_or("Invalid JSON"),
-            );
-            return with_request_id(response, &req_id);
+        match parse_json_body(&body_bytes) {
+            Ok(body) => body,
+            Err(response) => {
+                let status = response.status();
+                log_request_completed(
+                    &log,
+                    RequestLogContext {
+                        req_id: &req_id,
+                        provider: None,
+                        model: None,
+                        count_tokens,
+                        status: response.status(),
+                        started_at,
+                    },
+                );
+                let (response, details) = record_failed_response(
+                    &log,
+                    FailedResponseLogContext {
+                        req_id: &req_id,
+                        provider: None,
+                        model: None,
+                        count_tokens,
+                        started_at,
+                    },
+                    *response,
+                )
+                .await;
+                monitor_failed(
+                    state.monitor.as_ref(),
+                    &req_id,
+                    Some(status),
+                    details
+                        .as_ref()
+                        .map(|details| details.message.as_str())
+                        .unwrap_or("Invalid JSON"),
+                );
+                return with_request_id(response, &req_id);
+            }
         }
     };
 
@@ -1851,42 +1878,52 @@ async fn record_failed_response(
     }
 
     let status = response.status();
-    let (parts, body) = response.into_parts();
-    let bytes = match body.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(err) => {
-            log.error(
-                "request_failed",
-                Some(serde_json::Map::from_iter([
-                    ("reqId".to_string(), json!(ctx.req_id)),
-                    ("provider".to_string(), json!(ctx.provider)),
-                    ("model".to_string(), json!(ctx.model)),
-                    ("countTokens".to_string(), json!(ctx.count_tokens)),
-                    ("status".to_string(), json!(status.as_u16())),
-                    (
-                        "ms".to_string(),
-                        json!(ctx.started_at.elapsed().as_millis()),
-                    ),
-                    ("bodyReadError".to_string(), json!(err.to_string())),
-                ])),
-            );
-            return (Response::from_parts(parts, Body::empty()), None);
+    let (parts, mut body) = response.into_parts();
+    let mut frames = VecDeque::new();
+    let mut bytes = Vec::new();
+    let mut complete = false;
+    let mut read_error = None;
+    while bytes.len() < MAX_ERROR_CAPTURE_BYTES && frames.len() < MAX_ERROR_CAPTURE_FRAMES {
+        let Some(frame) = body.frame().await else {
+            complete = true;
+            break;
+        };
+        match &frame {
+            Ok(frame) => {
+                if let Some(data) = frame.data_ref() {
+                    let remaining = MAX_ERROR_CAPTURE_BYTES - bytes.len();
+                    bytes.extend_from_slice(&data[..data.len().min(remaining)]);
+                }
+            }
+            Err(error) => read_error = Some(bounded_error_message(&error.to_string()).to_owned()),
         }
+        frames.push_back(frame);
+        if read_error.is_some() {
+            break;
+        }
+    }
+    // A truncated JSON fragment cannot be safely redacted as structured data.
+    let response_body = if complete {
+        response_body_value(&bytes)
+    } else {
+        json!({ "captureTruncated": true, "capturedBytes": bytes.len() })
     };
-
-    let response_body = response_body_value(&bytes);
     let message = error_message_from_response(&response_body)
         .unwrap_or_else(|| format!("HTTP {}", status.as_u16()));
-    let document = json!({
+    let mut document = json!({
         "reqId": ctx.req_id,
         "provider": ctx.provider,
         "model": ctx.model,
         "countTokens": ctx.count_tokens,
         "status": status.as_u16(),
         "elapsedMs": ctx.started_at.elapsed().as_millis(),
-        "message": message,
-        "response": response_body,
+        "message": &message,
+        "bodyReadError": read_error,
     });
+    document
+        .as_object_mut()
+        .expect("capture document is an object")
+        .insert("response".to_string(), response_body);
     let error_file = write_error_capture(ctx.req_id, &redact_error_value(document));
 
     let mut fields = serde_json::Map::from_iter([
@@ -1906,8 +1943,15 @@ async fn record_failed_response(
     }
     log.error("request_failed", Some(fields));
 
+    let stream = futures_util::stream::unfold((frames, body), |(mut frames, mut body)| async {
+        let frame = match frames.pop_front() {
+            Some(frame) => Some(frame),
+            None => body.frame().await,
+        };
+        frame.map(|frame| (frame, (frames, body)))
+    });
     (
-        Response::from_parts(parts, Body::from(bytes)),
+        Response::from_parts(parts, Body::new(StreamBody::new(stream))),
         Some(FailedResponseDetails { message }),
     )
 }
@@ -1932,7 +1976,7 @@ fn error_message_from_response(response_body: &Value) -> Option<String> {
                 .map(str::trim)
                 .filter(|text| !text.is_empty())
         })
-        .map(std::string::ToString::to_string)
+        .map(|message| bounded_error_message(message).to_owned())
 }
 
 fn write_error_capture(req_id: &str, document: &Value) -> Option<PathBuf> {
@@ -1944,11 +1988,12 @@ fn write_error_capture(req_id: &str, document: &Value) -> Option<PathBuf> {
         current_millis(),
         sanitize_path_part(req_id)
     ));
-    let mut file = File::create(&path).ok()?;
+    let file = File::create(&path).ok()?;
     set_mode(&path, 0o600);
-    let payload = serde_json::to_vec_pretty(document).ok()?;
-    file.write_all(&payload).ok()?;
-    file.write_all(b"\n").ok()?;
+    let mut writer = BufWriter::new(file);
+    serde_json::to_writer_pretty(&mut writer, document).ok()?;
+    writer.write_all(b"\n").ok()?;
+    writer.flush().ok()?;
     Some(path)
 }
 

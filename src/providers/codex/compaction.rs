@@ -74,15 +74,15 @@ pub async fn request_compaction(
 ) -> Result<Vec<ResponsesInputItem>, CompactionError> {
     let (envelope, conversation) = split_input_envelope(&request.input);
     let conversation = without_compaction_instruction(conversation);
-    let mut compaction_request = request.clone();
-    compaction_request.instructions = None;
-    compaction_request.input = envelope
+    let input = envelope
         .iter()
         .filter(|item| matches!(item, ResponsesInputItem::AdditionalTools { .. }))
         .cloned()
-        .chain(conversation.iter().cloned())
+        .chain(conversation)
         .chain(std::iter::once(ResponsesInputItem::CompactionTrigger))
-        .collect();
+        .collect::<Vec<_>>();
+    let mut compaction_request = request.with_input(input);
+    compaction_request.instructions = None;
     compaction_request.include = Some(vec!["reasoning.encrypted_content".to_string()]);
 
     let response = client
@@ -97,7 +97,10 @@ pub async fn request_compaction(
         ));
     }
     let compaction = parse_compaction_response(&response.body)?;
-    Ok(build_compacted_history(&conversation, compaction))
+    Ok(build_compacted_history(
+        compaction_request.input,
+        compaction,
+    ))
 }
 
 pub(crate) fn begin_compaction_scoped(scope: &CompactionScope, model: &str) -> CompactionAttempt {
@@ -227,13 +230,13 @@ pub(crate) fn apply_compaction_replay_scoped(
         return None;
     }
 
-    let mut replay = request.clone();
-    replay.input = envelope
+    let input = envelope
         .iter()
         .cloned()
         .chain(state.native_history.iter().cloned())
         .chain(conversation[1..].iter().cloned())
-        .collect();
+        .collect::<Vec<_>>();
+    let replay = request.with_input(input);
     if serialized_size(&replay.input) > MAX_STATE_BYTES {
         registry.remove(&scope.owner);
         return None;
@@ -411,11 +414,11 @@ fn parse_compaction_response(body: &[u8]) -> Result<ResponsesInputItem, Compacti
 }
 
 fn build_compacted_history(
-    input: &[ResponsesInputItem],
+    input: Vec<ResponsesInputItem>,
     compaction: ResponsesInputItem,
 ) -> Vec<ResponsesInputItem> {
     let retained = input
-        .iter()
+        .into_iter()
         .filter(|item| {
             matches!(
                 item,
@@ -423,7 +426,6 @@ fn build_compacted_history(
                     if matches!(role.as_str(), "user" | "developer" | "system")
             )
         })
-        .cloned()
         .collect::<Vec<_>>();
     let mut retained = truncate_retained_messages(retained, RETAINED_MESSAGE_TOKEN_BUDGET);
     retained.push(compaction);
@@ -534,6 +536,14 @@ fn state_size(owner: &ConversationIdentity, state: &CompactionState) -> usize {
     }) + state.model.len()
         + summary_len
         + serialized_size(&state.native_history)
+}
+
+pub(super) fn prune_idle_state() {
+    let mut guard = REGISTRY.lock().unwrap();
+    if let Some(registry) = guard.as_mut() {
+        evict_states(registry, now_ms());
+        registry.shrink_to_fit();
+    }
 }
 
 fn now_ms() -> u64 {

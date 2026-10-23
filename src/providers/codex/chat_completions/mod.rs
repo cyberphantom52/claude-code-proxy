@@ -63,19 +63,14 @@ impl ChatCompletionsBackend {
         }
 
         let headers = stream::response_headers(upstream.headers());
-        let bytes =
-            match collect_body(upstream, self.client.body_idle_timeout_ms(), Some(&ctx)).await {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    let mut response = error.response();
-                    response.headers_mut().extend(headers);
-                    return response;
-                }
-            };
-        if let Some(traffic) = ctx.traffic.as_deref() {
+        let (bytes, read_result) =
+            collect_body(upstream, self.client.body_idle_timeout_ms(), Some(&ctx)).await;
+        if read_result.is_ok()
+            && let Some(traffic) = ctx.traffic.as_deref()
+        {
             traffic.write_bytes("032-upstream-response-body.sse", &bytes);
         }
-        let completion = match response::aggregate_sse(&bytes, &request.model) {
+        let completion = match response::aggregate_sse(&bytes, &request.model, &ctx, read_result) {
             Ok(completion) => completion,
             Err(error) => {
                 let mut response = error.response();
@@ -100,7 +95,7 @@ async fn collect_body(
     upstream: reqwest::Response,
     idle_timeout_ms: u64,
     ctx: Option<&RequestContext>,
-) -> Result<Vec<u8>, ChatError> {
+) -> (Vec<u8>, Result<(), ChatError>) {
     let mut stream = upstream.bytes_stream();
     let mut bytes = Vec::new();
     let mut started = false;
@@ -145,14 +140,7 @@ async fn collect_body(
             }
         }
     };
-    if let Some(ctx) = ctx {
-        for event in crate::anthropic::sse::parse_sse_events(&bytes) {
-            if let Ok(payload) = serde_json::from_str::<Value>(&event.data) {
-                super::record_upstream_telemetry(ctx, &payload);
-            }
-        }
-    }
-    result.map(|()| bytes)
+    (bytes, result)
 }
 
 fn codex_error_response(mut error: CodexError) -> Response {
@@ -171,14 +159,12 @@ fn codex_error_response(mut error: CodexError) -> Response {
 async fn upstream_error_response(upstream: reqwest::Response, idle_timeout_ms: u64) -> Response {
     let status = upstream.status();
     let headers = stream::response_headers(upstream.headers());
-    let bytes = match collect_body(upstream, idle_timeout_ms, None).await {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            let mut response = error.response();
-            response.headers_mut().extend(headers);
-            return response;
-        }
-    };
+    let (bytes, read_result) = collect_body(upstream, idle_timeout_ms, None).await;
+    if let Err(error) = read_result {
+        let mut response = error.response();
+        response.headers_mut().extend(headers);
+        return response;
+    }
     let message = serde_json::from_slice::<Value>(&bytes)
         .ok()
         .and_then(|value| {

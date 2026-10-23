@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use super::translate::request::{
     ResponsesContentPart, ResponsesFunctionCallOutput, ResponsesFunctionCallOutputContentPart,
     ResponsesInputItem, ResponsesRequest, ResponsesTool,
@@ -10,6 +12,7 @@ use tiktoken_rs::o200k_base_singleton;
 /// provider billing count.
 pub fn count_translated_tokens(translated: &ResponsesRequest) -> u64 {
     let mut total = 0u64;
+    let mut scratch = Vec::new();
 
     // Instructions
     if let Some(ref instructions) = translated.instructions {
@@ -18,12 +21,12 @@ pub fn count_translated_tokens(translated: &ResponsesRequest) -> u64 {
 
     // Input items
     for item in &translated.input {
-        total += count_input_item_tokens(item);
+        total += count_input_item_tokens(item, &mut scratch);
     }
 
     // Tools
     if let Some(ref tools) = translated.tools {
-        total += count_tool_tokens(tools);
+        total += count_tool_tokens(tools, &mut scratch);
     }
 
     // Overhead
@@ -36,11 +39,11 @@ pub fn count_translated_tokens(translated: &ResponsesRequest) -> u64 {
     total.max(1)
 }
 
-fn count_input_item_tokens(item: &ResponsesInputItem) -> u64 {
+fn count_input_item_tokens(item: &ResponsesInputItem, scratch: &mut Vec<u8>) -> u64 {
     match item {
         ResponsesInputItem::AdditionalTools { tools, .. } => tools
             .iter()
-            .map(|tool| approx_token_count(&serde_json::to_string(tool).unwrap_or_default()))
+            .map(|tool| count_serialized_tokens(tool, scratch))
             .sum(),
         ResponsesInputItem::Message { content, .. } => {
             let mut total = 0u64;
@@ -98,7 +101,7 @@ fn count_content_part_tokens(part: &ResponsesContentPart) -> u64 {
     }
 }
 
-fn count_tool_tokens(tools: &[ResponsesTool]) -> u64 {
+fn count_tool_tokens(tools: &[ResponsesTool], scratch: &mut Vec<u8>) -> u64 {
     let mut total = 0u64;
     for tool in tools {
         match tool {
@@ -107,8 +110,7 @@ fn count_tool_tokens(tools: &[ResponsesTool]) -> u64 {
                 if let Some(ref desc) = f.description {
                     total += approx_token_count(desc);
                 }
-                total +=
-                    approx_token_count(&serde_json::to_string(&f.parameters).unwrap_or_default());
+                total += count_serialized_tokens(&f.parameters, scratch);
             }
             ResponsesTool::WebSearch(_) => {
                 total += 10; // fixed overhead for web search tool
@@ -118,29 +120,39 @@ fn count_tool_tokens(tools: &[ResponsesTool]) -> u64 {
     total
 }
 
+fn count_serialized_tokens(value: &serde_json::Value, scratch: &mut Vec<u8>) -> u64 {
+    scratch.clear();
+    if serde_json::to_writer(&mut *scratch, value).is_err() {
+        return 0;
+    }
+    // Count the complete serialization, never its chunks: JSON write boundaries
+    // are not token boundaries.
+    approx_token_count(std::str::from_utf8(scratch).expect("serialized JSON is UTF-8"))
+}
+
 pub(crate) fn approx_token_count(text: &str) -> u64 {
     u64::try_from(o200k_base_singleton().count_ordinary(text)).unwrap_or(u64::MAX)
 }
 
-pub(crate) fn truncate_to_token_budget(text: &str, max_tokens: u64) -> String {
+pub(crate) fn truncate_to_token_budget(text: Cow<'_, str>, max_tokens: u64) -> Cow<'_, str> {
     let max_tokens = usize::try_from(max_tokens).unwrap_or(usize::MAX);
     if max_tokens == 0 {
-        return String::new();
+        return Cow::Borrowed("");
     }
 
     let tokenizer = o200k_base_singleton();
-    let tokens = tokenizer.encode_ordinary(text);
+    let tokens = tokenizer.encode_ordinary(&text);
     if tokens.len() <= max_tokens {
-        return text.to_string();
+        return text;
     }
 
     // A token boundary may split a multi-byte UTF-8 scalar. Back up until the
     // decoded prefix is valid rather than replacing bytes or splitting text.
     for end in (1..=max_tokens).rev() {
         if let Ok(prefix) = tokenizer.decode(&tokens[..end]) {
-            return prefix;
+            return Cow::Owned(prefix);
         }
     }
 
-    String::new()
+    Cow::Borrowed("")
 }

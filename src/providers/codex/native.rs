@@ -586,7 +586,7 @@ impl NativeResponseObserver {
                 .or_insert_with(|| Value::String(event.to_string()));
         }
         self.update_usage(&value);
-        self.update_outcome(&value);
+        value = self.update_outcome(value);
         if self.ctx.traffic.is_none() {
             return;
         }
@@ -616,20 +616,26 @@ impl NativeResponseObserver {
         }
     }
 
-    fn update_outcome(&self, value: &Value) {
-        // Shared classification includes nested failed/incomplete terminal responses.
-        if let Some(failure) = super::events::classify_event_failure(value) {
+    fn update_outcome(&self, mut value: Value) -> Value {
+        // Move non-SSE responses through the terminal envelope, then recover the
+        // original body for capture without copying its output payload.
+        let failure = if !self.is_sse && value.get("type").is_none() {
+            let mut envelope = Value::Object(Map::from_iter([
+                (
+                    "type".to_string(),
+                    Value::String("response.completed".to_string()),
+                ),
+                ("response".to_string(), value),
+            ]));
+            let failure = super::events::classify_event_failure(&envelope);
+            value = envelope["response"].take();
+            failure
+        } else {
+            super::events::classify_event_failure(&value)
+        };
+        if let Some(failure) = failure {
             self.outcome.fail(failure.message);
-            return;
-        }
-        if !self.is_sse
-            && value.get("type").is_none()
-            && let Some(failure) = super::events::classify_event_failure(&json!({
-                "type": "response.completed", "response": value
-            }))
-        {
-            self.outcome.fail(failure.message);
-            return;
+            return value;
         }
         let event_type = value.get("type").and_then(Value::as_str);
         let has_error = value.get("error").is_some_and(|error| !error.is_null());
@@ -648,6 +654,7 @@ impl NativeResponseObserver {
                 .unwrap_or("Native Responses stream failed");
             self.outcome.fail(message.to_string());
         }
+        value
     }
 
     fn update_usage(&mut self, value: &Value) {
@@ -671,7 +678,7 @@ impl NativeResponseObserver {
             && let Ok(value) = serde_json::from_slice::<Value>(&self.raw)
         {
             self.update_usage(&value);
-            self.update_outcome(&value);
+            let value = self.update_outcome(value);
             self.capture_event(value);
             if let Some(monitor) = self.ctx.monitor.as_ref() {
                 monitor.usage_updated(&self.ctx.req_id, self.usage);

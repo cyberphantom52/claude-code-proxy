@@ -62,13 +62,17 @@ fn read_file_config(config_dir: &Path) -> Option<FileConfig> {
 
 /// Reject obsolete backend selection rather than silently sending its intent to Codex.
 pub fn validate_config() -> anyhow::Result<()> {
-    validate_config_for_env(&std::env::vars().collect())
+    validate_config_from_env(|key| std::env::var(key).ok())
 }
 
 pub fn validate_config_for_env(env: &HashMap<String, String>) -> anyhow::Result<()> {
+    validate_config_from_env(|key| env.get(key).cloned())
+}
+
+fn validate_config_from_env(env: impl Fn(&str) -> Option<String>) -> anyhow::Result<()> {
     use anyhow::Context;
 
-    let cfg = load_config_for_env(env);
+    let cfg = load_config_from_env(&env, config_dir_from_env(&env));
     let path = cfg.config_dir.join("config.json");
     let file: serde_json::Value = match fs::read_to_string(&path) {
         Ok(raw) => serde_json::from_str(&raw)
@@ -76,9 +80,7 @@ pub fn validate_config_for_env(env: &HashMap<String, String>) -> anyhow::Result<
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::Value::Null,
         Err(error) => return Err(error).with_context(|| format!("cannot read {}", path.display())),
     };
-    let env_alias = env
-        .get("CCP_ALIAS_PROVIDER")
-        .map(|value| serde_json::json!(value));
+    let env_alias = env("CCP_ALIAS_PROVIDER").map(|value| serde_json::json!(value));
     for (source, value) in [
         ("CCP_ALIAS_PROVIDER", env_alias.as_ref()),
         ("aliasProvider", file.get("aliasProvider")),
@@ -95,27 +97,34 @@ pub fn validate_config_for_env(env: &HashMap<String, String>) -> anyhow::Result<
 }
 
 pub fn load_config() -> LoadedConfig {
-    let env = paths::DirResolverEnv::default();
-    let config_dir = paths::resolve_config_dir(&env);
-    load_config_from_env(&env.env, config_dir)
+    let env = |key: &str| std::env::var(key).ok();
+    load_config_from_env(env, config_dir_from_env(&env))
 }
 
 pub fn load_config_for_env(env: &HashMap<String, String>) -> LoadedConfig {
-    let home = env
-        .get("HOME")
-        .or_else(|| env.get("USERPROFILE"))
-        .cloned()
-        .unwrap_or_else(|| "/".to_string());
-    let resolver_env = paths::DirResolverEnv {
-        platform: std::env::consts::OS.to_string(),
-        env: env.clone(),
-        home,
-    };
-    let config_dir = paths::resolve_config_dir(&resolver_env);
-    load_config_from_env(env, config_dir)
+    let env = |key: &str| env.get(key).cloned();
+    load_config_from_env(env, config_dir_from_env(&env))
 }
 
-fn load_config_from_env(env: &HashMap<String, String>, config_dir: PathBuf) -> LoadedConfig {
+fn config_dir_from_env(env: &impl Fn(&str) -> Option<String>) -> PathBuf {
+    let resolver_env = paths::DirResolverEnv {
+        platform: std::env::consts::OS.to_string(),
+        env: ["CCP_CONFIG_DIR", "APPDATA", "XDG_CONFIG_HOME"]
+            .into_iter()
+            .filter_map(|key| env(key).map(|value| (key.to_string(), value)))
+            .collect(),
+        home: env("HOME")
+            .or_else(|| env("USERPROFILE"))
+            .unwrap_or_else(|| "/".to_string()),
+    };
+    paths::resolve_config_dir(&resolver_env)
+}
+
+fn config_dir() -> PathBuf {
+    config_dir_from_env(&|key| std::env::var(key).ok())
+}
+
+fn load_config_from_env(env: impl Fn(&str) -> Option<String>, config_dir: PathBuf) -> LoadedConfig {
     let file = read_file_config(&config_dir);
 
     let mut out = LoadedConfig {
@@ -126,13 +135,13 @@ fn load_config_from_env(env: &HashMap<String, String>, config_dir: PathBuf) -> L
         config_dir,
     };
 
-    if let Some(raw) = env.get("CCP_BIND_ADDRESS") {
-        out.bind_address = raw.clone();
+    if let Some(raw) = env("CCP_BIND_ADDRESS") {
+        out.bind_address = raw;
     } else if let Some(bind_address) = file.as_ref().and_then(|f| f.bind_address.clone()) {
         out.bind_address = bind_address;
     }
 
-    if let Some(raw) = env.get("PORT") {
+    if let Some(raw) = env("PORT") {
         if let Ok(port) = raw.parse::<u16>() {
             out.port = port;
         }
@@ -140,7 +149,7 @@ fn load_config_from_env(env: &HashMap<String, String>, config_dir: PathBuf) -> L
         out.port = port;
     }
 
-    if env.contains_key("CCP_LOG_VERBOSE") {
+    if env("CCP_LOG_VERBOSE").is_some() {
         out.log_verbose = true;
     } else if let Some(value) = file
         .as_ref()
@@ -149,7 +158,7 @@ fn load_config_from_env(env: &HashMap<String, String>, config_dir: PathBuf) -> L
         out.log_verbose = value;
     }
 
-    if env.contains_key("CCP_LOG_STDERR") {
+    if env("CCP_LOG_STDERR").is_some() {
         out.log_stderr = true;
     } else if let Some(value) = file
         .as_ref()
@@ -182,14 +191,13 @@ pub fn log_stderr() -> bool {
 // ---------------------------------------------------------------------------
 
 pub fn codex_base_url(default: &str) -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env.get("CCP_CODEX_BASE_URL") {
-        return raw.clone();
+    if let Ok(raw) = std::env::var("CCP_CODEX_BASE_URL") {
+        return raw;
     }
-    if let Some(raw) = env.get("CLAUDE_CODE_PROXY_CODEX_BASE_URL") {
-        return raw.clone();
+    if let Ok(raw) = std::env::var("CLAUDE_CODE_PROXY_CODEX_BASE_URL") {
+        return raw;
     }
-    let config_dir = paths::config_dir();
+    let config_dir = config_dir();
     if let Some(file) = read_file_config(&config_dir)
         && let Some(codex) = file.codex
         && let Some(url) = codex.base_url
@@ -200,11 +208,10 @@ pub fn codex_base_url(default: &str) -> String {
 }
 
 pub fn codex_originator(default: &str) -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env.get("CCP_CODEX_ORIGINATOR") {
-        return raw.clone();
+    if let Ok(raw) = std::env::var("CCP_CODEX_ORIGINATOR") {
+        return raw;
     }
-    let config_dir = paths::config_dir();
+    let config_dir = config_dir();
     if let Some(file) = read_file_config(&config_dir)
         && let Some(codex) = file.codex
         && let Some(val) = codex.originator
@@ -215,14 +222,13 @@ pub fn codex_originator(default: &str) -> String {
 }
 
 pub fn codex_user_agent(default: &str) -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env.get("CCP_CODEX_USER_AGENT") {
-        return raw.clone();
+    if let Ok(raw) = std::env::var("CCP_CODEX_USER_AGENT") {
+        return raw;
     }
-    if let Some(raw) = env.get("CCP_USER_AGENT") {
-        return raw.clone();
+    if let Ok(raw) = std::env::var("CCP_USER_AGENT") {
+        return raw;
     }
-    let config_dir = paths::config_dir();
+    let config_dir = config_dir();
     if let Some(file) = read_file_config(&config_dir)
         && let Some(codex) = file.codex
         && let Some(ua) = codex.user_agent
@@ -233,11 +239,10 @@ pub fn codex_user_agent(default: &str) -> String {
 }
 
 pub fn codex_previous_response_id() -> bool {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env.get("CCP_CODEX_PREVIOUS_RESPONSE_ID") {
+    if let Ok(raw) = std::env::var("CCP_CODEX_PREVIOUS_RESPONSE_ID") {
         return matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
     }
-    let config_dir = paths::config_dir();
+    let config_dir = config_dir();
     if let Some(file) = read_file_config(&config_dir)
         && let Some(codex) = file.codex
         && let Some(val) = codex.previous_response_id
@@ -248,15 +253,14 @@ pub fn codex_previous_response_id() -> bool {
 }
 
 pub fn codex_server_compaction() -> bool {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env.get("CCP_CODEX_SERVER_COMPACTION") {
+    if let Ok(raw) = std::env::var("CCP_CODEX_SERVER_COMPACTION") {
         match raw.trim().to_ascii_lowercase().as_str() {
             "1" | "true" | "yes" | "on" => return true,
             "0" | "false" | "no" | "off" => return false,
             _ => {}
         }
     }
-    let config_dir = paths::config_dir();
+    let config_dir = config_dir();
     if let Some(file) = read_file_config(&config_dir)
         && let Some(codex) = file.codex
         && let Some(enabled) = codex.server_compaction
@@ -267,11 +271,10 @@ pub fn codex_server_compaction() -> bool {
 }
 
 pub fn codex_responses_api() -> bool {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env.get("CCP_CODEX_RESPONSES_API") {
+    if let Ok(raw) = std::env::var("CCP_CODEX_RESPONSES_API") {
         return matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
     }
-    let config_dir = paths::config_dir();
+    let config_dir = config_dir();
     if let Some(file) = read_file_config(&config_dir)
         && let Some(codex) = file.codex
         && let Some(enabled) = codex.responses_api
@@ -282,11 +285,10 @@ pub fn codex_responses_api() -> bool {
 }
 
 pub fn codex_images_api() -> bool {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env.get("CCP_CODEX_IMAGES_API") {
+    if let Ok(raw) = std::env::var("CCP_CODEX_IMAGES_API") {
         return matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
     }
-    let config_dir = paths::config_dir();
+    let config_dir = config_dir();
     if let Some(file) = read_file_config(&config_dir)
         && let Some(codex) = file.codex
         && let Some(enabled) = codex.images_api
@@ -297,11 +299,10 @@ pub fn codex_images_api() -> bool {
 }
 
 pub fn codex_transcriptions_api() -> bool {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env.get("CCP_CODEX_TRANSCRIPTIONS_API") {
+    if let Ok(raw) = std::env::var("CCP_CODEX_TRANSCRIPTIONS_API") {
         return matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
     }
-    let config_dir = paths::config_dir();
+    let config_dir = config_dir();
     if let Some(file) = read_file_config(&config_dir)
         && let Some(codex) = file.codex
         && let Some(enabled) = codex.transcriptions_api
@@ -312,11 +313,10 @@ pub fn codex_transcriptions_api() -> bool {
 }
 
 pub fn codex_images_base_url() -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env.get("CCP_CODEX_IMAGES_BASE_URL") {
-        return raw.clone();
+    if let Ok(raw) = std::env::var("CCP_CODEX_IMAGES_BASE_URL") {
+        return raw;
     }
-    let config_dir = paths::config_dir();
+    let config_dir = config_dir();
     if let Some(file) = read_file_config(&config_dir)
         && let Some(codex) = file.codex
         && let Some(url) = codex.images_base_url
@@ -327,11 +327,10 @@ pub fn codex_images_base_url() -> String {
 }
 
 pub fn codex_service_tier() -> Option<String> {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env.get("CCP_CODEX_SERVICE_TIER") {
-        return Some(raw.clone());
+    if let Ok(raw) = std::env::var("CCP_CODEX_SERVICE_TIER") {
+        return Some(raw);
     }
-    let config_dir = paths::config_dir();
+    let config_dir = config_dir();
     if let Some(file) = read_file_config(&config_dir)
         && let Some(codex) = file.codex
     {
@@ -341,11 +340,10 @@ pub fn codex_service_tier() -> Option<String> {
 }
 
 pub fn codex_effort() -> Option<String> {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env.get("CCP_CODEX_EFFORT") {
-        return Some(raw.clone());
+    if let Ok(raw) = std::env::var("CCP_CODEX_EFFORT") {
+        return Some(raw);
     }
-    let config_dir = paths::config_dir();
+    let config_dir = config_dir();
     if let Some(file) = read_file_config(&config_dir)
         && let Some(codex) = file.codex
     {
@@ -355,11 +353,10 @@ pub fn codex_effort() -> Option<String> {
 }
 
 pub fn codex_full_lane() -> bool {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env.get("CCP_CODEX_FULL_LANE") {
+    if let Ok(raw) = std::env::var("CCP_CODEX_FULL_LANE") {
         return raw == "1" || raw == "true";
     }
-    let config_dir = paths::config_dir();
+    let config_dir = config_dir();
     if let Some(file) = read_file_config(&config_dir)
         && let Some(codex) = file.codex
     {
@@ -369,14 +366,13 @@ pub fn codex_full_lane() -> bool {
 }
 
 pub fn codex_reasoning_summary() -> Option<String> {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env
-        .get("CCP_CODEX_REASONING_SUMMARY")
+    if let Some(raw) = std::env::var("CCP_CODEX_REASONING_SUMMARY")
+        .ok()
         .filter(|raw| !raw.is_empty())
     {
-        return Some(raw.clone());
+        return Some(raw);
     }
-    let config_dir = paths::config_dir();
+    let config_dir = config_dir();
     if let Some(file) = read_file_config(&config_dir)
         && let Some(codex) = file.codex
         && let Some(summary) = codex.reasoning_summary.filter(|raw| !raw.is_empty())
@@ -395,7 +391,7 @@ pub fn codex_model_discovery() -> bool {
             _ => {}
         }
     }
-    read_file_config(&paths::config_dir())
+    read_file_config(&config_dir())
         .and_then(|file| file.codex)
         .and_then(|codex| codex.model_discovery)
         .unwrap_or(true)
@@ -407,18 +403,17 @@ pub fn codex_models_file() -> Option<PathBuf> {
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
         .or_else(|| {
-            read_file_config(&paths::config_dir())
+            read_file_config(&config_dir())
                 .and_then(|file| file.codex)
                 .and_then(|codex| codex.models_file)
         })
 }
 
 pub fn codex_model() -> Option<String> {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env.get("CCP_CODEX_MODEL") {
-        return Some(raw.clone());
+    if let Ok(raw) = std::env::var("CCP_CODEX_MODEL") {
+        return Some(raw);
     }
-    let config_dir = paths::config_dir();
+    let config_dir = config_dir();
     if let Some(file) = read_file_config(&config_dir)
         && let Some(codex) = file.codex
     {
@@ -428,14 +423,13 @@ pub fn codex_model() -> Option<String> {
 }
 
 pub fn auto_review_model() -> Option<String> {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env
-        .get("CCP_AUTO_REVIEW_MODEL")
+    if let Some(raw) = std::env::var("CCP_AUTO_REVIEW_MODEL")
+        .ok()
         .filter(|raw| !raw.is_empty())
     {
-        return Some(raw.clone());
+        return Some(raw);
     }
-    read_file_config(&paths::config_dir())
+    read_file_config(&config_dir())
         .and_then(|file| file.auto_review_model)
         .filter(|model| !model.is_empty())
 }
@@ -476,13 +470,12 @@ fn parse_codex_transport(raw: &str) -> Option<CodexTransport> {
 /// l'origine n'a refusé aucun upgrade ; l'espacement s'élargit alors tout seul. Un
 /// opérateur qui préfère un rythme garanti peut imposer un plancher.
 pub fn codex_websocket_connect_spacing() -> std::time::Duration {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env.get("CCP_CODEX_WS_CONNECT_SPACING_MS")
+    if let Ok(raw) = std::env::var("CCP_CODEX_WS_CONNECT_SPACING_MS")
         && let Ok(ms) = raw.trim().parse::<u64>()
     {
         return std::time::Duration::from_millis(ms);
     }
-    let config_dir = paths::config_dir();
+    let config_dir = config_dir();
     if let Some(file) = read_file_config(&config_dir)
         && let Some(codex) = file.codex
         && let Some(ms) = codex.websocket_connect_spacing_ms
@@ -493,13 +486,12 @@ pub fn codex_websocket_connect_spacing() -> std::time::Duration {
 }
 
 pub fn codex_transport() -> CodexTransport {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env.get("CCP_CODEX_TRANSPORT")
-        && let Some(transport) = parse_codex_transport(raw)
+    if let Ok(raw) = std::env::var("CCP_CODEX_TRANSPORT")
+        && let Some(transport) = parse_codex_transport(&raw)
     {
         return transport;
     }
-    let config_dir = paths::config_dir();
+    let config_dir = config_dir();
     if let Some(file) = read_file_config(&config_dir)
         && let Some(codex) = file.codex
         && let Some(transport) = codex.transport.as_deref().and_then(parse_codex_transport)
@@ -523,15 +515,14 @@ pub const CODEX_DEFAULT_HEADER_TIMEOUT_MS: u64 = 300_000;
 pub const CODEX_MIN_HEADER_TIMEOUT_MS: u64 = 1_000;
 
 pub fn codex_header_timeout_ms() -> u64 {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(ms) = env
-        .get("CCP_CODEX_HEADER_TIMEOUT_MS")
+    if let Some(ms) = std::env::var("CCP_CODEX_HEADER_TIMEOUT_MS")
+        .ok()
         .and_then(|raw| raw.trim().parse::<u64>().ok())
         .filter(|ms| *ms >= CODEX_MIN_HEADER_TIMEOUT_MS)
     {
         return ms;
     }
-    let config_dir = paths::config_dir();
+    let config_dir = config_dir();
     if let Some(file) = read_file_config(&config_dir)
         && let Some(codex) = file.codex
         && let Some(ms) = codex

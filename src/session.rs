@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 const SESSION_IDLE_TTL_MS: u64 = 30 * 60 * 1000;
 pub const MAX_SESSIONS: usize = 10_000;
@@ -12,8 +12,8 @@ pub struct SessionState {
 
 #[derive(Default)]
 struct SessionStore {
-    map: HashMap<String, SessionState>,
-    order: VecDeque<String>,
+    map: HashMap<Arc<str>, SessionState>,
+    order: VecDeque<Arc<str>>,
 }
 
 static SESSIONS: LazyLock<Mutex<SessionStore>> =
@@ -25,7 +25,7 @@ pub fn existing_session(session_id: Option<&str>, now: u64) -> Option<SessionSta
     let state = store.map.get(id).cloned()?;
     if now.saturating_sub(state.last_seen) > SESSION_IDLE_TTL_MS {
         store.map.remove(id);
-        store.order.retain(|item| item != id);
+        store.order.retain(|item| item.as_ref() != id);
         return None;
     }
     Some(state)
@@ -38,30 +38,28 @@ pub fn record_session_request(
 ) -> Option<SessionState> {
     let id = session_id?;
     let mut store = SESSIONS.lock().expect("session lock");
-    let stored = store
-        .map
-        .get(id)
-        .cloned()
-        .filter(|state| now.saturating_sub(state.last_seen) <= SESSION_IDLE_TTL_MS);
-    if stored.is_none() && store.map.remove(id).is_some() {
-        store.order.retain(|item| item != id);
+    if let Some(state) = store.map.get_mut(id)
+        && now.saturating_sub(state.last_seen) <= SESSION_IDLE_TTL_MS
+    {
+        state.seq += 1;
+        state.last_seen = now;
+        return Some(state.clone());
     }
-    let mut next = stored
-        .or_else(|| {
-            prior
-                .filter(|state| now.saturating_sub(state.last_seen) <= SESSION_IDLE_TTL_MS)
-                .cloned()
-        })
+    if store.map.remove(id).is_some() {
+        store.order.retain(|item| item.as_ref() != id);
+    }
+    let mut next = prior
+        .filter(|state| now.saturating_sub(state.last_seen) <= SESSION_IDLE_TTL_MS)
+        .cloned()
         .unwrap_or(SessionState {
             seq: 0,
             last_seen: now,
         });
     next.seq += 1;
     next.last_seen = now;
-    if !store.map.contains_key(id) {
-        store.order.push_back(id.to_string());
-    }
-    store.map.insert(id.to_string(), next.clone());
+    let id: Arc<str> = Arc::from(id);
+    store.order.push_back(Arc::clone(&id));
+    store.map.insert(id, next.clone());
 
     while store.order.len() > MAX_SESSIONS {
         if let Some(evict) = store.order.pop_front() {

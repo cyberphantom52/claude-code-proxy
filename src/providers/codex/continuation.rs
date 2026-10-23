@@ -17,7 +17,7 @@ struct ContinuationState {
     socket_id: u64,
     prompt_signature: String,
     transcript: Vec<ResponsesInputItem>,
-    transcript_bytes: u64,
+    retained_bytes: u64,
     updated_at: u64,
 }
 
@@ -31,7 +31,7 @@ struct OwnerState {
 #[derive(Default)]
 struct ContinuationRegistry {
     owners: HashMap<ConversationIdentity, OwnerState>,
-    total_transcript_bytes: u64,
+    total_retained_bytes: u64,
 }
 
 static REGISTRY: Mutex<Option<ContinuationRegistry>> = Mutex::new(None);
@@ -104,14 +104,38 @@ impl ContinuationReservation {
     }
 
     pub(crate) fn full_context_retry(&self) -> Self {
-        let mut candidate = self.candidate.clone();
-        candidate.previous_response_id = None;
-        candidate.input_delta = None;
-        candidate.disabled_reason = Some("full_context_retry".to_string());
+        let candidate = ContinuationCandidate {
+            turn_id: self.candidate.turn_id,
+            previous_response_id: None,
+            input_delta: None,
+            disabled_reason: Some("full_context_retry".to_string()),
+        };
         let mut retry = Self::new(candidate, self.owner.clone(), None);
         retry.provenance = self.provenance.clone();
         retry
     }
+}
+
+pub(super) fn prune_idle_state() {
+    let mut guard = REGISTRY.lock().unwrap();
+    let Some(registry) = guard.as_mut() else {
+        return;
+    };
+    let now = now_ms();
+    registry.owners.retain(|_, owner| {
+        // A pending turn is an invalidation guard, not expired history.
+        let expired = owner
+            .continuation
+            .as_ref()
+            .is_some_and(|state| now.saturating_sub(state.updated_at) > TTL_MS);
+        if expired && let Some(state) = &owner.continuation {
+            registry.total_retained_bytes = registry
+                .total_retained_bytes
+                .saturating_sub(state.retained_bytes);
+        }
+        !expired
+    });
+    registry.owners.shrink_to_fit();
 }
 
 fn now_ms() -> u64 {
@@ -182,9 +206,9 @@ fn continuation_candidate_inner(
             .is_some_and(|state| state.provenance != *provenance);
         let state = existing.and_then(|owner| owner.continuation);
         if let Some(state) = &state {
-            registry.total_transcript_bytes = registry
-                .total_transcript_bytes
-                .saturating_sub(state.transcript_bytes);
+            registry.total_retained_bytes = registry
+                .total_retained_bytes
+                .saturating_sub(state.retained_bytes);
         }
         registry.owners.insert(
             owner.clone(),
@@ -325,9 +349,11 @@ pub(crate) fn record_continuation_for_owner(
     let mut transcript: Vec<ResponsesInputItem> = request_body.input.clone();
     transcript.extend_from_slice(output_items);
 
-    let transcript_bytes = super::request_summary::serialized_json_bytes(&transcript);
+    let prompt_signature = prompt_signature(request_body);
+    let retained_bytes = super::request_summary::serialized_json_bytes(&transcript)
+        .saturating_add(prompt_signature.len() as u64);
 
-    if transcript_bytes > MAX_OWNER_TRANSCRIPT_BYTES {
+    if retained_bytes > MAX_OWNER_TRANSCRIPT_BYTES {
         abort_continuation_inner(Some(owner), Some(turn_id));
         return;
     }
@@ -335,9 +361,9 @@ pub(crate) fn record_continuation_for_owner(
     let state = ContinuationState {
         response_id,
         socket_id,
-        prompt_signature: prompt_signature(request_body),
+        prompt_signature,
         transcript,
-        transcript_bytes,
+        retained_bytes,
         updated_at: now_ms(),
     };
 
@@ -352,11 +378,11 @@ pub(crate) fn record_continuation_for_owner(
         return;
     }
     if let Some(existing) = owner_state.continuation.replace(state) {
-        registry.total_transcript_bytes = registry
-            .total_transcript_bytes
-            .saturating_sub(existing.transcript_bytes);
+        registry.total_retained_bytes = registry
+            .total_retained_bytes
+            .saturating_sub(existing.retained_bytes);
     }
-    registry.total_transcript_bytes += transcript_bytes;
+    registry.total_retained_bytes += retained_bytes;
     evict_oldest(registry);
 }
 
@@ -379,9 +405,9 @@ fn abort_continuation_inner(owner: Option<&ConversationIdentity>, turn_id: Optio
         && let Some(state) = registry.owners.remove(owner)
         && let Some(continuation) = state.continuation
     {
-        registry.total_transcript_bytes = registry
-            .total_transcript_bytes
-            .saturating_sub(continuation.transcript_bytes);
+        registry.total_retained_bytes = registry
+            .total_retained_bytes
+            .saturating_sub(continuation.retained_bytes);
     }
 }
 
@@ -454,15 +480,12 @@ fn input_items_equivalent(a: &ResponsesInputItem, b: &ResponsesInputItem) -> boo
                         (Ok(a_value), Ok(b_value)) if a_value == b_value
                     ))
         }
-        _ => {
-            serde_json::to_value(a).unwrap_or_default()
-                == serde_json::to_value(b).unwrap_or_default()
-        }
+        _ => a == b,
     }
 }
 
 fn prompt_signature(body: &ResponsesRequest) -> String {
-    let mut value = serde_json::to_value(body).unwrap_or_default();
+    let mut value = serde_json::to_value(body.with_input(())).unwrap_or_default();
     let Some(object) = value.as_object_mut() else {
         return String::new();
     };
@@ -473,7 +496,7 @@ fn prompt_signature(body: &ResponsesRequest) -> String {
 
 fn evict_oldest(registry: &mut ContinuationRegistry) {
     while registry.owners.len() > MAX_STATES
-        || registry.total_transcript_bytes > MAX_TOTAL_TRANSCRIPT_BYTES
+        || registry.total_retained_bytes > MAX_TOTAL_TRANSCRIPT_BYTES
     {
         let owner = registry
             .owners
@@ -486,9 +509,9 @@ fn evict_oldest(registry: &mut ContinuationRegistry) {
         if let Some(state) = registry.owners.remove(&owner)
             && let Some(continuation) = state.continuation
         {
-            registry.total_transcript_bytes = registry
-                .total_transcript_bytes
-                .saturating_sub(continuation.transcript_bytes);
+            registry.total_retained_bytes = registry
+                .total_retained_bytes
+                .saturating_sub(continuation.retained_bytes);
         }
     }
 }

@@ -134,15 +134,21 @@ pub fn parse_catalog(bytes: &[u8]) -> Option<Vec<CatalogModel>> {
     if bytes.len() > MAX_CATALOG_BYTES {
         return None;
     }
-    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
-    let entries = value.get("models")?.as_array()?;
+    let mut value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let serde_json::Value::Array(entries) = value.as_object_mut()?.remove("models")? else {
+        return None;
+    };
     if entries.len() > MAX_CATALOG_MODELS {
         return None;
     }
     let mut seen = HashSet::new();
     let mut models = Vec::new();
     for entry in entries {
-        let Ok(mut model) = serde_json::from_value::<CatalogModel>(entry.clone()) else {
+        let listed = entry
+            .get("visibility")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|visibility| visibility == "list");
+        let Ok(mut model) = serde_json::from_value::<CatalogModel>(entry) else {
             continue;
         };
         if model.slug.is_empty()
@@ -153,10 +159,7 @@ pub fn parse_catalog(bytes: &[u8]) -> Option<Vec<CatalogModel>> {
         {
             continue;
         }
-        model.listed = entry
-            .get("visibility")
-            .and_then(serde_json::Value::as_str)
-            .is_none_or(|visibility| visibility == "list");
+        model.listed = listed;
         models.push(model);
     }
     Some(models)
@@ -165,14 +168,55 @@ pub fn parse_catalog(bytes: &[u8]) -> Option<Vec<CatalogModel>> {
 #[derive(Default)]
 struct ImportCache {
     key: Option<(PathBuf, SystemTime, u64)>,
-    models: Vec<CatalogModel>,
+    snapshot: Option<Arc<CatalogSnapshot>>,
 }
 
 static IMPORT: OnceLock<Mutex<ImportCache>> = OnceLock::new();
 
-fn imported_models() -> Vec<CatalogModel> {
+fn builtin_snapshot() -> Arc<CatalogSnapshot> {
+    use super::model_allowlist::FALLBACK_MODELS;
+
+    static BUILTIN: OnceLock<Arc<CatalogSnapshot>> = OnceLock::new();
+    BUILTIN
+        .get_or_init(|| {
+            let models = FALLBACK_MODELS
+                .iter()
+                .map(|slug| {
+                    let lite = matches!(
+                        *slug,
+                        "gpt-5.6-luna"
+                            | "gpt-5.6-sol"
+                            | "gpt-5.6-terra"
+                            | "gpt-6-astra"
+                            | "gpt-6-luna"
+                            | "gpt-6-sol"
+                            | "gpt-6.1-sol"
+                    );
+                    // Context-only offline fallback, verified in OpenAI Codex models.json
+                    // at 61f34c35af77777db4d77d0ea2aeb8547a6b4523. Other capabilities
+                    // remain unknown until discovery; do not guess limits for older IDs.
+                    let known_context = lite || *slug == "gpt-5.5";
+                    CatalogModel {
+                        slug: (*slug).to_string(),
+                        use_responses_lite: Some(lite),
+                        context_window: known_context.then_some(272_000),
+                        max_context_window: known_context.then_some(if lite {
+                            872_000
+                        } else {
+                            272_000
+                        }),
+                        ..Default::default()
+                    }
+                })
+                .collect();
+            Arc::new(CatalogSnapshot::new(models, false))
+        })
+        .clone()
+}
+
+pub fn fallback_snapshot() -> Arc<CatalogSnapshot> {
     let Some(path) = catalog_path() else {
-        return Vec::new();
+        return builtin_snapshot();
     };
     let mut cache = IMPORT
         .get_or_init(Default::default)
@@ -183,13 +227,13 @@ fn imported_models() -> Vec<CatalogModel> {
         .and_then(|meta| Some((meta.modified().ok()?, meta.len())))
     else {
         return if cache.key.as_ref().is_some_and(|key| key.0 == path) {
-            cache.models.clone()
+            cache.snapshot.clone().unwrap_or_else(builtin_snapshot)
         } else {
-            Vec::new()
+            builtin_snapshot()
         };
     };
     if len > MAX_CATALOG_BYTES as u64 {
-        return Vec::new();
+        return builtin_snapshot();
     }
     let key = (path, modified, len);
     if cache.key.as_ref() != Some(&key) {
@@ -197,79 +241,56 @@ fn imported_models() -> Vec<CatalogModel> {
             .ok()
             .and_then(|bytes| parse_catalog(&bytes))
         {
-            Some(models) => {
-                cache.models = models;
+            Some(imported) => {
+                let mut models = builtin_snapshot().models.clone();
+                for mut imported in imported {
+                    if let Some(existing) =
+                        models.iter_mut().find(|model| model.slug == imported.slug)
+                    {
+                        imported.use_responses_lite =
+                            imported.use_responses_lite.or(existing.use_responses_lite);
+                        imported.context_window =
+                            imported.context_window.or(existing.context_window);
+                        imported.max_context_window =
+                            imported.max_context_window.or(existing.max_context_window);
+                        *existing = imported;
+                    } else {
+                        models.push(imported);
+                    }
+                }
+                cache.snapshot = Some(Arc::new(CatalogSnapshot::new(models, false)));
                 cache.key = Some(key);
             }
-            None if cache.key.as_ref().is_none_or(|old| old.0 != key.0) => return Vec::new(),
+            None if cache.key.as_ref().is_none_or(|old| old.0 != key.0) => {
+                return builtin_snapshot();
+            }
             None => {}
         }
     }
-    cache.models.clone()
+    cache.snapshot.clone().unwrap_or_else(builtin_snapshot)
 }
 
-pub fn fallback_snapshot() -> CatalogSnapshot {
-    use super::model_allowlist::FALLBACK_MODELS;
+pub fn catalog_models() -> Arc<CatalogSnapshot> {
+    scoped_catalog().unwrap_or_else(fallback_snapshot)
+}
 
-    let mut models: Vec<_> = FALLBACK_MODELS
-        .iter()
-        .map(|slug| {
-            let lite = matches!(
-                *slug,
-                "gpt-5.6-luna"
-                    | "gpt-5.6-sol"
-                    | "gpt-5.6-terra"
-                    | "gpt-6-astra"
-                    | "gpt-6-luna"
-                    | "gpt-6-sol"
-                    | "gpt-6.1-sol"
-            );
-            // Context-only offline fallback, verified in OpenAI Codex models.json
-            // at 61f34c35af77777db4d77d0ea2aeb8547a6b4523. Other capabilities
-            // remain unknown until discovery; do not guess limits for older IDs.
-            let known_context = lite || *slug == "gpt-5.5";
-            CatalogModel {
-                slug: (*slug).to_string(),
-                use_responses_lite: Some(lite),
-                context_window: known_context.then_some(272_000),
-                max_context_window: known_context.then_some(if lite { 872_000 } else { 272_000 }),
-                ..Default::default()
-            }
-        })
-        .collect();
-    for imported in imported_models() {
-        if let Some(existing) = models.iter_mut().find(|model| model.slug == imported.slug) {
-            let mut imported = imported;
-            imported.use_responses_lite =
-                imported.use_responses_lite.or(existing.use_responses_lite);
-            imported.context_window = imported.context_window.or(existing.context_window);
-            imported.max_context_window =
-                imported.max_context_window.or(existing.max_context_window);
-            *existing = imported;
-        } else {
-            models.push(imported);
-        }
+/// A model view that keeps its immutable catalog alive without copying metadata.
+#[derive(Debug, Clone)]
+pub struct CatalogModelRef {
+    catalog: Arc<CatalogSnapshot>,
+    index: usize,
+}
+
+impl std::ops::Deref for CatalogModelRef {
+    type Target = CatalogModel;
+
+    fn deref(&self) -> &Self::Target {
+        &self.catalog.models[self.index]
     }
-    CatalogSnapshot::new(models, false)
 }
 
-pub fn catalog_models() -> Vec<CatalogModel> {
-    scoped_catalog().map_or_else(
-        || fallback_snapshot().models,
-        |catalog| catalog.models.clone(),
-    )
-}
-
-pub fn catalog_model(slug: &str) -> Option<CatalogModel> {
-    match scoped_catalog() {
-        Some(catalog) => catalog
-            .models
-            .iter()
-            .find(|model| model.slug == slug)
-            .cloned(),
-        None => fallback_snapshot()
-            .models
-            .into_iter()
-            .find(|model| model.slug == slug),
-    }
+pub fn catalog_model(slug: &str) -> Option<CatalogModelRef> {
+    let catalog = catalog_models();
+    let index = catalog.models.iter().position(|model| model.slug == slug)?;
+    Some(CatalogModelRef { catalog, index })
 }

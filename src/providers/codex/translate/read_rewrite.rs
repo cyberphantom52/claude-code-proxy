@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{LazyLock, Mutex};
 
@@ -31,25 +32,32 @@ pub fn sanitize_read_args(name: &str, args: &str, call_id: Option<&str>) -> Stri
         Ok(v) => v,
         Err(_) => return args.to_string(),
     };
-    let Value::Object(mut sanitized) = parsed else {
-        return args.to_string();
-    };
-    let mut changed = false;
+    sanitize_parsed_read_args(name, args, Cow::Owned(parsed), call_id).into_owned()
+}
 
-    let has_empty_pages = sanitized
-        .get("pages")
-        .and_then(|v| v.as_str())
-        .is_some_and(|s| s.is_empty());
+pub(crate) fn sanitize_parsed_read_args<'a>(
+    name: &str,
+    args: &'a str,
+    mut parsed: Cow<'_, Value>,
+    call_id: Option<&str>,
+) -> Cow<'a, str> {
+    let has_empty_pages = parsed.get("pages").and_then(Value::as_str) == Some("");
+    let offset = parsed
+        .get("offset")
+        .and_then(Value::as_i64)
+        .filter(|offset| *offset >= READ_OFFSET_REWRITE_THRESHOLD);
+    if name != "Read" || !(has_empty_pages || offset.is_some()) {
+        return Cow::Borrowed(args);
+    }
+    let Value::Object(sanitized) = parsed.to_mut() else {
+        return Cow::Borrowed(args);
+    };
     if has_empty_pages {
         sanitized.remove("pages");
-        changed = true;
     }
 
-    if let Some(offset) = sanitized.get("offset").and_then(Value::as_i64)
-        && offset >= READ_OFFSET_REWRITE_THRESHOLD
-    {
+    if let Some(offset) = offset {
         sanitized.remove("offset");
-        changed = true;
         if let Some(call_id) = call_id.filter(|id| !id.is_empty()) {
             record_read_offset_rewrite(
                 call_id,
@@ -64,11 +72,7 @@ pub fn sanitize_read_args(name: &str, args: &str, call_id: Option<&str>) -> Stri
         }
     }
 
-    if changed {
-        serde_json::to_string(&sanitized).unwrap_or_else(|_| args.to_string())
-    } else {
-        args.to_string()
-    }
+    Cow::Owned(serde_json::to_string(sanitized).unwrap_or_else(|_| args.to_string()))
 }
 
 pub(crate) fn repair_whitespace_stalled_read_args(
@@ -95,11 +99,8 @@ fn parse_read_args_candidate(args: &str, call_id: Option<&str>) -> Option<String
     if !is_valid_read_args(&parsed) {
         return None;
     }
-    Some(sanitize_read_args(
-        "Read",
-        &serde_json::to_string(&parsed).ok()?,
-        call_id,
-    ))
+    let args = serde_json::to_string(&parsed).ok()?;
+    Some(sanitize_parsed_read_args("Read", &args, Cow::Owned(parsed), call_id).into_owned())
 }
 
 fn is_valid_read_args(value: &Value) -> bool {

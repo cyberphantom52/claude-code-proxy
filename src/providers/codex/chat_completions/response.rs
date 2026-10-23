@@ -1,7 +1,8 @@
 use http::StatusCode;
 use serde_json::{Value, json};
 
-use crate::anthropic::sse::parse_sse_events;
+use crate::anthropic::sse::sse_events;
+use crate::provider::RequestContext;
 use crate::providers::codex::events::classify_event_failure;
 
 use super::ChatError;
@@ -15,7 +16,11 @@ pub struct Usage {
 
 impl Usage {
     pub fn value(&self) -> Value {
-        let mut value = Value::Object(self.details.clone());
+        self.clone().into_value()
+    }
+
+    fn into_value(self) -> Value {
+        let mut value = Value::Object(self.details);
         value["prompt_tokens"] = json!(self.prompt_tokens);
         value["completion_tokens"] = json!(self.completion_tokens);
         if value.get("total_tokens").is_none() {
@@ -31,7 +36,8 @@ pub struct CompletionState {
     pub id: String,
     pub created: u64,
     pub model: String,
-    pub text: String,
+    text: Option<String>,
+    pub output_bytes: usize,
     pub usage: Usage,
     pub completed: bool,
     pub service_tier: Option<String>,
@@ -39,12 +45,13 @@ pub struct CompletionState {
 }
 
 impl CompletionState {
-    pub fn new(model: &str) -> Self {
+    pub fn new(model: &str, retain_text: bool) -> Self {
         Self {
             id: format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()),
             created: unix_seconds(),
             model: model.to_string(),
-            text: String::new(),
+            text: retain_text.then(String::new),
+            output_bytes: 0,
             usage: Usage::default(),
             completed: false,
             service_tier: None,
@@ -79,14 +86,16 @@ impl CompletionState {
                 let delta = event.get("delta").and_then(Value::as_str).ok_or_else(|| {
                     ChatError::upstream("Codex output-text delta did not contain text")
                 })?;
-                if self.text.len().saturating_add(delta.len())
-                    > crate::traffic::MAX_SSE_CAPTURE_BYTES
-                {
+                let output_bytes = self.output_bytes.saturating_add(delta.len());
+                if output_bytes > crate::traffic::MAX_SSE_CAPTURE_BYTES {
                     return Err(ChatError::upstream(
                         "Codex output text exceeded the response byte limit",
                     ));
                 }
-                self.text.push_str(delta);
+                self.output_bytes = output_bytes;
+                if let Some(text) = self.text.as_mut() {
+                    text.push_str(delta);
+                }
                 return Ok(Some(delta));
             }
             Some("response.completed" | "response.done") => {
@@ -149,54 +158,80 @@ impl CompletionState {
     }
 }
 
-pub fn aggregate_sse(body: &[u8], requested_model: &str) -> Result<Value, ChatError> {
+pub fn aggregate_sse(
+    body: &[u8],
+    requested_model: &str,
+    ctx: &RequestContext,
+    read_result: Result<(), ChatError>,
+) -> Result<Value, ChatError> {
     if body.len() > crate::traffic::MAX_SSE_CAPTURE_BYTES {
         return Err(ChatError::upstream(
             "Codex response exceeded the response byte limit",
         ));
     }
-    let events = parse_sse_events(body);
-    if events.is_empty() {
-        return Err(ChatError::upstream(
-            "Codex returned an empty or malformed event stream",
-        ));
-    }
-    let mut state = CompletionState::new(requested_model);
-    for event in events {
+    let text = String::from_utf8_lossy(body);
+    let mut saw_event = false;
+    let mut error = None;
+    let mut state = CompletionState::new(requested_model, read_result.is_ok());
+    for event in sse_events(&text) {
+        saw_event = true;
         if event.data == "[DONE]" {
             continue;
         }
-        let value: Value = serde_json::from_str(&event.data).map_err(|_| {
-            ChatError::upstream("Codex returned malformed JSON in its event stream")
-        })?;
-        state.observe(&value)?;
+        match serde_json::from_str::<Value>(&event.data) {
+            Ok(value) => {
+                // Telemetry previously traversed the entire collected body before
+                // aggregation, including valid terminal usage after any error.
+                super::super::record_upstream_telemetry(ctx, &value);
+                if read_result.is_ok() && error.is_none() {
+                    error = state.observe(&value).err();
+                }
+            }
+            Err(_) if error.is_none() => {
+                error = Some(ChatError::upstream(
+                    "Codex returned malformed JSON in its event stream",
+                ));
+            }
+            Err(_) => {}
+        }
+    }
+    read_result?;
+    if let Some(error) = error {
+        return Err(error);
+    }
+    if !saw_event {
+        return Err(ChatError::upstream(
+            "Codex returned an empty or malformed event stream",
+        ));
     }
     if !state.completed {
         return Err(ChatError::upstream(
             "Codex event stream ended before completion",
         ));
     }
-    if state.text.is_empty() {
+    if state.output_bytes == 0 {
         return Err(ChatError::upstream("Codex completed without output text"));
     }
-    Ok(completion_value(&state))
+    Ok(completion_value(state))
 }
 
-pub fn completion_value(state: &CompletionState) -> Value {
+pub fn completion_value(state: CompletionState) -> Value {
     let mut value = json!({
-        "id": state.id,
         "object": "chat.completion",
         "created": state.created,
-        "model": state.model,
         "choices": [{
             "index": 0,
-            "message": {"role":"assistant", "content":state.text},
+            "message": {"role":"assistant"},
             "finish_reason": "stop",
         }],
-        "usage": state.usage.value(),
     });
-    if let Some(tier) = &state.service_tier {
-        value["service_tier"] = json!(tier);
+    value["id"] = Value::String(state.id);
+    value["model"] = Value::String(state.model);
+    value["choices"][0]["message"]["content"] =
+        Value::String(state.text.expect("buffered completion retains text"));
+    value["usage"] = state.usage.into_value();
+    if let Some(tier) = state.service_tier {
+        value["service_tier"] = Value::String(tier);
     }
     value
 }

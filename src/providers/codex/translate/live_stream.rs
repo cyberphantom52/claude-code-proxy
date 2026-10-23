@@ -1,11 +1,12 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 
-use crate::anthropic::sse::encode_sse_event;
+use crate::anthropic::sse::append_json_sse_event;
 use crate::providers::codex::client::MAX_PENDING_HTTP_EVENT_BYTES;
 use crate::providers::codex::events::classify_event_failure;
 use crate::traffic::TrafficCapture;
 
-use super::read_rewrite::{repair_whitespace_stalled_read_args, sanitize_read_args};
+use super::read_rewrite::{repair_whitespace_stalled_read_args, sanitize_parsed_read_args};
 use super::reasoning_signature::{PendingReasoning, encode_reasoning_signature};
 use super::reducer::{
     CodexRateLimits, CodexUsage, STOP_END_TURN, STOP_TOOL_USE, map_codex_usage_to_anthropic,
@@ -16,10 +17,22 @@ use super::web_search_compat::web_search_query;
 pub(crate) const BUFFERED_TOOL_MAX_ARGS_BYTES: usize = 5_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CompletedFunctionCall {
-    pub call_id: String,
-    pub name: String,
-    pub arguments: String,
+pub(crate) struct CompletedFunctionCall<'a> {
+    pub call_id: &'a str,
+    pub name: &'a str,
+    pub arguments: Cow<'a, str>,
+    pub parsed_arguments: serde_json::Value,
+}
+
+impl CompletedFunctionCall<'_> {
+    pub(crate) fn sanitized_arguments(&self, call_id: Option<&str>) -> Cow<'_, str> {
+        sanitize_parsed_read_args(
+            self.name,
+            &self.arguments,
+            Cow::Borrowed(&self.parsed_arguments),
+            call_id,
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,67 +57,66 @@ impl std::fmt::Display for CompletedFunctionCallValidationError {
 
 pub(crate) fn validate_completed_function_call(
     item: &serde_json::Value,
-) -> Result<CompletedFunctionCall, CompletedFunctionCallValidationError> {
-    let call_id = item
-        .get("call_id")
-        .and_then(serde_json::Value::as_str)
+) -> Result<CompletedFunctionCall<'_>, CompletedFunctionCallValidationError> {
+    validate_completed_function_call_fields(
+        item.get("call_id").and_then(serde_json::Value::as_str),
+        item.get("name").and_then(serde_json::Value::as_str),
+        item.get("arguments").and_then(serde_json::Value::as_str),
+    )
+}
+
+pub(crate) fn validate_completed_function_call_fields<'a>(
+    call_id: Option<&'a str>,
+    name: Option<&'a str>,
+    arguments: Option<&'a str>,
+) -> Result<CompletedFunctionCall<'a>, CompletedFunctionCallValidationError> {
+    let call_id = call_id
         .filter(|call_id| !call_id.trim().is_empty())
         .ok_or_else(|| {
             CompletedFunctionCallValidationError::Protocol(
                 "completed function call is missing call_id".to_string(),
             )
         })?;
-    let name = item
-        .get("name")
-        .and_then(serde_json::Value::as_str)
-        .filter(|name| !name.trim().is_empty())
-        .ok_or_else(|| {
-            CompletedFunctionCallValidationError::Protocol(
-                "completed function call is missing name".to_string(),
-            )
-        })?;
-    let arguments = item
-        .get("arguments")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            CompletedFunctionCallValidationError::Protocol(
-                "completed function call is missing string arguments".to_string(),
-            )
-        })?;
-
+    let name = name.filter(|name| !name.trim().is_empty()).ok_or_else(|| {
+        CompletedFunctionCallValidationError::Protocol(
+            "completed function call is missing name".to_string(),
+        )
+    })?;
+    let arguments = arguments.ok_or_else(|| {
+        CompletedFunctionCallValidationError::Protocol(
+            "completed function call is missing string arguments".to_string(),
+        )
+    })?;
     if arguments.len() > BUFFERED_TOOL_MAX_ARGS_BYTES {
         return Err(CompletedFunctionCallValidationError::TooLarge {
             tool: name.to_string(),
         });
     }
-    if arguments.trim().is_empty() {
-        return Ok(CompletedFunctionCall {
-            call_id: call_id.to_string(),
-            name: name.to_string(),
-            arguments: "{}".to_string(),
-        });
-    }
-
-    let value = serde_json::from_str::<serde_json::Value>(arguments).map_err(|_| {
+    let arguments = if arguments.trim().is_empty() {
+        "{}"
+    } else {
+        arguments
+    };
+    let parsed_arguments = serde_json::from_str::<serde_json::Value>(arguments).map_err(|_| {
         CompletedFunctionCallValidationError::Protocol(
             "completed function call arguments are not valid JSON".to_string(),
         )
     })?;
-    if !value.is_object() {
+    if !parsed_arguments.is_object() {
         return Err(CompletedFunctionCallValidationError::Protocol(
             "completed function call arguments must be a JSON object".to_string(),
         ));
     }
-
     Ok(CompletedFunctionCall {
-        call_id: call_id.to_string(),
-        name: name.to_string(),
-        arguments: arguments.to_string(),
+        call_id,
+        name,
+        arguments: Cow::Borrowed(arguments),
+        parsed_arguments,
     })
 }
 
 pub(crate) fn validate_streamed_function_call(
-    completed: &CompletedFunctionCall,
+    completed: &CompletedFunctionCall<'_>,
     call_id: &str,
     name: &str,
     arguments: &str,
@@ -127,28 +139,33 @@ pub(crate) fn validate_streamed_function_call(
             "streamed function call arguments are not valid JSON".to_string(),
         ));
     }
+    if arguments == completed.arguments.as_ref() {
+        return Ok(());
+    }
     // Read is buffered: repair only at authoritative finalization, never close
     // the turn from a delta or hide a later upstream failure/usage event.
-    let streamed = validate_completed_function_call(&serde_json::json!({
-        "call_id": call_id,
-        "name": name,
-        "arguments": arguments,
-    }));
-    let (streamed_arguments, final_arguments) = match streamed {
-        Ok(streamed) => (streamed.arguments, completed.arguments.clone()),
+    match validate_completed_function_call_fields(Some(call_id), Some(name), Some(arguments)) {
+        Ok(streamed) => {
+            if streamed.parsed_arguments != completed.parsed_arguments {
+                return Err(disagreement());
+            }
+        }
         Err(error @ CompletedFunctionCallValidationError::TooLarge { .. }) => return Err(error),
-        Err(error) => match repair_whitespace_stalled_read_args(name, arguments, None) {
-            Some(repaired) => (
-                repaired,
-                sanitize_read_args(name, &completed.arguments, None),
-            ),
-            None => return Err(error),
-        },
-    };
-    if serde_json::from_str::<serde_json::Value>(&streamed_arguments).ok()
-        != serde_json::from_str::<serde_json::Value>(&final_arguments).ok()
-    {
-        return Err(disagreement());
+        Err(error) => {
+            let Some(repaired) = repair_whitespace_stalled_read_args(name, arguments, None) else {
+                return Err(error);
+            };
+            let final_arguments = completed.sanitized_arguments(None);
+            let repaired = serde_json::from_str::<serde_json::Value>(&repaired).ok();
+            let rewritten = match final_arguments {
+                Cow::Owned(arguments) => serde_json::from_str::<serde_json::Value>(&arguments).ok(),
+                Cow::Borrowed(_) => None,
+            };
+            let final_value = rewritten.as_ref().or(Some(&completed.parsed_arguments));
+            if repaired.as_ref() != final_value {
+                return Err(disagreement());
+            }
+        }
     }
     Ok(())
 }
@@ -463,7 +480,7 @@ impl LiveStreamTranslator {
                 }),
             );
         }
-        out.extend_from_slice(&encode_sse_event(Some(event), &data.to_string()));
+        append_json_sse_event(out, event, data);
     }
 
     fn output_item_added(
@@ -521,22 +538,14 @@ impl LiveStreamTranslator {
                 self.saw_tool_use = true;
                 let index = self.anthropic_index;
                 self.anthropic_index += 1;
-                let call_id = item
-                    .get("call_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let name = item
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
+                let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
+                let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 self.blocks_by_output_index.insert(
                     output_index,
                     LiveBlock::Tool {
                         index,
-                        call_id: call_id.clone(),
-                        name: name.clone(),
+                        call_id: call_id.to_owned(),
+                        name: name.to_owned(),
                         args_accum: String::new(),
                         emitted_args: false,
                     },
@@ -767,16 +776,16 @@ impl LiveStreamTranslator {
         else {
             return Ok(());
         };
-        let completed = validate_completed_function_call(&serde_json::json!({
-            "call_id": call_id,
-            "name": name,
-            "arguments": payload.get("arguments"),
-        }))
+        let completed = validate_completed_function_call_fields(
+            Some(call_id),
+            Some(name),
+            payload.get("arguments").and_then(serde_json::Value::as_str),
+        )
         .map_err(|error| error.to_string())?;
         validate_streamed_function_call(&completed, call_id, name, args_accum)
             .map_err(|error| error.to_string())?;
         if args_accum.is_empty() {
-            *args_accum = completed.arguments;
+            *args_accum = completed.arguments.into_owned();
         }
         Ok(())
     }
@@ -863,18 +872,18 @@ impl LiveStreamTranslator {
             validate_streamed_function_call(completed, call_id, name, args_accum)
                 .map_err(|error| error.to_string())?;
         }
-        let Some(mut state) = self.blocks_by_output_index.remove(&output_index) else {
+        let Some(state) = self.blocks_by_output_index.remove(&output_index) else {
             return Ok(());
         };
 
-        match &mut state {
+        match state {
             LiveBlock::Text {
                 index,
                 text,
                 deferred,
             } => {
-                if *deferred {
-                    self.deferred_text.push((*index, std::mem::take(text)));
+                if deferred {
+                    self.deferred_text.push((index, text));
                 } else {
                     self.emit(
                         traffic,
@@ -889,9 +898,7 @@ impl LiveStreamTranslator {
             }
             LiveBlock::Tool {
                 index,
-                name,
                 call_id,
-                args_accum,
                 emitted_args,
                 ..
             } => {
@@ -900,9 +907,8 @@ impl LiveStreamTranslator {
                     .expect("validated tool completion");
                 self.semantic_output_started = true;
                 self.current_generation_semantic_output_started = true;
-                if !*emitted_args {
-                    *args_accum =
-                        sanitize_read_args(name, &completed.arguments, Some(call_id.as_str()));
+                if !emitted_args {
+                    let arguments = completed.sanitized_arguments(Some(call_id.as_str()));
                     self.emit(
                         traffic,
                         out,
@@ -910,7 +916,7 @@ impl LiveStreamTranslator {
                         &serde_json::json!({
                             "type": "content_block_delta",
                             "index": index,
-                            "delta": {"type": "input_json_delta", "partial_json": args_accum}
+                            "delta": {"type": "input_json_delta", "partial_json": arguments}
                         }),
                     );
                 }
@@ -930,15 +936,11 @@ impl LiveStreamTranslator {
 
     fn emit_completed_function_call(
         &mut self,
-        completed: &CompletedFunctionCall,
+        completed: &CompletedFunctionCall<'_>,
         traffic: Option<&TrafficCapture>,
         out: &mut Vec<u8>,
     ) {
-        let arguments = sanitize_read_args(
-            &completed.name,
-            &completed.arguments,
-            Some(&completed.call_id),
-        );
+        let arguments = completed.sanitized_arguments(Some(completed.call_id));
 
         self.close_thinking(traffic, out);
         self.saw_tool_use = true;
@@ -1168,7 +1170,7 @@ impl LiveStreamTranslator {
         let mut usage = payload.get("response").map(parse_codex_usage);
         if let Some(usage) = usage.as_mut() {
             usage.service_tier = usage.service_tier.take().or(self.service_tier.take());
-            usage.rate_limits = self.rate_limits.clone();
+            usage.rate_limits = self.rate_limits.take();
         }
         let stop_reason = if self.saw_tool_use {
             STOP_TOOL_USE

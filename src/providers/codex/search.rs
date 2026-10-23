@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
@@ -332,64 +333,83 @@ fn extract_search_query(req: &MessagesRequest) -> Option<String> {
 }
 
 fn search_input(req: &MessagesRequest) -> Option<Value> {
-    let mut messages: Vec<(&str, String)> = req
+    let latest_user = req
         .messages
         .iter()
-        .filter(|message| matches!(message.role.as_str(), "user" | "assistant"))
-        .filter_map(|message| {
-            let text = content_text(&message.content);
-            (!text.is_empty()).then_some((message.role.as_str(), text))
-        })
-        .collect();
-    let latest_user = messages.iter().rposition(|(role, _)| *role == "user")?;
-    messages.truncate(latest_user + 1);
-    let first_user = messages
+        .rposition(|message| message.role == "user" && has_content_text(&message.content))?;
+    let first_user = req.messages[..=latest_user]
         .iter()
         .enumerate()
         .rev()
-        .filter(|(_, (role, _))| *role == "user")
+        .filter(|(_, message)| message.role == "user" && has_content_text(&message.content))
         .take(SEARCH_USER_CONTEXT_MESSAGES)
         .last()
         .map(|(index, _)| index)
         .unwrap_or(latest_user);
-    messages.drain(..first_user);
 
     let mut assistant_budget = SEARCH_ASSISTANT_CONTEXT_TOKEN_BUDGET;
-    let items: Vec<Value> = messages
-        .into_iter()
-        .filter_map(|(role, text)| {
+    let items: Vec<Value> = req.messages[first_user..=latest_user]
+        .iter()
+        .filter(|message| matches!(message.role.as_str(), "user" | "assistant"))
+        .filter_map(|message| {
+            let role = message.role.as_str();
+            if role == "assistant" && assistant_budget == 0 {
+                return None;
+            }
+            let text = content_text(&message.content);
+            if text.is_empty() {
+                return None;
+            }
             let (content_type, text) = if role == "assistant" {
-                if assistant_budget == 0 {
-                    return None;
-                }
-                let text = truncate_to_token_budget(&text, assistant_budget);
+                let text = truncate_to_token_budget(text, assistant_budget);
                 assistant_budget = assistant_budget.saturating_sub(approx_token_count(&text));
                 ("output_text", text)
             } else {
                 ("input_text", text)
             };
             (!text.is_empty()).then(|| {
-                json!({
+                let mut item = json!({
                     "type": "message",
                     "role": role,
-                    "content": [{"type": content_type, "text": text}]
-                })
+                    "content": [{"type": content_type, "text": null}]
+                });
+                item["content"][0]["text"] = Value::String(text.into_owned());
+                item
             })
         })
         .collect();
     (!items.is_empty()).then_some(Value::Array(items))
 }
 
-fn content_text(content: &Value) -> String {
+fn has_content_text(content: &Value) -> bool {
     match content {
-        Value::String(text) => text.clone(),
-        Value::Array(blocks) => blocks
-            .iter()
-            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
-            .filter_map(|block| block.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => String::new(),
+        Value::String(text) => !text.is_empty(),
+        Value::Array(blocks) => {
+            let mut texts = blocks
+                .iter()
+                .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|block| block.get("text").and_then(Value::as_str));
+            // Even two empty text blocks join to a nonempty newline.
+            texts
+                .next()
+                .is_some_and(|first| !first.is_empty() || texts.next().is_some())
+        }
+        _ => false,
+    }
+}
+
+fn content_text(content: &Value) -> Cow<'_, str> {
+    match content {
+        Value::String(text) => Cow::Borrowed(text),
+        Value::Array(blocks) => Cow::Owned(
+            blocks
+                .iter()
+                .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        _ => Cow::Borrowed(""),
     }
 }
 

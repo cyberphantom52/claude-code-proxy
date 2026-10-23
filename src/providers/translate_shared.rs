@@ -1,36 +1,37 @@
+use std::borrow::Cow;
+
 use serde_json::Value;
 
 use crate::anthropic::schema::MessagesRequest;
 
 #[derive(Debug)]
-pub enum ContentBlock {
+pub enum ContentBlock<'a> {
     Text {
-        text: String,
+        text: &'a str,
     },
     Image {
-        source: ImageSource,
+        source: ImageSource<'a>,
     },
     ToolUse {
-        id: String,
-        name: String,
-        input: Value,
+        id: &'a str,
+        name: &'a str,
+        input: &'a Value,
     },
     ToolResult {
-        tool_use_id: String,
-        content: Value,
+        tool_use_id: &'a str,
+        content: Cow<'a, Value>,
         is_error: Option<bool>,
     },
     Thinking {
-        thinking: String,
-        signature: Option<String>,
+        signature: Option<&'a str>,
     },
 }
 
 #[derive(Debug)]
-pub struct ImageSource {
-    pub media_type: String,
-    pub data: String,
-    pub source_type: String,
+pub struct ImageSource<'a> {
+    pub media_type: &'a str,
+    pub data: &'a str,
+    pub source_type: &'a str,
 }
 
 pub fn flatten_system_text(system_val: Option<&Value>) -> Option<String> {
@@ -66,9 +67,9 @@ pub fn parallel_tool_calls(req: &MessagesRequest) -> Option<bool> {
         .map(|disabled| !disabled)
 }
 
-pub fn normalize_content(content: &Value) -> anyhow::Result<Vec<ContentBlock>> {
+pub fn normalize_content(content: &Value) -> anyhow::Result<Vec<ContentBlock<'_>>> {
     match content {
-        Value::String(s) => Ok(vec![ContentBlock::Text { text: s.clone() }]),
+        Value::String(s) => Ok(vec![ContentBlock::Text { text: s }]),
         Value::Array(arr) => arr
             .iter()
             .enumerate()
@@ -81,9 +82,9 @@ pub fn normalize_content(content: &Value) -> anyhow::Result<Vec<ContentBlock>> {
     }
 }
 
-pub fn image_source_to_url(source: &ImageSource) -> String {
+pub fn image_source_to_url(source: &ImageSource<'_>) -> String {
     if source.source_type == "url" {
-        source.data.clone()
+        source.data.to_string()
     } else {
         format!("data:{};base64,{}", source.media_type, source.data)
     }
@@ -96,12 +97,12 @@ fn string_field<'a>(value: &'a Value, field: &str) -> anyhow::Result<&'a str> {
         .ok_or_else(|| anyhow::anyhow!("{field} must be a string"))
 }
 
-fn parse_content_block(value: &Value) -> anyhow::Result<ContentBlock> {
+fn parse_content_block(value: &Value) -> anyhow::Result<ContentBlock<'_>> {
     let kind = string_field(value, "type")?;
-    let parsed = || -> anyhow::Result<ContentBlock> {
+    let parsed = || -> anyhow::Result<ContentBlock<'_>> {
         Ok(match kind {
             "text" => ContentBlock::Text {
-                text: string_field(value, "text")?.to_string(),
+                text: string_field(value, "text")?,
             },
             "image" => {
                 let source = value
@@ -110,9 +111,9 @@ fn parse_content_block(value: &Value) -> anyhow::Result<ContentBlock> {
                     .ok_or_else(|| anyhow::anyhow!("source must be an object"))?;
                 let source_type = string_field(source, "type")?;
                 let (media_type, data) = match source_type {
-                    "url" => (String::new(), string_field(source, "url")?),
+                    "url" => ("", string_field(source, "url")?),
                     "base64" => (
-                        string_field(source, "media_type")?.to_string(),
+                        string_field(source, "media_type")?,
                         string_field(source, "data")?,
                     ),
                     _ => anyhow::bail!("unsupported image source type '{source_type}'"),
@@ -125,14 +126,14 @@ fn parse_content_block(value: &Value) -> anyhow::Result<ContentBlock> {
                 ContentBlock::Image {
                     source: ImageSource {
                         media_type,
-                        data: data.to_string(),
-                        source_type: source_type.to_string(),
+                        data,
+                        source_type,
                     },
                 }
             }
             "tool_use" => {
-                let id = string_field(value, "id")?.to_string();
-                let name = string_field(value, "name")?.to_string();
+                let id = string_field(value, "id")?;
+                let name = string_field(value, "name")?;
                 anyhow::ensure!(
                     !id.is_empty() && !name.is_empty(),
                     "id and name must not be empty"
@@ -140,16 +141,16 @@ fn parse_content_block(value: &Value) -> anyhow::Result<ContentBlock> {
                 ContentBlock::ToolUse {
                     id,
                     name,
-                    input: value.get("input").cloned().unwrap_or(Value::Null),
+                    input: value.get("input").unwrap_or(&Value::Null),
                 }
             }
             "tool_result" => {
-                let tool_use_id = string_field(value, "tool_use_id")?.to_string();
+                let tool_use_id = string_field(value, "tool_use_id")?;
                 anyhow::ensure!(!tool_use_id.is_empty(), "tool_use_id must not be empty");
                 let content = value
                     .get("content")
-                    .cloned()
-                    .unwrap_or(Value::String(String::new()));
+                    .map(Cow::Borrowed)
+                    .unwrap_or_else(|| Cow::Owned(Value::String(String::new())));
                 // Nested blocks keep the renderer's explicit placeholders and client
                 // extensions (tool_reference); only an invalid container was silent loss.
                 anyhow::ensure!(
@@ -170,13 +171,11 @@ fn parse_content_block(value: &Value) -> anyhow::Result<ContentBlock> {
             "thinking" => {
                 let signature = match value.get("signature") {
                     None | Some(Value::Null) => None,
-                    Some(Value::String(signature)) => Some(signature.clone()),
+                    Some(Value::String(signature)) => Some(signature.as_str()),
                     Some(_) => anyhow::bail!("signature must be a string"),
                 };
-                ContentBlock::Thinking {
-                    thinking: string_field(value, "thinking")?.to_string(),
-                    signature,
-                }
+                string_field(value, "thinking")?;
+                ContentBlock::Thinking { signature }
             }
             _ => anyhow::bail!("unsupported content block type '{kind}'"),
         })

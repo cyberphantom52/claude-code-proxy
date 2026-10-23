@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use http::StatusCode;
@@ -47,7 +49,7 @@ pub struct PreparedTranscription {
 #[derive(Debug, Deserialize)]
 struct TranscriptionResponse<'a> {
     #[serde(borrow)]
-    text: &'a str,
+    text: Cow<'a, str>,
 }
 
 pub struct CodexTranscriptionBackend {

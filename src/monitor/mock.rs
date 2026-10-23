@@ -438,9 +438,12 @@ fn advance_output_buckets(
             );
         }
     }
-    for samples in buckets.values_mut() {
+    let first_bucket = super::first_session_output_bucket(now);
+    buckets.retain(|_, samples| {
+        samples.retain(|(bucket, _)| *bucket >= first_bucket);
         samples.sort_by_key(|(bucket, _)| *bucket);
-    }
+        !samples.is_empty()
+    });
 }
 
 fn record_output_bucket(

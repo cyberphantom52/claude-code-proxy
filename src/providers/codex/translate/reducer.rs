@@ -1,11 +1,11 @@
-use crate::anthropic::sse::parse_sse_events;
+use crate::anthropic::sse::sse_events;
 use crate::providers::codex::events::{CodexFailureKind, classify_event_failure};
 
 use super::live_stream::{
     BUFFERED_TOOL_MAX_ARGS_BYTES, CompletedFunctionCallValidationError,
-    validate_completed_function_call, validate_streamed_function_call,
+    validate_completed_function_call, validate_completed_function_call_fields,
+    validate_streamed_function_call,
 };
-use super::read_rewrite::sanitize_read_args;
 use super::reasoning_signature::{PendingReasoning, ReasoningReplay, encode_reasoning_signature};
 use super::request::ResponsesInputItem;
 use super::web_search_compat::{server_tool_use_id_from_codex_web_search_id, web_search_query};
@@ -291,7 +291,7 @@ pub fn finish_metadata_from_upstream(
 }
 
 pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, UpstreamStreamError> {
-    let sse_events = parse_sse_events(input);
+    let text = String::from_utf8_lossy(input);
     let mut out = Vec::new();
 
     let mut blocks_by_output_index: std::collections::HashMap<usize, BlockState> =
@@ -318,7 +318,7 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
 
     fn capture_output_item(
         output_index: usize,
-        state: &BlockState,
+        state: BlockState,
         items: &mut std::collections::BTreeMap<usize, ResponsesInputItem>,
     ) {
         match state {
@@ -334,7 +334,7 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                     ResponsesInputItem::Message {
                         role: "assistant".to_string(),
                         content: vec![super::request::ResponsesContentPart::OutputText {
-                            text: text_accum.clone(),
+                            text: text_accum,
                         }],
                     },
                 );
@@ -348,16 +348,16 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                 items.insert(
                     output_index,
                     ResponsesInputItem::FunctionCall {
-                        call_id: call_id.clone(),
-                        name: name.clone(),
-                        arguments: args_accum.clone(),
+                        call_id,
+                        name,
+                        arguments: args_accum,
                     },
                 );
             }
         }
     }
 
-    for evt in &sse_events {
+    for evt in sse_events(&text) {
         let data = evt.data.trim();
         if data.is_empty() {
             continue;
@@ -368,13 +368,9 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
             Err(_) => continue,
         };
 
-        let t = p
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+        let t = p.get("type").and_then(|v| v.as_str()).unwrap_or("");
         event_count += 1;
-        last_event_type = Some(t.clone());
+        last_event_type = Some(t.to_owned());
 
         // A trailing billing/keepalive ping carries no model output. All other
         // JSON events after a terminal remain invalid.
@@ -652,14 +648,14 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                 ..
             }) = blocks_by_output_index.get_mut(&output_index)
             {
-                let completed = validate_completed_function_call(&serde_json::json!({
-                    "call_id": call_id,
-                    "name": name,
-                    "arguments": p.get("arguments"),
-                }))?;
+                let completed = validate_completed_function_call_fields(
+                    Some(call_id),
+                    Some(name),
+                    p.get("arguments").and_then(serde_json::Value::as_str),
+                )?;
                 validate_streamed_function_call(&completed, call_id, name, args_accum)?;
                 if args_accum.is_empty() {
-                    *args_accum = completed.arguments;
+                    *args_accum = completed.arguments.into_owned();
                 }
             }
             continue;
@@ -743,7 +739,7 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                     );
                 if !explicit_tool {
                     let mut matching = blocks_by_output_index.iter().filter_map(|(output_index, state)| {
-                        matches!(state, BlockState::Tool { call_id, .. } if call_id == &completed.call_id)
+                        matches!(state, BlockState::Tool { call_id, .. } if call_id == completed.call_id)
                             .then_some(*output_index)
                     });
                     let matching_index = matching.next().filter(|_| matching.next().is_none());
@@ -760,15 +756,13 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                         saw_tool_use = true;
                         let index = anthropic_index;
                         anthropic_index += 1;
-                        let arguments = sanitize_read_args(
-                            &completed.name,
-                            &completed.arguments,
-                            Some(&completed.call_id),
-                        );
+                        let arguments = completed
+                            .sanitized_arguments(Some(completed.call_id))
+                            .into_owned();
                         out.push(ReducerEvent::ToolStart {
                             index,
-                            id: completed.call_id.clone(),
-                            name: completed.name.clone(),
+                            id: completed.call_id.to_owned(),
+                            name: completed.name.to_owned(),
                         });
                         out.push(ReducerEvent::ToolDelta {
                             index,
@@ -788,8 +782,8 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                         output_items_by_index.insert(
                             output_index,
                             ResponsesInputItem::FunctionCall {
-                                call_id: completed.call_id.clone(),
-                                name: completed.name.clone(),
+                                call_id: completed.call_id.to_owned(),
+                                name: completed.name.to_owned(),
                                 arguments,
                             },
                         );
@@ -817,8 +811,9 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                 })?;
                 validate_streamed_function_call(completed, call_id, name, args_accum)?;
                 if !*emitted_args {
-                    *args_accum =
-                        sanitize_read_args(name, &completed.arguments, Some(call_id.as_str()));
+                    *args_accum = completed
+                        .sanitized_arguments(Some(call_id.as_str()))
+                        .into_owned();
                     out.push(ReducerEvent::ToolDelta {
                         index: *index,
                         partial_json: args_accum.clone(),
@@ -826,14 +821,14 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                 }
             }
 
-            capture_output_item(output_index, &state, &mut output_items_by_index);
+            capture_output_item(output_index, state, &mut output_items_by_index);
 
             continue;
         }
 
         if t == "response.completed" || t == "response.incomplete" || t == "response.done" {
             _saw_terminal = true;
-            terminal_type = Some(t.clone());
+            terminal_type = Some(t.to_owned());
             response_id = p
                 .get("response")
                 .and_then(|r| r.get("id"))
@@ -842,7 +837,7 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
             final_usage = p.get("response").map(parse_codex_usage);
             if let Some(usage) = final_usage.as_mut() {
                 usage.service_tier = usage.service_tier.take().or(service_tier.take());
-                usage.rate_limits = latest_rate_limits.clone();
+                usage.rate_limits = latest_rate_limits.take();
             }
             continuation_eligible = t == "response.completed" || t == "response.done";
             continue;
