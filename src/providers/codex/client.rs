@@ -1438,6 +1438,7 @@ impl CodexHttpClient {
                             );
                         }
 
+                        super::record_upstream_telemetry(&ctx, &payload);
                         let event_kind = super::events::classify_stream_event(&payload);
                         let failure = super::events::classify_event_failure(&payload);
                         if !semantic_output_forwarded
@@ -1752,6 +1753,14 @@ impl CodexHttpClient {
                     }
                 }
             };
+
+            if let Ok(response) = &result {
+                for event in parse_sse_events(&response.body) {
+                    if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&event.data) {
+                        super::record_upstream_telemetry(ctx, &payload);
+                    }
+                }
+            }
 
             if should_refresh_after_unauthorized(&result, auth_refresh_attempted, transport) {
                 auth_refresh_attempted = true;
@@ -2188,6 +2197,9 @@ impl CodexHttpClient {
                     return;
                 };
                 socket_id_publisher.publish(stream.socket_id());
+                if let Ok(payload) = &item {
+                    super::record_upstream_telemetry(&ctx, payload);
+                }
 
                 let unauthorized = match &item {
                     Err(err) => err.status == 401,

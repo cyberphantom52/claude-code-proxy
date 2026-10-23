@@ -12,6 +12,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use crate::anthropic::sse::parse_sse_events;
+use crate::monitor::TokenUsage;
 use crate::provider::RequestContext;
 use crate::traffic::{
     MAX_SSE_CAPTURE_BYTES, MAX_STREAM_CAPTURE_EVENT_BYTES, MAX_STREAM_CAPTURE_EVENTS,
@@ -462,8 +463,7 @@ struct NativeResponseObserver {
     captured_events: Vec<Value>,
     captured_event_bytes: usize,
     captured_events_truncated: u64,
-    input_tokens: Option<u64>,
-    output_tokens: Option<u64>,
+    usage: TokenUsage,
     outcome: NativeResponseOutcome,
     finished: bool,
 }
@@ -483,8 +483,7 @@ impl NativeResponseObserver {
             captured_events: Vec::new(),
             captured_event_bytes: 0,
             captured_events_truncated: 0,
-            input_tokens: None,
-            output_tokens: None,
+            usage: TokenUsage::default(),
             outcome,
             finished: false,
         }
@@ -506,13 +505,7 @@ impl NativeResponseObserver {
             0
         };
         if let Some(monitor) = self.ctx.monitor.as_ref() {
-            monitor.stream_progress(
-                &self.ctx.req_id,
-                chunk.len() as u64,
-                events,
-                self.input_tokens,
-                self.output_tokens,
-            );
+            monitor.stream_progress(&self.ctx.req_id, chunk.len() as u64, events, self.usage);
         }
     }
 
@@ -658,18 +651,14 @@ impl NativeResponseObserver {
     }
 
     fn update_usage(&mut self, value: &Value) {
-        let usage = value
+        if self.is_sse && !super::events::event_is_terminal(value) {
+            return;
+        }
+        if let Some(usage) = value
             .pointer("/response/usage")
-            .or_else(|| value.get("usage"));
-        if let Some(usage) = usage {
-            self.input_tokens = usage
-                .get("input_tokens")
-                .and_then(Value::as_u64)
-                .or(self.input_tokens);
-            self.output_tokens = usage
-                .get("output_tokens")
-                .and_then(Value::as_u64)
-                .or(self.output_tokens);
+            .or_else(|| value.get("usage"))
+        {
+            self.usage = TokenUsage::from_codex(usage);
         }
     }
 
@@ -685,7 +674,7 @@ impl NativeResponseObserver {
             self.update_outcome(&value);
             self.capture_event(value);
             if let Some(monitor) = self.ctx.monitor.as_ref() {
-                monitor.usage_updated(&self.ctx.req_id, self.input_tokens, self.output_tokens);
+                monitor.usage_updated(&self.ctx.req_id, self.usage);
             }
         }
         self.write_capture(outcome);
@@ -718,8 +707,9 @@ impl NativeResponseObserver {
                 "capturedEvents": self.captured_events.len(),
                 "capturedEventBytes": self.captured_event_bytes,
                 "truncatedEvents": self.captured_events_truncated,
-                "inputTokens": self.input_tokens,
-                "outputTokens": self.output_tokens,
+                "inputTokens": self.usage.input_tokens,
+                "cachedInputTokens": self.usage.cached_input_tokens,
+                "outputTokens": self.usage.output_tokens,
             }),
         );
     }

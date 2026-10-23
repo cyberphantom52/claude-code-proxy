@@ -3,6 +3,8 @@ use http::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::monitor::TokenUsage;
+
 pub const IMAGE_MODEL: &str = "gpt-image-2";
 pub const MAX_GENERATION_REQUEST_BYTES: usize = 256 * 1024;
 pub const MAX_EDIT_REQUEST_BYTES: usize = 64 * 1024 * 1024;
@@ -231,7 +233,14 @@ impl CodexImagesBackend {
             Err(error) => return image_error_response(error),
         };
         if let Some(monitor) = ctx.monitor.as_ref() {
-            monitor.usage_updated(&ctx.req_id, usage.0, usage.1);
+            monitor.usage_updated(
+                &ctx.req_id,
+                TokenUsage {
+                    input_tokens: usage.0,
+                    cached_input_tokens: usage.0.map(|_| 0),
+                    output_tokens: usage.1,
+                },
+            );
         }
         let mut response = (
             StatusCode::OK,

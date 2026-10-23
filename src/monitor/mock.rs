@@ -84,6 +84,7 @@ fn mock_state_for_tick(
         Some(instant_now - Duration::from_secs(10) - simulated_elapsed);
     streaming.output_tokens = Some(420_u64.saturating_add(simulated_output_tokens(tick)));
     streaming.input_tokens = Some(12_480_u64.saturating_add(tick / 4));
+    streaming.cached_input_tokens = Some(48_000);
     streaming.streamed_bytes = 18_432_u64.saturating_add(tick.saturating_mul(384));
     streaming.stream_chunks = 96_u64.saturating_add(tick.saturating_mul(3));
     streaming.generation_duration = Some(Duration::from_secs(4));
@@ -176,7 +177,8 @@ fn mock_state_for_tick(
     success.generation_initial_output_tokens = 32;
     success.streamed_bytes = 24_576;
     success.stream_chunks = 142;
-    success.input_tokens = Some(125_600);
+    success.input_tokens = Some(600);
+    success.cached_input_tokens = Some(125_000);
     success.output_tokens = Some(832);
     success.traffic_capture_path = Some(PathBuf::from(
         "/tmp/claude-code-proxy-demo/traffic/req-complete-codex",
@@ -288,7 +290,6 @@ fn mock_state_for_tick(
     counted.project = Some("terminal-dashboard".to_string());
     counted.provider = Some("codex".to_string());
     counted.model = Some("gpt-5.4-mini".to_string());
-    counted.input_tokens = Some(2_048);
     recent.push_back(counted);
 
     let mut server_error = completed_request(
@@ -334,6 +335,9 @@ fn mock_state_for_tick(
         usage.input_tokens = usage
             .input_tokens
             .saturating_add(request.input_tokens.unwrap_or(0));
+        usage.cached_input_tokens = usage
+            .cached_input_tokens
+            .saturating_add(request.cached_input_tokens.unwrap_or(0));
         usage.output_tokens = usage
             .output_tokens
             .saturating_add(request.output_tokens.unwrap_or(0));
@@ -343,6 +347,9 @@ fn mock_state_for_tick(
         usage.input_tokens = usage
             .input_tokens
             .saturating_add(request.input_tokens.unwrap_or(0));
+        usage.cached_input_tokens = usage
+            .cached_input_tokens
+            .saturating_add(request.cached_input_tokens.unwrap_or(0));
         usage.output_tokens = usage
             .output_tokens
             .saturating_add(request.output_tokens.unwrap_or(0));
@@ -651,6 +658,7 @@ fn active_request(
         streamed_bytes: 0,
         stream_chunks: 0,
         input_tokens: None,
+        cached_input_tokens: None,
         output_tokens: None,
         error: None,
         traffic_capture_path: None,
@@ -689,9 +697,11 @@ fn completed_request(
         status,
         http_status,
         latency,
+        output_history_at: None,
         streamed_bytes: 0,
         stream_chunks: 0,
         input_tokens: None,
+        cached_input_tokens: None,
         output_tokens: None,
         error: None,
         traffic_capture_path: None,

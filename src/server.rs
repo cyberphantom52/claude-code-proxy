@@ -2007,7 +2007,7 @@ impl RequestMonitorGuard {
 
     fn completed(&mut self, status: StatusCode) {
         if let Some(monitor) = self.monitor.take() {
-            monitor.request_completed(&self.req_id, status.as_u16(), None, None);
+            monitor.request_completed(&self.req_id, status.as_u16());
         }
     }
 

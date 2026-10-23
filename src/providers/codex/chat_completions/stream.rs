@@ -6,6 +6,7 @@ use futures_util::{Stream, StreamExt};
 use http::{HeaderMap, StatusCode};
 use serde_json::{Value, json};
 
+use crate::monitor::TokenUsage;
 use crate::providers::codex::native::{NativeResponseOutcome, find_sse_boundary_from};
 use crate::{provider::RequestContext, traffic::MAX_SSE_CAPTURE_BYTES};
 
@@ -144,7 +145,12 @@ impl StreamState {
         }
         self.pending.extend_from_slice(chunk);
         if let Some(monitor) = self.ctx.monitor.as_ref() {
-            monitor.stream_progress(&self.ctx.req_id, chunk.len() as u64, 0, None, None);
+            monitor.stream_progress(
+                &self.ctx.req_id,
+                chunk.len() as u64,
+                0,
+                TokenUsage::default(),
+            );
         }
     }
 
@@ -167,13 +173,7 @@ impl StreamState {
             }
         }
         if let Some(monitor) = self.ctx.monitor.as_ref() {
-            monitor.stream_progress(
-                &self.ctx.req_id,
-                0,
-                event_count,
-                Some(self.completion.usage.prompt_tokens),
-                Some(self.completion.usage.completion_tokens),
-            );
+            monitor.stream_progress(&self.ctx.req_id, 0, event_count, TokenUsage::default());
         }
         true
     }
@@ -194,6 +194,7 @@ impl StreamState {
         if let Some(traffic) = self.ctx.traffic.as_deref() {
             traffic.write_json_event("040-upstream-event", &event);
         }
+        super::super::record_upstream_telemetry(&self.ctx, &event);
         match self.completion.observe(&event) {
             Ok(Some(delta)) => {
                 if !self.role_sent {
@@ -241,13 +242,6 @@ impl StreamState {
         let terminal = self.chunk(json!([
             {"index":0,"delta":{},"finish_reason":"stop"}
         ]));
-        if let Some(monitor) = self.ctx.monitor.as_ref() {
-            monitor.usage_updated(
-                &self.ctx.req_id,
-                Some(self.completion.usage.prompt_tokens),
-                Some(self.completion.usage.completion_tokens),
-            );
-        }
         self.output.push_back(sse(terminal));
         if self.include_usage {
             let mut usage = self.chunk(json!([]));

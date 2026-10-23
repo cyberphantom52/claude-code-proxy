@@ -30,7 +30,7 @@ use crate::anthropic::schema::{CountTokensResponse, MessagesRequest};
 use crate::anthropic::sse::parse_sse_events;
 use crate::config;
 use crate::logging::create_logger;
-use crate::monitor::usage_from_anthropic_sse;
+use crate::monitor::TokenUsage;
 use crate::provider::{CliHandlers, Provider, RequestContext};
 use crate::registry;
 use crate::request_identity::ConversationIdentity;
@@ -200,10 +200,6 @@ impl CodexProvider {
                 ])),
             );
             let input_tokens = search::search_request_input_tokens(&search_request);
-            let output_tokens = search::search_response_output_tokens(&search_response);
-            if let Some(monitor) = ctx.monitor.as_ref() {
-                monitor.usage_updated(&ctx.req_id, Some(input_tokens), Some(output_tokens));
-            }
             return search::anthropic_search_response(
                 &search_response,
                 &query,
@@ -540,14 +536,6 @@ impl CodexProvider {
             ctx.traffic.as_deref(),
         ) {
             Ok(json) => {
-                if let Some(monitor) = ctx.monitor.as_ref() {
-                    monitor.usage_updated(
-                        &ctx.req_id,
-                        json.pointer("/usage/input_tokens").and_then(|v| v.as_u64()),
-                        json.pointer("/usage/output_tokens")
-                            .and_then(|v| v.as_u64()),
-                    );
-                }
                 update_continuation_from_upstream(
                     compaction_scope(&request_continuation).as_ref(),
                     &request_continuation,
@@ -673,9 +661,6 @@ impl CodexProvider {
         };
 
         let tokens = count_translated_tokens(&translated);
-        if let Some(monitor) = ctx.monitor.as_ref() {
-            monitor.usage_updated(&ctx.req_id, Some(tokens), None);
-        }
         (
             StatusCode::OK,
             Json(CountTokensResponse {
@@ -1213,7 +1198,6 @@ async fn live_stream_response_once(
             &request_continuation,
             compaction.attempt,
         );
-        record_rate_limit_telemetry(&payload);
         let (chunk, terminal) = match translate_live_stream_payload(&mut translator, &payload, None)
         {
             Ok(result) => result,
@@ -1436,13 +1420,11 @@ fn record_live_stream_downstream_capture(ctx: &RequestContext, chunk: &[u8]) {
 
 fn record_live_stream_progress(ctx: &RequestContext, chunk: &[u8]) {
     if let Some(monitor) = ctx.monitor.as_ref() {
-        let (input_tokens, output_tokens) = usage_from_anthropic_sse(chunk);
         monitor.stream_progress(
             &ctx.req_id,
             chunk.len() as u64,
             count_sse_events(chunk),
-            input_tokens,
-            output_tokens,
+            TokenUsage::default(),
         );
     }
 }
@@ -1580,7 +1562,6 @@ fn remaining_live_stream_response(
                         &request_continuation,
                         compaction.attempt,
                     );
-                    record_rate_limit_telemetry(&payload);
                     let (chunk, terminal) = match translate_live_stream_payload(
                         &mut translator,
                         &payload,
@@ -1827,10 +1808,15 @@ fn append_upstream_sse_payload(
     body.extend_from_slice(b"\n\n");
 }
 
-/// Records quota telemetry from `codex.rate_limits` events.
-fn record_rate_limit_telemetry(payload: &serde_json::Value) {
+pub(super) fn record_upstream_telemetry(ctx: &RequestContext, payload: &serde_json::Value) {
     if payload.get("type").and_then(|value| value.as_str()) == Some("codex.rate_limits") {
         rate_limits::record(rate_limits::event_headers(payload));
+    }
+    if events::event_is_terminal(payload)
+        && let Some(usage) = payload.pointer("/response/usage")
+        && let Some(monitor) = ctx.monitor.as_ref()
+    {
+        monitor.usage_updated(&ctx.req_id, TokenUsage::from_codex(usage));
     }
 }
 

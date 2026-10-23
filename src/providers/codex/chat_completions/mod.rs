@@ -12,6 +12,7 @@ use futures_util::StreamExt;
 use http::StatusCode;
 use serde_json::{Value, json};
 
+use crate::monitor::TokenUsage;
 use crate::provider::RequestContext;
 
 use super::client::{CodexError, CodexHttpClient};
@@ -82,15 +83,6 @@ impl ChatCompletionsBackend {
                 return response;
             }
         };
-        if let Some(usage) = completion.get("usage")
-            && let Some(monitor) = ctx.monitor.as_ref()
-        {
-            monitor.usage_updated(
-                &ctx.req_id,
-                usage.get("prompt_tokens").and_then(Value::as_u64),
-                usage.get("completion_tokens").and_then(Value::as_u64),
-            );
-        }
         if let Some(traffic) = ctx.traffic.as_deref() {
             traffic.write_json("050-openai-chat-completion-response", &completion);
         }
@@ -112,7 +104,7 @@ async fn collect_body(
     let mut stream = upstream.bytes_stream();
     let mut bytes = Vec::new();
     let mut started = false;
-    loop {
+    let result = loop {
         match tokio::time::timeout(Duration::from_millis(idle_timeout_ms), stream.next()).await {
             Ok(Some(Ok(chunk))) => {
                 if !started {
@@ -124,7 +116,7 @@ async fn collect_body(
                     started = true;
                 }
                 if bytes.len().saturating_add(chunk.len()) > crate::traffic::MAX_SSE_CAPTURE_BYTES {
-                    return Err(ChatError::upstream(
+                    break Err(ChatError::upstream(
                         "Codex response exceeded the response byte limit",
                     ));
                 }
@@ -132,22 +124,35 @@ async fn collect_body(
                 if let Some(ctx) = ctx
                     && let Some(monitor) = ctx.monitor.as_ref()
                 {
-                    monitor.stream_progress(&ctx.req_id, chunk.len() as u64, 0, None, None);
+                    monitor.stream_progress(
+                        &ctx.req_id,
+                        chunk.len() as u64,
+                        0,
+                        TokenUsage::default(),
+                    );
                 }
             }
             Ok(Some(Err(error))) => {
-                return Err(ChatError::upstream(format!(
+                break Err(ChatError::upstream(format!(
                     "Codex response body read failed: {error}"
                 )));
             }
-            Ok(None) => return Ok(bytes),
+            Ok(None) => break Ok(()),
             Err(_) => {
-                return Err(ChatError::timeout(format!(
+                break Err(ChatError::timeout(format!(
                     "Timed out waiting {idle_timeout_ms}ms for the next Codex response body chunk"
                 )));
             }
         }
+    };
+    if let Some(ctx) = ctx {
+        for event in crate::anthropic::sse::parse_sse_events(&bytes) {
+            if let Ok(payload) = serde_json::from_str::<Value>(&event.data) {
+                super::record_upstream_telemetry(ctx, &payload);
+            }
+        }
     }
+    result.map(|()| bytes)
 }
 
 fn codex_error_response(mut error: CodexError) -> Response {
