@@ -1929,23 +1929,17 @@ fn should_append_read_offset_guidance(
     read_call_had_offset: bool,
     is_error: bool,
 ) -> bool {
-    read_call_had_offset
-        && !output.contains("Codex Read guidance:")
-        && looks_like_read_offset_result(output)
-        && (is_error || looks_like_read_offset_warning(output))
-}
-
-fn looks_like_read_offset_result(output: &RenderedToolResult<'_>) -> bool {
-    output.contains_ignore_ascii_case("offset")
-        && (output.contains_ignore_ascii_case("file has")
-            || output.contains_ignore_ascii_case("out of range")
-            || (output.contains_ignore_ascii_case("line")
-                && output.contains_ignore_ascii_case("requested")))
-}
-
-fn looks_like_read_offset_warning(output: &RenderedToolResult<'_>) -> bool {
-    output.contains_ignore_ascii_case("warning")
-        || output.contains_ignore_ascii_case("system-reminder")
+    if !read_call_had_offset || output.contains("Codex Read guidance:") {
+        return false;
+    }
+    // Fold each part once, then reuse optimized substring searches.
+    let lowercase: Vec<_> = output.text_parts().map(str::to_ascii_lowercase).collect();
+    let contains = |needle: &str| lowercase.iter().any(|text| text.contains(needle));
+    contains("offset")
+        && (contains("file has")
+            || contains("out of range")
+            || (contains("line") && contains("requested")))
+        && (is_error || contains("warning") || contains("system-reminder"))
 }
 
 fn read_offset_guidance() -> &'static str {
@@ -1988,14 +1982,6 @@ impl RenderedToolResult<'_> {
     // cannot create a match that is absent from the individual parts.
     fn contains(&self, needle: &str) -> bool {
         self.text_parts().any(|text| text.contains(needle))
-    }
-
-    fn contains_ignore_ascii_case(&self, needle: &str) -> bool {
-        self.text_parts().any(|text| {
-            text.as_bytes()
-                .windows(needle.len())
-                .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
-        })
     }
 
     fn joined_text(&self) -> String {
