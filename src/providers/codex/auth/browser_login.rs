@@ -35,22 +35,56 @@ impl BrowserLoginConfig {
     }
 }
 
-fn extract_request_path_and_query(stream: &mut TcpStream) -> Option<(String, String)> {
-    let mut buf = [0; 4096];
-    let n = stream.read(&mut buf).ok()?;
-    let request = String::from_utf8_lossy(&buf[..n]);
-
-    // Parse first line: GET /path?query HTTP/1.1
-    let first_line = request.lines().next()?;
-    let mut parts = first_line.split_whitespace();
-    let _method = parts.next()?;
+fn extract_request_path_and_query(
+    stream: &mut TcpStream,
+    deadline: std::time::Instant,
+) -> Option<(String, String)> {
+    const MAX_HEADERS: usize = 16 * 1024;
+    let deadline = deadline.min(std::time::Instant::now() + Duration::from_secs(5));
+    let mut request = Vec::new();
+    let mut buf = [0; 1024];
+    let header_end = loop {
+        let remaining = deadline.checked_duration_since(std::time::Instant::now())?;
+        if remaining.is_zero() || request.len() == MAX_HEADERS {
+            return None;
+        }
+        stream.set_read_timeout(Some(remaining)).ok()?;
+        let capacity = buf.len().min(MAX_HEADERS - request.len());
+        let n = match stream.read(&mut buf[..capacity]) {
+            Ok(0) => return None,
+            Ok(n) => n,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        };
+        request.extend_from_slice(&buf[..n]);
+        if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+            break end;
+        }
+    };
+    let request = std::str::from_utf8(&request[..header_end]).ok()?;
+    let mut lines = request.split("\r\n");
+    let mut parts = lines.next()?.split(' ');
+    if parts.next()? != "GET" {
+        return None;
+    }
     let path_and_query = parts.next()?;
-
-    let mut split = path_and_query.splitn(2, '?');
-    let path = split.next().unwrap_or("").to_string();
-    let query = split.next().unwrap_or("").to_string();
-
-    Some((path, query))
+    if !matches!(parts.next()?, "HTTP/1.0" | "HTTP/1.1")
+        || parts.next().is_some()
+        || !path_and_query.starts_with('/')
+        || path_and_query.contains('#')
+        || path_and_query.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return None;
+    }
+    for line in lines {
+        let (name, value) = line.split_once(':')?;
+        http::HeaderName::from_bytes(name.as_bytes()).ok()?;
+        http::HeaderValue::from_str(value.trim()).ok()?;
+    }
+    let (path, query) = path_and_query
+        .split_once('?')
+        .unwrap_or((path_and_query, ""));
+    Some((path.to_string(), query.to_string()))
 }
 
 fn write_response(
@@ -167,7 +201,7 @@ fn handle_callback_until(
     stream.set_read_timeout(Some(remaining.min(Duration::from_secs(5))))?;
     stream.set_write_timeout(Some(remaining.min(Duration::from_secs(5))))?;
 
-    let (path, query) = match extract_request_path_and_query(stream) {
+    let (path, query) = match extract_request_path_and_query(stream, deadline) {
         Some(pair) => pair,
         None => {
             write_response(stream, deadline, 400, "text/plain", "Bad request");
