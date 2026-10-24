@@ -51,7 +51,7 @@ use uuid::Uuid;
 
 const CLAUDE_AUTO_REVIEW_SYSTEM_PREFIX: &str =
     "You are a security monitor for autonomous AI coding agents.";
-const CODEX_AUTO_REVIEW_MODEL: &str = "gpt-6-luna";
+const CODEX_AUTO_REVIEW_MODEL: &str = "codex-auto-review";
 const MAX_ERROR_CAPTURE_BYTES: usize = 64 * 1024;
 const MAX_ERROR_CAPTURE_FRAMES: usize = 64;
 
@@ -101,41 +101,21 @@ fn apply_auto_review_model(
         .filter(|model| !model.is_empty())
         .unwrap_or(CODEX_AUTO_REVIEW_MODEL);
     let requested_model = body.model.clone()?;
-    let fast_override = format!(
-        "{}-fast",
-        override_model
-            .strip_suffix("-fast")
-            .unwrap_or(override_model)
-    );
-    let override_model = if requested_model.ends_with("-fast")
-        && crate::providers::codex::translate::model_allowlist::is_valid_model_for_codex(
-            &fast_override,
-        ) {
-        fast_override
-    } else {
-        override_model.to_owned()
-    };
     let route = AutoReviewRoute {
         requested_model,
-        override_model,
+        override_model: override_model.to_owned(),
     };
     body.model = Some(route.override_model.clone());
     Some(route)
 }
 
-/// Mirrors Codex's own approval reviewer: Low effort (`ext/guardian-reviewer/src/model.rs`)
-/// and a reviewer-scoped `guardian:{parent}` prompt cache key (`core/src/guardian/review_session.rs`).
+/// Select reviewer defaults during translation without manufacturing caller controls,
+/// and keep the prompt cache key separate from the main conversation.
 fn apply_codex_auto_review_defaults(
     body: &mut crate::anthropic::schema::MessagesRequest,
     session_id: Option<&str>,
 ) {
-    let output_config = body
-        .extra
-        .entry("output_config")
-        .or_insert_with(|| json!({}));
-    if let Some(config) = output_config.as_object_mut() {
-        config.entry("effort").or_insert_with(|| json!("low"));
-    }
+    body.auto_review = true;
     body.prompt_cache_key_override = session_id.map(|id| format!("guardian:{id}"));
     // The classifier reads only its text verdict; a reasoning summary or encrypted
     // reasoning would be generated and returned for nothing.
@@ -1272,6 +1252,7 @@ fn native_turn_state(headers: &http::HeaderMap) -> Result<Option<http::HeaderVal
 fn native_session_id(headers: &http::HeaderMap) -> Option<String> {
     [
         "x-claude-code-session-id",
+        "session-id",
         "session_id",
         "x-client-request-id",
     ]

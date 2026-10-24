@@ -15,6 +15,8 @@ pub struct MessagesRequest {
     pub prompt_cache_key_override: Option<String>,
     #[serde(skip)]
     pub omit_reasoning_artifacts: bool,
+    #[serde(skip)]
+    pub auto_review: bool,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }

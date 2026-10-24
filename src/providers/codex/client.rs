@@ -155,6 +155,39 @@ pub fn build_codex_headers(
     Ok(headers)
 }
 
+fn build_codex_response_headers(
+    auth: &StoredAuth,
+    ctx: &RequestContext,
+    use_responses_lite: bool,
+    codex_auto_review: bool,
+    endpoint: &str,
+) -> Result<http::HeaderMap, CodexError> {
+    // Codex 970111f6 core/src/client.rs and ext/guardian-v2/src/sync_reviewer/mod.rs:
+    // reviewer headers are selected-model scoped and restricted to Codex OAuth.
+    if codex_auto_review
+        && (endpoint.trim_end_matches('/') != CODEX_API_ENDPOINT
+            || auth.access.trim().is_empty()
+            || auth
+                .account_id
+                .as_deref()
+                .is_none_or(|id| id.trim().is_empty()))
+    {
+        return Err(CodexError::new(
+            400,
+            "codex-auto-review requires the official Codex endpoint and a ChatGPT OAuth account"
+                .to_string(),
+        ));
+    }
+    let mut headers = build_codex_headers(auth, ctx, use_responses_lite)?;
+    if codex_auto_review {
+        headers.insert(
+            "x-codex-guardian",
+            http::HeaderValue::from_static("reviewer"),
+        );
+    }
+    Ok(headers)
+}
+
 pub fn build_native_codex_headers(
     auth: &StoredAuth,
     ctx: &RequestContext,
@@ -382,6 +415,7 @@ struct HttpEventStreamState {
     auth: Arc<OperationAuth>,
     auth_refresh_attempted: bool,
     use_responses_lite: bool,
+    codex_auto_review: bool,
     retries: u32,
     model: String,
 }
@@ -1116,6 +1150,7 @@ impl CodexHttpClient {
             })?;
         let mut auth_refresh_attempted = false;
         let use_responses_lite = body.client_metadata.is_some();
+        let codex_auto_review = body.codex_auto_review && body.model == "codex-auto-review";
         let mut retries = 0_u32;
         let retry_started_at = Instant::now();
         let log_retry = |error: &CodexError, failed_attempt, delay_ms, stop_reason| {
@@ -1137,6 +1172,7 @@ impl CodexHttpClient {
                     &body_json,
                     ctx,
                     use_responses_lite,
+                    codex_auto_review,
                     &mut auth_refresh_attempted,
                 )
                 .await
@@ -1179,6 +1215,7 @@ impl CodexHttpClient {
                 auth,
                 auth_refresh_attempted,
                 use_responses_lite,
+                codex_auto_review,
                 retries,
                 model: body.model.clone(),
             },
@@ -1207,11 +1244,12 @@ impl CodexHttpClient {
         body_json: &Bytes,
         ctx: &RequestContext,
         use_responses_lite: bool,
+        codex_auto_review: bool,
         auth_refresh_attempted: &mut bool,
     ) -> Result<(reqwest::Response, Vec<(String, String)>, Instant), CodexError> {
         loop {
             let (resp, started_at) = self
-                .start_post_http(auth, body_json, ctx, use_responses_lite)
+                .start_post_http(auth, body_json, ctx, use_responses_lite, codex_auto_review)
                 .await?;
 
             if resp.status().as_u16() == 401 && !*auth_refresh_attempted {
@@ -1293,6 +1331,7 @@ impl CodexHttpClient {
             mut auth,
             mut auth_refresh_attempted,
             use_responses_lite,
+            codex_auto_review,
             mut retries,
             model,
         } = state;
@@ -1643,6 +1682,7 @@ impl CodexHttpClient {
                             &body_json,
                             &ctx,
                             use_responses_lite,
+                            codex_auto_review,
                             &mut auth_refresh_attempted,
                         ) => result
                     };
@@ -1680,6 +1720,9 @@ impl CodexHttpClient {
         use crate::config::CodexTransport;
 
         let transport = config::codex_transport();
+        let codex_auto_review = body.codex_auto_review && body.model == "codex-auto-review";
+        // Reviewer handshake headers must never share an ordinary pooled socket.
+        let continuation = continuation.filter(|_| !codex_auto_review);
 
         let mut auth = self.operation_auth().await.map_err(|e| CodexError {
             status: 401,
@@ -1736,13 +1779,24 @@ impl CodexHttpClient {
             let result = match transport {
                 CodexTransport::Http => {
                     let body_json = serialize_http_body()?;
-                    self.attempt_post_http(&auth, &body_json, ctx, body.client_metadata.is_some())
-                        .await
-                        .map(|response| OwnerAwareCodexResponse::new(response, None))
+                    self.attempt_post_http(
+                        &auth,
+                        &body_json,
+                        ctx,
+                        body.client_metadata.is_some(),
+                        codex_auto_review,
+                    )
+                    .await
+                    .map(|response| OwnerAwareCodexResponse::new(response, None))
                 }
                 CodexTransport::WebSocket | CodexTransport::Auto => {
-                    let ws_headers =
-                        build_codex_headers(&auth, ctx, body.client_metadata.is_some())?;
+                    let ws_headers = build_codex_response_headers(
+                        &auth,
+                        ctx,
+                        body.client_metadata.is_some(),
+                        codex_auto_review,
+                        &self.base_url,
+                    )?;
                     let ws_headers = super::websocket::codex_websocket_headers(&ws_headers);
                     let ws_body = build_websocket_request(
                         body,
@@ -1789,6 +1843,7 @@ impl CodexHttpClient {
                                 &body_json,
                                 ctx,
                                 body.client_metadata.is_some(),
+                                codex_auto_review,
                             )
                             .await
                             .map(|response| OwnerAwareCodexResponse::new(response, None))
@@ -2069,6 +2124,8 @@ impl CodexHttpClient {
         ctx: &RequestContext,
         continuation: Option<&super::continuation::ContinuationReservation>,
     ) -> Result<super::websocket::CodexWebSocketEventStream, CodexError> {
+        let codex_auto_review = body.codex_auto_review && body.model == "codex-auto-review";
+        let continuation = continuation.filter(|_| !codex_auto_review);
         let mut auth = self.operation_auth().await.map_err(|e| CodexError {
             status: 401,
             message: "Auth error".to_string(),
@@ -2133,8 +2190,13 @@ impl CodexHttpClient {
         'attempt: loop {
             socket_id_publisher.publish(None);
             socket_id_publisher.publish_provenance(auth.provenance(&self.base_url));
-            let ws_headers = match build_codex_headers(&auth, &ctx, body.client_metadata.is_some())
-            {
+            let ws_headers = match build_codex_response_headers(
+                &auth,
+                &ctx,
+                body.client_metadata.is_some(),
+                body.codex_auto_review && body.model == "codex-auto-review",
+                &self.base_url,
+            ) {
                 Ok(headers) => super::websocket::codex_websocket_headers(&headers),
                 Err(err) => {
                     if tx.send(Err(err)).await.is_err() {
@@ -2436,9 +2498,10 @@ impl CodexHttpClient {
         body_json: &Bytes,
         ctx: &RequestContext,
         use_responses_lite: bool,
+        codex_auto_review: bool,
     ) -> Result<CodexResponse, CodexError> {
         let (resp, started_at) = self
-            .start_post_http(auth, body_json, ctx, use_responses_lite)
+            .start_post_http(auth, body_json, ctx, use_responses_lite, codex_auto_review)
             .await?;
         self.collect_http_response(resp, started_at, ctx).await
     }
@@ -2449,9 +2512,11 @@ impl CodexHttpClient {
         body_json: &Bytes,
         ctx: &RequestContext,
         use_responses_lite: bool,
+        codex_auto_review: bool,
     ) -> Result<(reqwest::Response, Instant), CodexError> {
         let url = &self.base_url;
-        let headers = build_codex_headers(auth, ctx, use_responses_lite)?;
+        let headers =
+            build_codex_response_headers(auth, ctx, use_responses_lite, codex_auto_review, url)?;
 
         if let Some(traffic) = ctx.traffic.as_deref() {
             write_codex_http_request_capture(traffic, url, &headers, body_json);

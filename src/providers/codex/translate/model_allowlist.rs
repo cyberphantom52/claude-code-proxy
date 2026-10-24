@@ -397,9 +397,11 @@ fn uses_responses_lite_with_full_lane(model: &str, full_lane: bool) -> bool {
     if full_lane && matches!(model, "gpt-5.6-sol" | "gpt-5.6-terra") {
         return false;
     }
+    // Hidden reviewer metadata at Codex 970111f6 models-manager/models.json.
+    // This shapes an exact ID only; it does not advertise backend availability.
     catalog_model(model)
         .and_then(|entry| entry.use_responses_lite)
-        .unwrap_or(false)
+        .unwrap_or(model == "codex-auto-review")
 }
 
 /// Known Lite-only Luna IDs cannot run hosted tools on the full lane.

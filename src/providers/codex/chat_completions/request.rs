@@ -21,6 +21,7 @@ const SUPPORTED_FIELDS: &[&str] = &[
     "reasoning_effort",
     "verbosity",
     "service_tier",
+    "prompt_cache_key",
     "parallel_tool_calls",
     "response_format",
     "temperature",
@@ -158,6 +159,9 @@ pub fn translate_request(mut body: Value) -> Result<TranslatedRequest, ChatError
         ("parallel_tool_calls".to_string(), json!(parallel)),
         ("text".to_string(), Value::Object(text)),
     ]);
+    if let Some(key) = optional_string(object, "prompt_cache_key")? {
+        upstream.insert("prompt_cache_key".to_string(), json!(key));
+    }
     let tier = optional_string(object, "service_tier")?
         .map(str::to_string)
         .or_else(|| resolved.service_tier.map(String::from));

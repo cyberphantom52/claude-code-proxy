@@ -182,6 +182,8 @@ pub enum ResponsesToolChoice {
 pub struct ResponsesRequest<I = Vec<ResponsesInputItem>> {
     #[serde(skip)]
     pub stop_sequences: Vec<String>,
+    #[serde(skip)]
+    pub codex_auto_review: bool,
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
@@ -211,6 +213,7 @@ impl ResponsesRequest {
     pub(crate) fn with_input<I>(&self, input: I) -> ResponsesRequest<I> {
         ResponsesRequest {
             stop_sequences: self.stop_sequences.clone(),
+            codex_auto_review: self.codex_auto_review,
             model: self.model.clone(),
             instructions: self.instructions.clone(),
             input,
@@ -622,6 +625,17 @@ fn resolve_service_tier(
         }
         Some(_) => anyhow::bail!("Invalid speed: expected 'fast' or 'standard'"),
     };
+    if req.auto_review && model == "codex-auto-review" {
+        // Codex 970111f6 core/src/client.rs clears reviewer service tiers.
+        // Do not silently discard explicit caller speed/tier requirements.
+        anyhow::ensure!(
+            speed != Some("fast")
+                && model_tier.is_none()
+                && req.extra.get("service_tier").is_none_or(Value::is_null),
+            "codex-auto-review does not support explicit fast speed or service_tier"
+        );
+        return Ok(None);
+    }
     // An interactive /fast choice is explicit caller intent, not an operator default.
     let configured = config::codex_service_tier();
     let tier = match speed {
@@ -1092,6 +1106,7 @@ pub fn translate_request(
 
     let mut out = ResponsesRequest {
         stop_sequences: parse_stop_sequences(req)?,
+        codex_auto_review: req.auto_review && opts.model == "codex-auto-review",
         model: opts.model,
         instructions,
         input,
@@ -1194,6 +1209,20 @@ pub fn translate_request(
     let configured_effort = config::codex_effort();
     let mut resolved_effort =
         resolve_effort_override(to_codex_effort(effort), configured_effort.as_deref())?;
+    if req.auto_review && resolved_effort.is_none() {
+        let metadata = super::model_catalog::catalog_model(&out.model);
+        let low_supported = metadata
+            .as_ref()
+            .and_then(|model| model.supported_reasoning_levels.as_ref())
+            .map_or_else(
+                // Verified low effort at Codex 970111f6 models-manager/models.json.
+                || matches!(out.model.as_str(), "gpt-6-luna" | "codex-auto-review"),
+                |levels| levels.iter().any(|level| level.effort == "low"),
+            );
+        if low_supported {
+            resolved_effort = Some(Effort::Low);
+        }
+    }
     let resolved_string = resolved_effort.as_ref().map(ToString::to_string);
     resolved_effort =
         resolve_model_effort(&out.model, resolved_string.as_deref())?.map(Effort::from);
