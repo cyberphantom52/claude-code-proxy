@@ -380,7 +380,12 @@ async fn run(
                 });
                 let blocks = compatibility_blocks(
                     &call_id,
-                    &serde_json::from_str(&arguments).map_err(|e| error(e.to_string()))?,
+                    &serde_json::from_str(if arguments.trim().is_empty() {
+                        "{}"
+                    } else {
+                        &arguments
+                    })
+                    .map_err(|e| error(e.to_string()))?,
                     result.as_ref().map_err(String::as_str),
                 );
                 for block in &blocks {

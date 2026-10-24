@@ -9,9 +9,10 @@ use crate::anthropic::schema::MessagesRequest;
 use crate::request_identity::ConversationIdentity;
 
 use super::count_tokens::{approx_token_count, truncate_to_token_budget};
-use super::translate::request::{
-    ResponsesContentPart, ResponsesFunctionTool, ResponsesInputItem, ResponsesTool,
-};
+use super::translate::request::{ResponsesContentPart, ResponsesInputItem};
+
+mod tool;
+pub(crate) use tool::native_search_tool;
 
 const SEARCH_OUTPUT_TOKEN_BUDGET: u64 = 2_500;
 
@@ -26,19 +27,31 @@ pub struct SearchRequest {
     pub max_output_tokens: u64,
 }
 
-// The supported subset of pinned codex-api/src/search.rs. Unknown commands and
-// unknown nested fields are errors, never silently discarded model instructions.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+// Match the pinned codex-api search commands, but reject unknown fields instead
+// of silently discarding model instructions before forwarding them to alpha/search.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct SearchCommands {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search_query: Option<Vec<SearchQuery>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_query: Option<Vec<SearchQuery>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open: Option<Vec<OpenOperation>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub click: Option<Vec<ClickOperation>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub find: Option<Vec<FindOperation>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screenshot: Option<Vec<ScreenshotOperation>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finance: Option<Vec<FinanceOperation>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weather: Option<Vec<WeatherOperation>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sports: Option<Vec<SportsOperation>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time: Option<Vec<TimeOperation>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_length: Option<SearchResponseLength>,
 }
@@ -76,6 +89,95 @@ pub struct FindOperation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ScreenshotOperation {
+    pub ref_id: String,
+    pub pageno: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct FinanceOperation {
+    pub ticker: String,
+    pub r#type: FinanceAssetType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub market: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum FinanceAssetType {
+    Equity,
+    Fund,
+    Crypto,
+    Index,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct WeatherOperation {
+    pub location: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SportsOperation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<SportsToolName>,
+    pub r#fn: SportsFunction,
+    pub league: SportsLeague,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opponent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date_from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_games: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locale: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum SportsToolName {
+    Sports,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum SportsFunction {
+    Schedule,
+    Standings,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum SportsLeague {
+    Nba,
+    Wnba,
+    Nfl,
+    Nhl,
+    Mlb,
+    Epl,
+    Ncaamb,
+    Ncaawb,
+    Ipl,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TimeOperation {
+    pub utc_offset: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum SearchResponseLength {
     Short,
@@ -85,18 +187,10 @@ pub enum SearchResponseLength {
 
 impl SearchCommands {
     pub(crate) fn parse(arguments: &str) -> anyhow::Result<Self> {
-        let commands: Self = serde_json::from_str(arguments)?;
-        anyhow::ensure!(
-            commands
-                .search_query
-                .as_ref()
-                .is_some_and(|v| !v.is_empty())
-                || commands.open.as_ref().is_some_and(|v| !v.is_empty())
-                || commands.click.as_ref().is_some_and(|v| !v.is_empty())
-                || commands.find.as_ref().is_some_and(|v| !v.is_empty()),
-            "web.run requires at least one supported operation"
-        );
-        Ok(commands)
+        if arguments.trim().is_empty() {
+            return Ok(Self::default());
+        }
+        Ok(serde_json::from_str(arguments)?)
     }
 }
 
@@ -296,59 +390,6 @@ fn string_array(value: Option<&Value>) -> Option<Vec<String>> {
             .map(str::to_owned)
             .collect()
     })
-}
-
-pub(crate) fn native_search_tool() -> ResponsesTool {
-    let string = json!({"type": "string"});
-    let integer = json!({"type": "integer", "minimum": 0, "maximum": u64::MAX});
-    let operations = [
-        (
-            "search_query",
-            json!({"q": string, "recency": integer, "domains": {"type":"array", "items":string}}),
-            vec!["q"],
-        ),
-        (
-            "open",
-            json!({"ref_id": string, "lineno": integer}),
-            vec!["ref_id"],
-        ),
-        (
-            "click",
-            json!({"ref_id": string, "id": integer}),
-            vec!["ref_id", "id"],
-        ),
-        (
-            "find",
-            json!({"ref_id": string, "pattern": string}),
-            vec!["ref_id", "pattern"],
-        ),
-    ];
-    let mut properties = serde_json::Map::new();
-    for (name, fields, required) in operations {
-        properties.insert(
-            name.into(),
-            json!({
-                "type": "array", "items": {"type": "object", "properties": fields,
-                    "required": required, "additionalProperties": false}
-            }),
-        );
-    }
-    properties.insert(
-        "response_length".into(),
-        json!({"type":"string", "enum":["short","medium","long"]}),
-    );
-    ResponsesTool::Namespace {
-        kind: "namespace".into(),
-        name: "web".into(),
-        description: "Search and browse the web.".into(),
-        tools: vec![ResponsesTool::Function(ResponsesFunctionTool {
-            kind: "function".into(),
-            name: "run".into(),
-            description: Some("Search queries, open pages, click numbered links, or find page text. At least one operation is required. Results contain reference IDs for later calls.".into()),
-            parameters: json!({"type":"object", "properties":properties, "additionalProperties":false}),
-            strict: false,
-        })],
-    }
 }
 
 pub(crate) fn compatibility_blocks(
