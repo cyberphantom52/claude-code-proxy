@@ -54,6 +54,16 @@ pub fn split_tier_suffix(model: &str) -> Option<(&str, ServiceTier)> {
     catalog_model(base).map(|_| (base, ServiceTier::Priority))
 }
 
+/// Discovered labels stay exact; local tier aliases retain their visible suffix.
+pub fn model_display_name(model: &str) -> Option<String> {
+    let base = split_tier_suffix(model).map_or(model, |(base, _)| base);
+    let name = catalog_model(base)?
+        .display_name
+        .clone()
+        .filter(|name| !name.is_empty())?;
+    Some(format!("{name}{}", &model[base.len()..]))
+}
+
 /// Compatibility name: validate syntax, never gate IDs against a local catalog.
 /// Codex is authoritative for model availability and subscription access.
 pub fn is_allowed_model(model: &str) -> bool {

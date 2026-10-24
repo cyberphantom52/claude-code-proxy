@@ -424,7 +424,8 @@ async fn handler_models(
                 "type": "model",
                 "object": "model",
                 "id": model,
-                "display_name": format!("{model} ({provider})"),
+                "display_name": crate::providers::codex::translate::model_allowlist::model_display_name(model)
+                    .unwrap_or_else(|| format!("{model} ({provider})")),
             })
         })
         .collect();
