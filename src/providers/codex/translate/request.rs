@@ -163,17 +163,17 @@ pub enum ResponsesToolChoiceMode {
 #[serde(untagged)]
 pub enum ResponsesToolChoice {
     Mode(ResponsesToolChoiceMode),
+    AllowedTools {
+        r#type: String,
+        mode: String,
+        tools: Vec<Value>,
+    },
     Function {
         r#type: String,
         name: String,
     },
     WebSearch {
         r#type: String,
-    },
-    AllowedTools {
-        r#type: String,
-        mode: String,
-        tools: Vec<Value>,
     },
 }
 
@@ -280,6 +280,8 @@ pub enum ResponsesInputItem {
         #[serde(default)]
         call_id: String,
         name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
         arguments: String,
     },
     #[serde(rename = "function_call_output")]
@@ -303,6 +305,8 @@ pub enum ResponsesInputItem {
         status: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         action: Option<ResponsesWebSearchAction>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        results: Option<Vec<Value>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         encrypted_content: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -379,6 +383,8 @@ pub enum ResponsesWebSearchAction {
         query: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         queries: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sources: Option<Vec<Value>>,
     },
     OpenPage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -436,6 +442,13 @@ pub enum ResponsesContentPart {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ResponsesTool {
+    Namespace {
+        #[serde(rename = "type")]
+        kind: String,
+        name: String,
+        description: String,
+        tools: Vec<ResponsesTool>,
+    },
     Function(ResponsesFunctionTool),
     WebSearch(ResponsesWebSearchTool),
 }
@@ -460,6 +473,10 @@ pub struct ResponsesWebSearchTool {
     pub search_content_types: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filters: Option<ResponsesWebSearchFilters>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_location: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_context_size: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -856,6 +873,11 @@ pub fn validate_messages_capabilities(req: &MessagesRequest) -> anyhow::Result<(
             disabled.is_boolean(),
             "disable_parallel_tool_use must be a boolean"
         );
+        anyhow::ensure!(
+            disabled != &Value::Bool(true)
+                || req.extra.get("parallel_tool_calls") != Some(&Value::Bool(true)),
+            "parallel_tool_calls=true conflicts with disable_parallel_tool_use=true"
+        );
     }
     if let Some(output) = req.extra.get("output_config") {
         anyhow::ensure!(output.is_object(), "output_config must be an object");
@@ -891,6 +913,14 @@ fn validate_tool_definition(tool: &Value) -> anyhow::Result<()> {
         tool.get("strict") != Some(&Value::Bool(true)),
         "strict=true tool enforcement has no verified Codex contract"
     );
+    if let Some(callers) = tool.get("allowed_callers") {
+        anyhow::ensure!(
+            callers
+                .as_array()
+                .is_some_and(|callers| callers.len() == 1 && callers[0] == "direct"),
+            "tool.allowed_callers supports only ['direct']; programmatic tool execution is unavailable"
+        );
+    }
     validate_cache_hint(tool.get("cache_control"))?;
     match tool.get("type") {
         None => {}
@@ -919,6 +949,56 @@ fn validate_tool_definition(tool: &Value) -> anyhow::Result<()> {
             );
         }
     }
+    if tool["type"] == "web_search_20250305" {
+        anyhow::ensure!(
+            tool["name"] == "web_search",
+            "web_search_20250305 requires the tool name web_search"
+        );
+        anyhow::ensure!(
+            tool.as_object()
+                .expect("validated tool object")
+                .keys()
+                .all(|key| matches!(
+                    key.as_str(),
+                    "type"
+                        | "name"
+                        | "max_uses"
+                        | "allowed_domains"
+                        | "blocked_domains"
+                        | "user_location"
+                        | "search_context_size"
+                        | "allowed_callers"
+                        | "cache_control"
+                )),
+            "unsupported web_search tool control"
+        );
+        if let Some(max_uses) = tool.get("max_uses") {
+            anyhow::ensure!(
+                max_uses.as_u64().is_some_and(|n| u32::try_from(n).is_ok()),
+                "web_search.max_uses must be an integer between 0 and 4294967295"
+            );
+        }
+        if let Some(location) = tool.get("user_location") {
+            let location = location.as_object().ok_or_else(|| {
+                anyhow::anyhow!("web_search.user_location must be an approximate location object")
+            })?;
+            anyhow::ensure!(
+                location.get("type").and_then(Value::as_str) == Some("approximate")
+                    && location.iter().all(|(key, value)| {
+                        key == "type"
+                            || (matches!(key.as_str(), "country" | "region" | "city" | "timezone")
+                                && value.is_string())
+                    }),
+                "web_search.user_location supports only approximate country, region, city and timezone strings"
+            );
+        }
+        if let Some(size) = tool.get("search_context_size") {
+            anyhow::ensure!(
+                matches!(size.as_str(), Some("low" | "medium" | "high")),
+                "web_search.search_context_size must be low, medium or high"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -935,9 +1015,7 @@ fn validate_cache_hint(hint: Option<&Value>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Hosted tools (web_search) are rejected by the Responses Lite lane, which
-/// only supports function and custom tools. Requests carrying them must use
-/// the full Responses API.
+/// Whether the Messages catalog requests server-executed web search.
 pub fn has_hosted_web_search(req: &MessagesRequest) -> bool {
     req.extra
         .get("tools")
@@ -954,15 +1032,15 @@ pub fn translate_request(
     opts: TranslateOptions,
 ) -> Result<ResponsesRequest, anyhow::Error> {
     validate_messages_capabilities(&req)?;
-    if has_hosted_web_search(&req) {
+    if !opts.use_responses_lite && has_hosted_web_search(&req) {
         validate_hosted_web_search(&opts.model)?;
     }
     let instructions = flatten_system_text(req.extra.get("system"));
     let is_compact = is_compact_messages_request(&req);
     let input = build_input(&req, opts.use_responses_lite, None)?;
-    let tools = read_tools(&mut req)?;
+    let tools = read_tools(&mut req, opts.use_responses_lite)?;
     let req = &req;
-    let tool_choice = map_tool_choice(req)?;
+    let tool_choice = map_tool_choice(req, opts.use_responses_lite)?;
     validate_input_modalities_iter(
         &opts.model,
         req.messages.iter().map(|message| &message.content),
@@ -1180,7 +1258,7 @@ const DEFERRED_TOOL_PLACEHOLDER: &str = "DeferredToolPlaceholder";
 fn responses_tool_name(tool: &ResponsesTool) -> Option<&str> {
     match tool {
         ResponsesTool::Function(function) => Some(function.name.as_str()),
-        ResponsesTool::WebSearch(_) => None,
+        ResponsesTool::WebSearch(_) | ResponsesTool::Namespace { .. } => None,
     }
 }
 
@@ -1253,7 +1331,7 @@ fn split_loaded_deferred_tools(
         // parameters tree into the same field instead of serializing a copy.
         let parameters = match &mut tool {
             ResponsesTool::Function(function) => Some(std::mem::take(&mut function.parameters)),
-            ResponsesTool::WebSearch(_) => None,
+            ResponsesTool::WebSearch(_) | ResponsesTool::Namespace { .. } => None,
         };
         let mut value = serde_json::to_value(&tool)?;
         if let Some(parameters) = parameters {
@@ -1269,10 +1347,32 @@ fn split_loaded_deferred_tools(
     Ok(prefix)
 }
 
-fn read_tools(req: &mut MessagesRequest) -> Result<Option<Vec<ResponsesTool>>, anyhow::Error> {
+fn read_tools(
+    req: &mut MessagesRequest,
+    lite: bool,
+) -> Result<Option<Vec<ResponsesTool>>, anyhow::Error> {
     let Some(tools) = req.extra.get_mut("tools").and_then(Value::as_array_mut) else {
         return Ok(None);
     };
+    let search_count = tools
+        .iter()
+        .filter(|tool| tool["type"] == "web_search_20250305")
+        .count();
+    anyhow::ensure!(
+        search_count <= 1,
+        "multiple server web search definitions are ambiguous"
+    );
+    if lite && search_count != 0 {
+        anyhow::ensure!(
+            !tools
+                .iter()
+                .any(|tool| matches!(tool["name"].as_str(), Some("web" | "web.run")))
+                && !temporal_tool_names(&req.messages)
+                    .iter()
+                    .any(|name| matches!(name.as_str(), "web" | "web.run")),
+            "tool name collides with the private web namespace"
+        );
+    }
     let mut out = Vec::new();
     for tool in tools {
         let tool_type = tool
@@ -1280,6 +1380,14 @@ fn read_tools(req: &mut MessagesRequest) -> Result<Option<Vec<ResponsesTool>>, a
             .and_then(|v| v.as_str())
             .unwrap_or("function");
         if tool_type == "web_search_20250305" {
+            if lite {
+                out.push(crate::providers::codex::search::native_search_tool());
+                continue;
+            }
+            anyhow::ensure!(
+                tool.get("max_uses").is_none(),
+                "web_search.max_uses has no verified full Responses enforcement; use Responses Lite or omit this limit"
+            );
             let mut filters = ResponsesWebSearchFilters {
                 allowed_domains: None,
                 blocked_domains: None,
@@ -1307,6 +1415,11 @@ fn read_tools(req: &mut MessagesRequest) -> Result<Option<Vec<ResponsesTool>>, a
                 external_web_access: true,
                 search_content_types: vec!["text".to_string(), "image".to_string()],
                 filters: if has_filters { Some(filters) } else { None },
+                user_location: tool.get("user_location").cloned(),
+                search_context_size: tool
+                    .get("search_context_size")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
             }));
         } else {
             out.push(function_tool(tool));
@@ -1448,7 +1561,10 @@ fn codex_tool_parameters(name: &str, mut parameters: Value) -> Value {
     parameters
 }
 
-fn map_tool_choice(req: &MessagesRequest) -> Result<Option<ResponsesToolChoice>, anyhow::Error> {
+fn map_tool_choice(
+    req: &MessagesRequest,
+    lite: bool,
+) -> Result<Option<ResponsesToolChoice>, anyhow::Error> {
     let choice = match req.extra.get("tool_choice") {
         Some(Value::Object(m)) => m,
         Some(Value::String(s)) => {
@@ -1485,7 +1601,13 @@ fn map_tool_choice(req: &MessagesRequest) -> Result<Option<ResponsesToolChoice>,
                         && tool.get("name").and_then(|v| v.as_str()) == Some(name)
                 })
             });
-            if is_web_search {
+            if is_web_search && lite {
+                // Orchestration restricts the initial catalog to web, then restores
+                // the caller's catalog after executing the required private call.
+                Ok(Some(ResponsesToolChoice::Mode(
+                    ResponsesToolChoiceMode::Required,
+                )))
+            } else if is_web_search {
                 Ok(Some(ResponsesToolChoice::AllowedTools {
                     r#type: "allowed_tools".to_string(),
                     mode: "required".to_string(),
@@ -1714,6 +1836,7 @@ fn build_input(
                             out.push(ResponsesInputItem::FunctionCall {
                                 call_id: id.to_string(),
                                 name: name.to_string(),
+                                namespace: None,
                                 arguments: args,
                             });
                         }

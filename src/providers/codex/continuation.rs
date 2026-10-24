@@ -488,16 +488,19 @@ fn input_items_equivalent(a: &ResponsesInputItem, b: &ResponsesInputItem) -> boo
         (
             ResponsesInputItem::FunctionCall {
                 call_id: a_call_id,
+                namespace: a_namespace,
                 name: a_name,
                 arguments: a_arguments,
             },
             ResponsesInputItem::FunctionCall {
                 call_id: b_call_id,
+                namespace: b_namespace,
                 name: b_name,
                 arguments: b_arguments,
             },
         ) => {
             a_call_id == b_call_id
+                && a_namespace == b_namespace
                 && a_name == b_name
                 && (a_arguments == b_arguments
                     || matches!(

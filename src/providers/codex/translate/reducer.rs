@@ -2,7 +2,7 @@ use crate::anthropic::sse::sse_events;
 use crate::providers::codex::events::{CodexFailureKind, classify_event_failure};
 
 use super::live_stream::{
-    BUFFERED_TOOL_MAX_ARGS_BYTES, CompletedFunctionCallValidationError,
+    BUFFERED_TOOL_MAX_ARGS_BYTES, CompletedFunctionCallValidationError, function_call_display_name,
     validate_completed_function_call, validate_completed_function_call_fields,
     validate_streamed_function_call,
 };
@@ -113,6 +113,7 @@ pub fn parse_codex_rate_limits(payload: &serde_json::Value) -> Option<Box<CodexR
 
 pub type StopReason = &'static str;
 pub const STOP_END_TURN: &str = "end_turn";
+pub const STOP_PAUSE_TURN: &str = "pause_turn";
 pub const STOP_TOOL_USE: &str = "tool_use";
 pub const STOP_MAX_TOKENS: &str = "max_tokens";
 pub const STOP_REFUSAL: &str = "refusal";
@@ -347,12 +348,22 @@ impl CompletedOutputs {
         }
         if kind == "response.output_item.added" {
             if payload["item"]["type"] == "function_call"
+                && payload["item"].get("namespace").is_some_and(|namespace| {
+                    !namespace.is_null()
+                        && namespace
+                            .as_str()
+                            .is_none_or(|namespace| namespace.trim().is_empty())
+                })
+            {
+                return Err("function call namespace must be a nonempty string".into());
+            }
+            if payload["item"]["type"] == "function_call"
                 && payload["item"]["status"] == "incomplete"
             {
                 return Err("incomplete output cannot start a tool call".into());
             }
             if let Some((old, _)) = self.items.get(&index) {
-                for key in ["type", "id", "call_id", "name"] {
+                for key in ["type", "id", "call_id", "name", "namespace"] {
                     if old
                         .get(key)
                         .zip(payload["item"].get(key))
@@ -386,7 +397,13 @@ impl CompletedOutputs {
                 return Err("output item identity moved to another index".into());
             }
             let duplicate = if let Some((old, done)) = self.items.get(&index) {
-                for key in ["type", "id", "call_id", "name"] {
+                if item["type"] == "function_call"
+                    && item.get("namespace").is_some()
+                    && item["namespace"] != old["namespace"]
+                {
+                    return Err("completed function call namespace changed".into());
+                }
+                for key in ["type", "id", "call_id", "name", "namespace"] {
                     if old.get(key).zip(item.get(key)).is_some_and(|(a, b)| a != b) {
                         return Err("completed output item identity changed".into());
                     }
@@ -396,6 +413,7 @@ impl CompletedOutputs {
                 } else {
                     for key in [
                         "id",
+                        "namespace",
                         "role",
                         "phase",
                         "encrypted_content",
@@ -560,7 +578,7 @@ impl CompletedOutputs {
                 Some("function_call") => {
                     // Keep the validated/sanitized tool projection. Other native
                     // tool lanes cannot be silently represented as ordinary calls.
-                    complete &= ["namespace", "encrypted_content", "encrypted_function_args"]
+                    complete &= ["encrypted_content", "encrypted_function_args"]
                         .iter()
                         .all(|key| item.get(key).is_none_or(|v| v.is_null()));
                     continue;
@@ -680,8 +698,11 @@ impl CompletedOutputs {
                     ResponsesInputItem::Compaction { encrypted_content } => {
                         complete &= !encrypted_content.is_empty()
                     }
-                    // Artifact retention is not complete hosted-search restoration.
-                    ResponsesInputItem::WebSearchCall { .. } => complete = false,
+                    // Replay genuine hosted items like Codex; this does not promise
+                    // that a fresh connection restores the hidden retrieved corpus.
+                    ResponsesInputItem::WebSearchCall { action, .. } => {
+                        complete &= action.is_some();
+                    }
                     _ => {}
                 }
                 items.insert(*index, native);
@@ -1101,6 +1122,7 @@ struct ToolState {
     index: usize,
     call_id: String,
     name: String,
+    namespace: Option<String>,
     args_accum: String,
     emitted_args: bool,
 }
@@ -1213,6 +1235,7 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
     let mut saw_tool_use = false;
     let mut text_parts = TextParts::default();
     let mut output_limited = false;
+    let mut needs_follow_up = false;
     let mut final_usage: Option<CodexUsage> = None;
     let mut service_tier: Option<String> = None;
     let mut latest_rate_limits: Option<Box<CodexRateLimits>> = None;
@@ -1234,6 +1257,7 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
             ResponsesInputItem::FunctionCall {
                 call_id: state.call_id,
                 name: state.name,
+                namespace: state.namespace,
                 arguments: state.args_accum,
             },
         );
@@ -1422,6 +1446,10 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                         index: idx,
                         call_id: call_id.clone(),
                         name: name.clone(),
+                        namespace: item
+                            .get("namespace")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned),
                         args_accum: String::new(),
                         emitted_args: false,
                     },
@@ -1429,7 +1457,11 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                 out.push(ReducerEvent::ToolStart {
                     index: idx,
                     id: call_id,
-                    name,
+                    name: function_call_display_name(
+                        item.get("namespace").and_then(serde_json::Value::as_str),
+                        &name,
+                    )
+                    .into_owned(),
                 });
                 continue;
             }
@@ -1637,7 +1669,8 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                         out.push(ReducerEvent::ToolStart {
                             index,
                             id: completed.call_id.to_owned(),
-                            name: completed.name.to_owned(),
+                            name: function_call_display_name(completed.namespace, completed.name)
+                                .into_owned(),
                         });
                         out.push(ReducerEvent::ToolDelta {
                             index,
@@ -1661,6 +1694,7 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                             ResponsesInputItem::FunctionCall {
                                 call_id: completed.call_id.to_owned(),
                                 name: completed.name.to_owned(),
+                                namespace: completed.namespace.map(str::to_owned),
                                 arguments,
                             },
                         );
@@ -1676,6 +1710,7 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                 let ToolState {
                     args_accum,
                     name,
+                    namespace,
                     call_id,
                     emitted_args,
                     index,
@@ -1685,6 +1720,12 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                         "tool output closed without a completed function call".to_string(),
                     )
                 })?;
+                if completed.namespace != namespace.as_deref() {
+                    return Err(CompletedFunctionCallValidationError::Protocol(
+                        "completed function call namespace changed".into(),
+                    )
+                    .into());
+                }
                 validate_streamed_function_call(completed, call_id, name, args_accum)?;
                 if !*emitted_args {
                     *args_accum = completed
@@ -1716,6 +1757,7 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                 usage.rate_limits = latest_rate_limits.take();
             }
             output_limited = crate::providers::codex::events::response_is_incomplete_terminal(&p);
+            needs_follow_up = crate::providers::codex::events::response_needs_follow_up(&p);
             continuation_eligible = !output_limited && !text_parts.has_refusal();
             if output_limited || text_parts.has_refusal() {
                 // A capped/refusal text part may not receive output_item.done. Retain
@@ -1767,6 +1809,8 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
         STOP_REFUSAL
     } else if saw_tool_use {
         STOP_TOOL_USE
+    } else if needs_follow_up {
+        STOP_PAUSE_TURN
     } else {
         STOP_END_TURN
     };

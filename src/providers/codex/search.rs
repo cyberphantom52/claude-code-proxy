@@ -10,6 +10,7 @@ use crate::request_identity::ConversationIdentity;
 use crate::traffic::TrafficCapture;
 
 use super::count_tokens::{approx_token_count, truncate_to_token_budget};
+use super::translate::request::{ResponsesFunctionTool, ResponsesTool};
 
 const SEARCH_OUTPUT_TOKEN_BUDGET: u64 = 2_500;
 const SEARCH_ASSISTANT_CONTEXT_TOKEN_BUDGET: u64 = 1_000;
@@ -521,4 +522,57 @@ fn emit(out: &mut Vec<u8>, traffic: Option<&TrafficCapture>, event: &str, data: 
         );
     }
     out.extend_from_slice(&encode_sse_event(Some(event), &data.to_string()));
+}
+
+pub(crate) fn native_search_tool() -> ResponsesTool {
+    let string = json!({"type": "string"});
+    let integer = json!({"type": "integer", "minimum": 0, "maximum": u64::MAX});
+    let operations = [
+        (
+            "search_query",
+            json!({"q": string, "recency": integer, "domains": {"type":"array", "items":string}}),
+            vec!["q"],
+        ),
+        (
+            "open",
+            json!({"ref_id": string, "lineno": integer}),
+            vec!["ref_id"],
+        ),
+        (
+            "click",
+            json!({"ref_id": string, "id": integer}),
+            vec!["ref_id", "id"],
+        ),
+        (
+            "find",
+            json!({"ref_id": string, "pattern": string}),
+            vec!["ref_id", "pattern"],
+        ),
+    ];
+    let mut properties = serde_json::Map::new();
+    for (name, fields, required) in operations {
+        properties.insert(
+            name.into(),
+            json!({
+                "type": "array", "items": {"type": "object", "properties": fields,
+                    "required": required, "additionalProperties": false}
+            }),
+        );
+    }
+    properties.insert(
+        "response_length".into(),
+        json!({"type":"string", "enum":["short","medium","long"]}),
+    );
+    ResponsesTool::Namespace {
+        kind: "namespace".into(),
+        name: "web".into(),
+        description: "Search and browse the web.".into(),
+        tools: vec![ResponsesTool::Function(ResponsesFunctionTool {
+            kind: "function".into(),
+            name: "run".into(),
+            description: Some("Search queries, open pages, click numbered links, or find page text. At least one operation is required. Results contain reference IDs for later calls.".into()),
+            parameters: json!({"type":"object", "properties":properties, "additionalProperties":false}),
+            strict: false,
+        })],
+    }
 }

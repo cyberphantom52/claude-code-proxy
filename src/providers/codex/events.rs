@@ -130,6 +130,19 @@ pub(crate) fn event_is_success_terminal(payload: &Value) -> bool {
     classify_stream_event(payload) == CodexStreamEventKind::TerminalSuccess
 }
 
+pub(crate) fn response_needs_follow_up(payload: &Value) -> bool {
+    event_is_success_terminal(payload)
+        && !response_is_incomplete_terminal(payload)
+        && (payload
+            .pointer("/response/end_turn")
+            .and_then(Value::as_bool)
+            == Some(false)
+            || payload
+                .pointer("/response/incomplete_details/reason")
+                .and_then(Value::as_str)
+                == Some("interrupted"))
+}
+
 pub(crate) fn event_error(payload: &Value) -> Option<&Value> {
     payload
         .get("error")
@@ -144,16 +157,20 @@ pub(crate) fn event_error(payload: &Value) -> Option<&Value> {
 pub(crate) fn response_is_incomplete_terminal(payload: &Value) -> bool {
     let event_type = payload.get("type").and_then(Value::as_str);
     let incomplete_details = payload.pointer("/response/incomplete_details");
+    // Lite can complete a sampling step without completing the user's turn.
+    // An interrupted step is resumable, not a token cap or a failed response.
+    let interrupted = incomplete_details
+        .and_then(|details| details.get("reason"))
+        .and_then(Value::as_str)
+        == Some("interrupted")
+        && event_error(payload).is_none();
     matches!(
         event_type,
         Some("response.completed" | "response.incomplete" | "response.done")
-    ) && (event_type == Some("response.incomplete")
-        || payload.pointer("/response/status").and_then(Value::as_str) == Some("incomplete")
-        || payload
-            .pointer("/response/end_turn")
-            .and_then(Value::as_bool)
-            == Some(false)
-        || incomplete_details.is_some_and(|details| !details.is_null()))
+    ) && !interrupted
+        && (event_type == Some("response.incomplete")
+            || payload.pointer("/response/status").and_then(Value::as_str) == Some("incomplete")
+            || incomplete_details.is_some_and(|details| !details.is_null()))
 }
 
 pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailure> {

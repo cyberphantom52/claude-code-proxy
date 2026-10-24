@@ -8,9 +8,9 @@ use crate::traffic::TrafficCapture;
 use super::read_rewrite::{repair_whitespace_stalled_read_args, sanitize_parsed_read_args};
 use super::reasoning_signature::{PendingReasoning, encode_reasoning_signature};
 use super::reducer::{
-    CodexRateLimits, CodexUsage, CompletedOutputs, STOP_END_TURN, STOP_MAX_TOKENS, STOP_REFUSAL,
-    STOP_TOOL_USE, TextDelta, TextParts, map_codex_usage_to_anthropic, parse_codex_rate_limits,
-    parse_codex_usage, upstream_annotations,
+    CodexRateLimits, CodexUsage, CompletedOutputs, STOP_END_TURN, STOP_MAX_TOKENS, STOP_PAUSE_TURN,
+    STOP_REFUSAL, STOP_TOOL_USE, TextDelta, TextParts, map_codex_usage_to_anthropic,
+    parse_codex_rate_limits, parse_codex_usage, upstream_annotations,
 };
 use super::web_search_compat::web_search_query;
 
@@ -20,12 +20,29 @@ pub(crate) const BUFFERED_TOOL_MAX_ARGS_BYTES: usize = 5_000_000;
 pub(crate) struct CompletedFunctionCall<'a> {
     pub call_id: &'a str,
     pub name: &'a str,
+    pub namespace: Option<&'a str>,
     pub arguments: Cow<'a, str>,
     pub parsed_arguments: serde_json::Value,
 }
 
+pub(crate) fn function_call_display_name<'a>(
+    namespace: Option<&str>,
+    name: &'a str,
+) -> Cow<'a, str> {
+    match namespace {
+        None | Some("functions") => Cow::Borrowed(name),
+        Some(namespace) => Cow::Owned(format!("{namespace}.{name}")),
+    }
+}
+
 impl CompletedFunctionCall<'_> {
     pub(crate) fn sanitized_arguments(&self, call_id: Option<&str>) -> Cow<'_, str> {
+        if self
+            .namespace
+            .is_some_and(|namespace| namespace != "functions")
+        {
+            return Cow::Borrowed(&self.arguments);
+        }
         sanitize_parsed_read_args(
             self.name,
             &self.arguments,
@@ -66,11 +83,23 @@ pub(crate) fn validate_completed_function_call(
             "function call is not completed".into(),
         ));
     }
-    validate_completed_function_call_fields(
+    let mut completed = validate_completed_function_call_fields(
         item.get("call_id").and_then(serde_json::Value::as_str),
         item.get("name").and_then(serde_json::Value::as_str),
         item.get("arguments").and_then(serde_json::Value::as_str),
-    )
+    )?;
+    completed.namespace = match item.get("namespace") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(namespace)) if !namespace.trim().is_empty() => {
+            Some(namespace)
+        }
+        Some(_) => {
+            return Err(CompletedFunctionCallValidationError::Protocol(
+                "function call namespace must be a nonempty string".into(),
+            ));
+        }
+    };
+    Ok(completed)
 }
 
 pub(crate) fn validate_completed_function_call_fields<'a>(
@@ -118,6 +147,7 @@ pub(crate) fn validate_completed_function_call_fields<'a>(
     Ok(CompletedFunctionCall {
         call_id,
         name,
+        namespace: None,
         arguments: Cow::Borrowed(arguments),
         parsed_arguments,
     })
@@ -160,6 +190,12 @@ pub(crate) fn validate_streamed_function_call(
         }
         Err(error @ CompletedFunctionCallValidationError::TooLarge { .. }) => return Err(error),
         Err(error) => {
+            if completed
+                .namespace
+                .is_some_and(|namespace| namespace != "functions")
+            {
+                return Err(error);
+            }
             let Some(repaired) = repair_whitespace_stalled_read_args(name, arguments, None) else {
                 return Err(error);
             };
@@ -183,6 +219,7 @@ struct LiveTool {
     index: usize,
     call_id: String,
     name: String,
+    namespace: Option<String>,
     args_accum: String,
     emitted_args: bool,
 }
@@ -586,6 +623,10 @@ impl LiveStreamTranslator {
                         index,
                         call_id: call_id.to_owned(),
                         name: name.to_owned(),
+                        namespace: item
+                            .get("namespace")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned),
                         args_accum: String::new(),
                         emitted_args: false,
                     },
@@ -601,7 +642,7 @@ impl LiveStreamTranslator {
                         "content_block": {
                             "type": "tool_use",
                             "id": call_id,
-                            "name": name,
+                            "name": function_call_display_name(item.get("namespace").and_then(serde_json::Value::as_str), name),
                             "input": {}
                         }
                     }),
@@ -893,6 +934,7 @@ impl LiveStreamTranslator {
         if let Some(LiveTool {
             call_id,
             name,
+            namespace,
             args_accum,
             ..
         }) = self.blocks_by_output_index.get(&output_index)
@@ -900,6 +942,9 @@ impl LiveStreamTranslator {
             let completed = completed_function_call
                 .as_ref()
                 .ok_or("tool output closed without a completed function call")?;
+            if completed.namespace != namespace.as_deref() {
+                return Err("completed function call namespace changed".into());
+            }
             validate_streamed_function_call(completed, call_id, name, args_accum)
                 .map_err(|error| error.to_string())?;
         }
@@ -964,7 +1009,7 @@ impl LiveStreamTranslator {
                 "content_block": {
                     "type": "tool_use",
                     "id": completed.call_id,
-                    "name": completed.name,
+                    "name": function_call_display_name(completed.namespace, completed.name),
                     "input": {}
                 }
             }),
@@ -1137,6 +1182,8 @@ impl LiveStreamTranslator {
                 STOP_REFUSAL
             } else if self.saw_tool_use {
                 STOP_TOOL_USE
+            } else if crate::providers::codex::events::response_needs_follow_up(payload) {
+                STOP_PAUSE_TURN
             } else {
                 STOP_END_TURN
             };

@@ -53,8 +53,15 @@ fn count_input_item_tokens(item: &ResponsesInputItem, scratch: &mut Vec<u8>) -> 
             total
         }
         ResponsesInputItem::FunctionCall {
-            name, arguments, ..
-        } => approx_token_count(name) + approx_token_count(arguments),
+            namespace,
+            name,
+            arguments,
+            ..
+        } => {
+            namespace.as_deref().map_or(0, approx_token_count)
+                + approx_token_count(name)
+                + approx_token_count(arguments)
+        }
         ResponsesInputItem::FunctionCallOutput { output, .. } => {
             count_function_call_output_tokens(output)
         }
@@ -127,6 +134,9 @@ fn count_tool_tokens(tools: &[ResponsesTool], scratch: &mut Vec<u8>) -> u64 {
             }
             ResponsesTool::WebSearch(_) => {
                 total += 10; // fixed overhead for web search tool
+            }
+            ResponsesTool::Namespace { .. } => {
+                total += count_serialized_tokens(tool, scratch);
             }
         }
     }
