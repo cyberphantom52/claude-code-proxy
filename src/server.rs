@@ -35,6 +35,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use futures_util::StreamExt;
 use http_body_util::{BodyExt, StreamBody};
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
@@ -2005,13 +2006,18 @@ async fn record_failed_response(
     }
     log.error("request_failed", Some(fields));
 
-    let stream = futures_util::stream::unfold((frames, body), |(mut frames, mut body)| async {
-        let frame = match frames.pop_front() {
-            Some(frame) => Some(frame),
-            None => body.frame().await,
-        };
-        frame.map(|frame| (frame, (frames, body)))
-    });
+    let stream = futures_util::stream::unfold(
+        (frames, body, complete),
+        |(mut frames, mut body, complete)| async move {
+            let frame = match frames.pop_front() {
+                Some(frame) => Some(frame),
+                None if complete => None,
+                None => body.frame().await,
+            };
+            frame.map(|frame| (frame, (frames, body, complete)))
+        },
+    )
+    .fuse();
     (
         Response::from_parts(parts, Body::new(StreamBody::new(stream))),
         Some(FailedResponseDetails { message }),
