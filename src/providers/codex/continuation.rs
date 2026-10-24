@@ -5,7 +5,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use super::models::{OperationProvenance, current_operation_provenance};
 use crate::request_identity::ConversationIdentity;
 
-use super::translate::request::{ResponsesInputItem, ResponsesRequest};
+use super::translate::request::{
+    ResponsesInputItem, ResponsesRequest, ResponsesToolChoice, ResponsesToolChoiceMode,
+};
 
 const TTL_MS: u64 = 30 * 60 * 1000;
 const MAX_STATES: usize = 10_000;
@@ -297,6 +299,32 @@ fn continuation_candidate_from_state(
                 previous_response_id: None,
                 input_delta: None,
                 disabled_reason: Some("empty_delta".to_string()),
+            },
+            Some(owner.clone()),
+            None,
+        );
+    }
+
+    let has_inline_tools = |input: &[ResponsesInputItem]| {
+        input.iter().any(
+            |item| matches!(item, ResponsesInputItem::AdditionalTools { tools, .. } if !tools.is_empty()),
+        )
+    };
+    // Required tool choice is validated against this request's declarations,
+    // even when previous_response_id retains the earlier Lite tool catalog.
+    if matches!(
+        body.tool_choice.as_ref(),
+        Some(ResponsesToolChoice::Mode(ResponsesToolChoiceMode::Required))
+    ) && body.tools.as_ref().is_none_or(Vec::is_empty)
+        && has_inline_tools(&state.transcript)
+        && !has_inline_tools(&suffix)
+    {
+        return ContinuationReservation::new(
+            ContinuationCandidate {
+                turn_id: Some(turn_id),
+                previous_response_id: None,
+                input_delta: None,
+                disabled_reason: Some("required_tools_outside_delta".to_string()),
             },
             Some(owner.clone()),
             None,
