@@ -223,6 +223,7 @@ struct LiveTool {
     namespace: Option<String>,
     args_accum: String,
     emitted_args: bool,
+    exposed: bool,
 }
 
 #[derive(Clone)]
@@ -333,7 +334,7 @@ impl LiveStreamTranslator {
         );
         let saved = terminal.then(|| self.clone());
         let result = (|| {
-            let events = self.completed_outputs.accept(payload)?;
+            let events = self.completed_outputs.accept(Cow::Borrowed(payload))?;
             let mut out = Vec::new();
             for event in events {
                 out.extend(self.accept_event(&event, traffic)?);
@@ -361,24 +362,6 @@ impl LiveStreamTranslator {
         }
         if self.stops.matched().is_some() && self.completed_outputs.has_refusal() {
             return Err("Codex refused after a local text stop".into());
-        }
-        if self.stops.matched().is_some()
-            && !matches!(
-                kind,
-                "response.completed"
-                    | "response.incomplete"
-                    | "response.done"
-                    | "response.created"
-                    | "codex.rate_limits"
-            )
-        {
-            if kind == "response.output_item.done"
-                && payload["item"]["type"] == "web_search_call"
-                && payload["_ccp_output_already_done"] != true
-            {
-                self.web_search_requests += 1;
-            }
-            return Ok(out);
         }
         if matches!(
             kind,
@@ -421,12 +404,9 @@ impl LiveStreamTranslator {
             }
         }
         let next_index = self.anthropic_index;
-        let text_deltas = if self.stops.matched().is_none() {
+        let text_deltas =
             self.text_parts
-                .accept(payload, &mut self.anthropic_index, text_output_index)?
-        } else {
-            Vec::new()
-        };
+                .accept(payload, &mut self.anthropic_index, text_output_index)?;
         // Reconcile final-only text before deciding, but reject an empty replacement
         // before emitting starts or marking the translator finished.
         if crate::providers::codex::events::event_is_success_terminal(payload)
@@ -462,16 +442,6 @@ impl LiveStreamTranslator {
             }
             self.annotations.clear();
             self.annotation_bytes = 0;
-            if !matches!(
-                kind,
-                "response.completed"
-                    | "response.incomplete"
-                    | "response.done"
-                    | "response.created"
-                    | "codex.rate_limits"
-            ) {
-                return Ok(out);
-            }
         }
         match kind {
             "codex.rate_limits" => {
@@ -480,7 +450,8 @@ impl LiveStreamTranslator {
             }
             "response.created" => {
                 self.service_tier = payload
-                    .pointer("/response/service_tier")
+                    .get("response")
+                    .and_then(|value| value.get("service_tier"))
                     .and_then(|v| v.as_str())
                     .map(str::to_owned);
                 self.emit_ping(traffic, &mut out);
@@ -707,8 +678,12 @@ impl LiveStreamTranslator {
                             .map(str::to_owned),
                         args_accum: String::new(),
                         emitted_args: false,
+                        exposed: self.stops.matched().is_none(),
                     },
                 );
+                if self.stops.matched().is_some() {
+                    return;
+                }
                 self.ensure_message_start(traffic, out);
                 self.emit(
                     traffic,
@@ -738,7 +713,7 @@ impl LiveStreamTranslator {
     ) {
         let output_index = output_index(payload);
         let delta = payload.get("delta").and_then(|v| v.as_str()).unwrap_or("");
-        if delta.is_empty() {
+        if delta.is_empty() || self.stops.matched().is_some() {
             return;
         }
         self.semantic_output_started = true;
@@ -789,7 +764,8 @@ impl LiveStreamTranslator {
                     .as_str()
                     .or_else(|| {
                         payload
-                            .pointer("/item/id")
+                            .get("item")
+                            .and_then(|value| value.get("id"))
                             .and_then(serde_json::Value::as_str)
                     })
                     .and_then(|id| self.item_id_to_output_index.get(id).copied())
@@ -889,7 +865,7 @@ impl LiveStreamTranslator {
             ));
         }
         args_accum.push_str(delta);
-        if name != "Read" {
+        if name != "Read" && self.stops.matched().is_none() {
             *emitted_args = true;
             let index = *index;
             self.emit(
@@ -941,7 +917,8 @@ impl LiveStreamTranslator {
             return Ok(());
         }
         if payload
-            .pointer("/item/type")
+            .get("item")
+            .and_then(|value| value.get("type"))
             .and_then(serde_json::Value::as_str)
             == Some("message")
         {
@@ -957,6 +934,9 @@ impl LiveStreamTranslator {
             .filter(|item_type| *item_type == "reasoning")
             .and_then(|_| payload.get("item"))
         {
+            if self.stops.matched().is_some() {
+                return Ok(());
+            }
             self.reasoning_by_output_index
                 .entry(output_index)
                 .or_default()
@@ -977,6 +957,10 @@ impl LiveStreamTranslator {
             .and_then(|v| v.as_str())
             == Some("web_search_call")
         {
+            self.web_search_requests += 1;
+            if self.stops.matched().is_some() {
+                return Ok(());
+            }
             self.close_thinking(traffic, out);
             self.semantic_output_started = true;
             self.current_generation_semantic_output_started = true;
@@ -986,7 +970,6 @@ impl LiveStreamTranslator {
             let result_index = self.anthropic_index;
             self.anthropic_index += 1;
             let raw_id = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
-            self.web_search_requests += 1;
             self.web_searches.push(LiveWebSearch {
                 index,
                 result_index,
@@ -997,7 +980,8 @@ impl LiveStreamTranslator {
         }
 
         let completed_function_call = if payload
-            .pointer("/item/type")
+            .get("item")
+            .and_then(|value| value.get("type"))
             .and_then(|value| value.as_str())
             == Some("function_call")
         {
@@ -1033,6 +1017,17 @@ impl LiveStreamTranslator {
         let Some(state) = self.blocks_by_output_index.remove(&output_index) else {
             return Ok(());
         };
+        if self.stops.matched().is_some() {
+            if state.exposed {
+                self.emit(
+                    traffic,
+                    out,
+                    "content_block_stop",
+                    &serde_json::json!({"type":"content_block_stop", "index":state.index}),
+                );
+            }
+            return Ok(());
+        }
 
         let LiveTool {
             index,
@@ -1072,6 +1067,9 @@ impl LiveStreamTranslator {
         traffic: Option<&TrafficCapture>,
         out: &mut Vec<u8>,
     ) {
+        if self.stops.matched().is_some() {
+            return;
+        }
         let arguments = completed.sanitized_arguments(Some(completed.call_id));
 
         self.close_thinking(traffic, out);
@@ -1122,7 +1120,8 @@ impl LiveStreamTranslator {
 
     fn open_tool_output_index_for_done(&self, payload: &serde_json::Value) -> Option<usize> {
         let call_id = payload
-            .pointer("/item/call_id")
+            .get("item")
+            .and_then(|value| value.get("call_id"))
             .and_then(serde_json::Value::as_str)?;
         if let Some(output_index) = payload
             .get("output_index")
@@ -1307,6 +1306,9 @@ impl LiveStreamTranslator {
             let Some(state) = self.blocks_by_output_index.remove(&output_index) else {
                 continue;
             };
+            if !state.exposed {
+                continue;
+            }
             let index = state.index;
             self.emit(
                 traffic,

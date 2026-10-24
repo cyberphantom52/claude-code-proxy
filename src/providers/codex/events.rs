@@ -95,10 +95,14 @@ pub(crate) fn classify_stream_event(payload: &Value) -> CodexStreamEventKind {
         }
         Some("response.output_item.done")
             if matches!(
-                payload.pointer("/item/type").and_then(Value::as_str),
+                payload
+                    .get("item")
+                    .and_then(|value| value.get("type"))
+                    .and_then(Value::as_str),
                 Some("function_call" | "web_search_call")
             ) || payload
-                .pointer("/item/content")
+                .get("item")
+                .and_then(|value| value.get("content"))
                 .and_then(Value::as_array)
                 .is_some_and(|parts| parts.iter().any(part_has_semantic_text)) =>
         {
@@ -134,11 +138,14 @@ pub(crate) fn response_needs_follow_up(payload: &Value) -> bool {
     event_is_success_terminal(payload)
         && !response_is_incomplete_terminal(payload)
         && (payload
-            .pointer("/response/end_turn")
+            .get("response")
+            .and_then(|value| value.get("end_turn"))
             .and_then(Value::as_bool)
             == Some(false)
             || payload
-                .pointer("/response/incomplete_details/reason")
+                .get("response")
+                .and_then(|value| value.get("incomplete_details"))
+                .and_then(|value| value.get("reason"))
                 .and_then(Value::as_str)
                 == Some("interrupted"))
 }
@@ -149,14 +156,17 @@ pub(crate) fn event_error(payload: &Value) -> Option<&Value> {
         .filter(|error| !error.is_null())
         .or_else(|| {
             payload
-                .pointer("/response/error")
+                .get("response")
+                .and_then(|value| value.get("error"))
                 .filter(|error| !error.is_null())
         })
 }
 
 pub(crate) fn response_is_incomplete_terminal(payload: &Value) -> bool {
     let event_type = payload.get("type").and_then(Value::as_str);
-    let incomplete_details = payload.pointer("/response/incomplete_details");
+    let incomplete_details = payload
+        .get("response")
+        .and_then(|value| value.get("incomplete_details"));
     // Lite can complete a sampling step without completing the user's turn.
     // An interrupted step is resumable, not a token cap or a failed response.
     let interrupted = incomplete_details
@@ -169,19 +179,28 @@ pub(crate) fn response_is_incomplete_terminal(payload: &Value) -> bool {
         Some("response.completed" | "response.incomplete" | "response.done")
     ) && !interrupted
         && (event_type == Some("response.incomplete")
-            || payload.pointer("/response/status").and_then(Value::as_str) == Some("incomplete")
+            || payload
+                .get("response")
+                .and_then(|value| value.get("status"))
+                .and_then(Value::as_str)
+                == Some("incomplete")
             || incomplete_details.is_some_and(|details| !details.is_null()))
 }
 
 pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailure> {
     let event_type = payload.get("type").and_then(Value::as_str)?;
-    let response_status = payload.pointer("/response/status").and_then(Value::as_str);
+    let response_status = payload
+        .get("response")
+        .and_then(|value| value.get("status"))
+        .and_then(Value::as_str);
     if event_type == "codex.rate_limits" {
         return None;
     }
     if response_is_incomplete_terminal(payload) {
         let reason = payload
-            .pointer("/response/incomplete_details/reason")
+            .get("response")
+            .and_then(|value| value.get("incomplete_details"))
+            .and_then(|value| value.get("reason"))
             .and_then(Value::as_str)
             .unwrap_or("unknown");
         // This is a final capped answer, not a transport failure. Request-side
@@ -190,10 +209,14 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
             return None;
         }
         let id = payload
-            .pointer("/response/id")
+            .get("response")
+            .and_then(|value| value.get("id"))
             .and_then(Value::as_str)
             .unwrap_or("unknown");
-        let usage = payload.pointer("/response/usage").unwrap_or(&Value::Null);
+        let usage = payload
+            .get("response")
+            .and_then(|value| value.get("usage"))
+            .unwrap_or(&Value::Null);
         return Some(CodexEventFailure {
             kind: CodexFailureKind::Permanent,
             explicit_status: None,

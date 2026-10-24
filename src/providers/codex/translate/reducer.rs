@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use crate::anthropic::sse::sse_events;
 use crate::providers::codex::events::{CodexFailureKind, classify_event_failure};
 
@@ -204,13 +206,13 @@ impl CompletedOutputs {
         Ok(())
     }
 
-    pub fn accept(
+    pub fn accept<'a>(
         &mut self,
-        payload: &serde_json::Value,
-    ) -> Result<Vec<serde_json::Value>, String> {
+        payload: Cow<'a, serde_json::Value>,
+    ) -> Result<Vec<Cow<'a, serde_json::Value>>, String> {
         let kind = payload["type"].as_str().unwrap_or("");
-        if classify_event_failure(payload).is_some() {
-            return Ok(vec![payload.clone()]);
+        if classify_event_failure(&payload).is_some() {
+            return Ok(vec![payload]);
         }
         let mut out = Vec::new();
         if matches!(
@@ -218,7 +220,7 @@ impl CompletedOutputs {
             "response.completed" | "response.done" | "response.incomplete"
         ) {
             let incomplete =
-                crate::providers::codex::events::response_is_incomplete_terminal(payload);
+                crate::providers::codex::events::response_is_incomplete_terminal(&payload);
             if !incomplete
                 && self
                     .items
@@ -227,12 +229,15 @@ impl CompletedOutputs {
             {
                 return Err("successful response contains an incomplete output item".into());
             }
-            if let Some(items) = payload.pointer("/response/output") {
+            if let Some(items) = payload
+                .get("response")
+                .and_then(|value| value.get("output"))
+            {
                 let items = items
                     .as_array()
                     .ok_or("terminal response output must be an array")?;
                 let unsafe_terminal = self.refused
-                    || crate::providers::codex::events::response_is_incomplete_terminal(payload)
+                    || crate::providers::codex::events::response_is_incomplete_terminal(&payload)
                     || items.iter().any(|item| {
                         item["content"]
                             .as_array()
@@ -246,13 +251,13 @@ impl CompletedOutputs {
                     if unsafe_terminal && item["type"] == "function_call" && !already_done {
                         return Err("capped or refused output cannot finalize a tool call".into());
                     }
-                    out.extend(self.accept(&serde_json::json!({"type":"response.output_item.done","output_index":index,"item":item}))?);
+                    out.extend(self.accept(Cow::Owned(serde_json::json!({"type":"response.output_item.done","output_index":index,"item":item})))?);
                 }
             }
-            out.push(payload.clone());
+            out.push(payload);
             return Ok(out);
         }
-        let index = self.index(payload);
+        let index = self.index(&payload);
         let part_type = if kind.starts_with("response.output_text.")
             || kind.starts_with("response.refusal.")
             || kind.starts_with("response.content_part.")
@@ -290,16 +295,20 @@ impl CompletedOutputs {
         }
         self.refused |= kind.starts_with("response.refusal.")
             || payload
-                .pointer("/part/type")
+                .get("part")
+                .and_then(|value| value.get("type"))
                 .is_some_and(|p| p == "refusal")
             || payload
-                .pointer("/item/content")
+                .get("item")
+                .and_then(|value| value.get("content"))
                 .and_then(serde_json::Value::as_array)
                 .is_some_and(|parts| parts.iter().any(|p| p["type"] == "refusal"));
         if kind.starts_with("response.reasoning_summary_") {
-            return self.reconcile_summary(payload, index);
+            return self
+                .reconcile_summary(&payload, index)
+                .map(|events| events.into_iter().map(Cow::Owned).collect());
         }
-        for annotation in upstream_annotations(payload, index) {
+        for annotation in upstream_annotations(&payload, index) {
             let ci = annotation["content_index"].as_u64().unwrap_or(0) as usize;
             let annotations = self.annotations.entry((index, ci)).or_default();
             let annotation = &annotation["annotation"];
@@ -444,24 +453,32 @@ impl CompletedOutputs {
             }
             validate_output_message(&item)?;
             if item["type"] == "reasoning" {
-                let mut event = payload.clone();
+                let mut event = payload.clone().into_owned();
                 event["item"] = item.clone();
-                out.extend(self.reconcile_summary(&event, index)?);
+                out.extend(
+                    self.reconcile_summary(&event, index)?
+                        .into_iter()
+                        .map(Cow::Owned),
+                );
                 self.summary_parts.close_item(Some(index));
             }
             self.retain(index, item.clone(), item["status"] != "incomplete")?;
-            let mut event = payload.clone();
+            let mut event = payload.into_owned();
             event["item"] = item;
             event["output_index"] = index.into();
             event["_ccp_output_already_done"] = duplicate.into();
-            out.push(event);
+            out.push(Cow::Owned(event));
             return Ok(out);
         }
-        let mut event = payload.clone();
-        if matches!(kind, "response.output_item.added") || payload.get("item_id").is_some() {
+        if (kind == "response.output_item.added" || payload.get("item_id").is_some())
+            && payload["output_index"].as_u64() != Some(index as u64)
+        {
+            let mut event = payload.into_owned();
             event["output_index"] = index.into();
+            out.push(Cow::Owned(event));
+        } else {
+            out.push(payload);
         }
-        out.push(event);
         Ok(out)
     }
 
@@ -515,13 +532,18 @@ impl CompletedOutputs {
             if !text.is_string() {
                 return Err("reasoning summary requires string content".into());
             }
-            event["type"] = if delta {
-                "response.output_text.delta"
+            if kind.ends_with(".added") {
+                event["type"] = "response.content_part.added".into();
+                event["part"] = serde_json::json!({"type":"output_text","text":text});
             } else {
-                "response.output_text.done"
+                event["type"] = if delta {
+                    "response.output_text.delta"
+                } else {
+                    "response.output_text.done"
+                }
+                .into();
+                event[if delta { "delta" } else { "text" }] = text.clone();
             }
-            .into();
-            event[if delta { "delta" } else { "text" }] = text.clone();
             let ci = payload.get("summary_index").map_or(Ok(0), |v| {
                 v.as_u64()
                     .and_then(|v| usize::try_from(v).ok())
@@ -791,6 +813,7 @@ fn merge_completed_output(
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TextParts {
     parts: std::collections::BTreeMap<(usize, usize), TextPart>,
+    completed_items: std::collections::BTreeSet<usize>,
     retained_bytes: usize,
     ordered: bool,
     linear: bool,
@@ -801,6 +824,7 @@ struct TextPart {
     index: usize,
     text: String,
     refusal: bool,
+    finalized: bool,
     closed: bool,
 }
 pub(crate) struct TextDelta {
@@ -835,6 +859,7 @@ impl TextParts {
             .filter_map(|((oi, _), part)| {
                 if !part.closed && output_index.is_none_or(|index| index == *oi) {
                     part.closed = true;
+                    part.finalized = true;
                     Some(part.index)
                 } else {
                     None
@@ -904,20 +929,25 @@ impl TextParts {
                 updates.push((output_index, ci, text, delta, refusal));
             }
         }
-        if kind == "response.content_part.done" {
+        if matches!(
+            kind,
+            "response.content_part.added" | "response.content_part.done"
+        ) {
             let part = &payload["part"];
             if matches!(part["type"].as_str(), Some("output_text" | "refusal")) {
                 let refusal = part["type"] == "refusal";
                 let text = part[if refusal { "refusal" } else { "text" }]
                     .as_str()
                     .ok_or("text part requires string content")?;
-                updates.push((
-                    output_index,
-                    payload["content_index"].as_u64().unwrap_or(0) as usize,
-                    text,
-                    false,
-                    refusal,
-                ));
+                if kind == "response.content_part.done" || !text.is_empty() {
+                    updates.push((
+                        output_index,
+                        payload["content_index"].as_u64().unwrap_or(0) as usize,
+                        text,
+                        false,
+                        refusal,
+                    ));
+                }
             }
         }
         let items: Vec<(usize, &serde_json::Value)> = if kind == "response.output_item.done" {
@@ -927,7 +957,8 @@ impl TextParts {
             "response.completed" | "response.done" | "response.incomplete"
         ) {
             payload
-                .pointer("/response/output")
+                .get("response")
+                .and_then(|value| value.get("output"))
                 .and_then(serde_json::Value::as_array)
                 .into_iter()
                 .flatten()
@@ -936,16 +967,19 @@ impl TextParts {
         } else {
             Vec::new()
         };
+        let mut completed_items = Vec::new();
         for (oi, item) in items {
             if item["type"] == "message" {
-                if self.linear
-                    && let Some(content) = item["content"].as_array()
+                if let Some(content) = item["content"].as_array()
                     && self
                         .parts
                         .range((oi, 0)..=(oi, usize::MAX))
                         .any(|((_, ci), _)| *ci >= content.len())
                 {
                     return Err("completed output message omitted a streamed text part".into());
+                }
+                if item["status"] != "incomplete" {
+                    completed_items.push(oi);
                 }
                 for (ci, part) in item["content"].as_array().into_iter().flatten().enumerate() {
                     if matches!(part["type"].as_str(), Some("output_text" | "refusal")) {
@@ -970,6 +1004,9 @@ impl TextParts {
         let mut validated = Vec::with_capacity(updates.len());
         for (oi, ci, text, delta, refusal) in updates {
             let part = self.parts.get(&(oi, ci));
+            if part.is_none() && self.completed_items.contains(&oi) {
+                return Err("completed output message gained a new text part".into());
+            }
             if part.is_some_and(|part| part.refusal != refusal) {
                 return Err("upstream text part changed type".into());
             }
@@ -979,8 +1016,8 @@ impl TextParts {
                 text.strip_prefix(part.map_or("", |part| part.text.as_str()))
                     .ok_or("text completion disagrees with streamed text")?
             };
-            if part.is_some_and(|part| part.closed) && !suffix.is_empty() {
-                return Err("completed text part changed after output item closed".into());
+            if part.is_some_and(|part| part.finalized || part.closed) && !suffix.is_empty() {
+                return Err("completed text part changed after finalization".into());
             }
             if self.ordered
                 && !suffix.is_empty()
@@ -1009,13 +1046,11 @@ impl TextParts {
         }
         self.retained_bytes = retained;
         self.last_emitted = last_emitted;
-        let close_parts = self.linear
-            && matches!(
-                kind,
-                "response.output_text.done"
-                    | "response.refusal.done"
-                    | "response.content_part.done"
-            );
+        self.completed_items.extend(completed_items);
+        let finalize_parts = matches!(
+            kind,
+            "response.output_text.done" | "response.refusal.done" | "response.content_part.done"
+        );
         let mut out = Vec::with_capacity(validated.len());
         for (oi, ci, suffix, refusal) in validated {
             let start = !self.parts.contains_key(&(oi, ci));
@@ -1026,11 +1061,13 @@ impl TextParts {
                     index,
                     text: String::new(),
                     refusal,
+                    finalized: false,
                     closed: false,
                 }
             });
             part.text.push_str(suffix);
-            part.closed |= close_parts;
+            part.finalized |= finalize_parts;
+            part.closed |= self.linear && finalize_parts;
             if start || !suffix.is_empty() {
                 out.push(TextDelta {
                     index: part.index,
@@ -1089,7 +1126,8 @@ pub(super) fn upstream_annotations(
         "response.completed" | "response.done" | "response.incomplete"
     ) {
         payload
-            .pointer("/response/output")
+            .get("response")
+            .and_then(|value| value.get("output"))
             .and_then(serde_json::Value::as_array)
             .into_iter()
             .flatten()
@@ -1328,10 +1366,15 @@ pub fn reduce_upstream_bytes_with_stops(
     let mut completed_outputs = CompletedOutputs::default();
     let payloads = sse_events(&text)
         .filter_map(|evt| serde_json::from_str::<serde_json::Value>(evt.data.trim()).ok())
-        .flat_map(|payload| match completed_outputs.accept(&payload) {
-            Ok(events) => events.into_iter().map(Ok).collect::<Vec<_>>(),
-            Err(error) => vec![Err(error)],
-        });
+        .flat_map(
+            |payload| match completed_outputs.accept(Cow::Owned(payload)) {
+                Ok(events) => events
+                    .into_iter()
+                    .map(|event| Ok(event.into_owned()))
+                    .collect::<Vec<_>>(),
+                Err(error) => vec![Err(error)],
+            },
+        );
     for payload in payloads {
         let p = payload.map_err(|message| UpstreamStreamError {
             kind: UpstreamErrorKind::Failed,
@@ -1405,7 +1448,11 @@ pub fn reduce_upstream_bytes_with_stops(
             .or_else(|| {
                 p["item_id"]
                     .as_str()
-                    .or_else(|| p.pointer("/item/id").and_then(serde_json::Value::as_str))
+                    .or_else(|| {
+                        p.get("item")
+                            .and_then(|value| value.get("id"))
+                            .and_then(serde_json::Value::as_str)
+                    })
                     .and_then(|id| item_id_to_output_index.get(id).copied())
             })
             .unwrap_or(0);
@@ -1458,7 +1505,8 @@ pub fn reduce_upstream_bytes_with_stops(
 
         if t == "response.created" {
             service_tier = p
-                .pointer("/response/service_tier")
+                .get("response")
+                .and_then(|value| value.get("service_tier"))
                 .and_then(|v| v.as_str())
                 .map(str::to_owned);
             continue;

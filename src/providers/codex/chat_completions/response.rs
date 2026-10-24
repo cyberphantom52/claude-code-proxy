@@ -88,7 +88,7 @@ impl CompletionState {
         let mut suffix = String::new();
         for reconciled in self
             .completed_outputs
-            .accept(event)
+            .accept(std::borrow::Cow::Borrowed(event))
             .map_err(ChatError::upstream)?
         {
             let output_index = reconciled["output_index"].as_u64().unwrap_or(0) as usize;
