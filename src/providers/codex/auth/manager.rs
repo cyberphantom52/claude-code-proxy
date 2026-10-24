@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex as AsyncMutex;
 
 use super::constants::{CLIENT_ID, ISSUER, REFRESH_MARGIN_MS};
-use super::jwt::{TokenResponse, extract_account_id, validate_token_response};
+use super::jwt::{RefreshResponse, TokenResponse, extract_account_id, validate_token_response};
 use super::token_store::{CodexTokenStore, StoredAuth};
 use crate::auth::{AuthSnapshot, AuthStorage};
 
@@ -118,11 +118,11 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
             anyhow::bail!("Token refresh failed: {status}");
         }
 
-        let tokens: TokenResponse = resp
+        let tokens: RefreshResponse = resp
             .json()
             .await
             .map_err(|e| anyhow::anyhow!("failed to parse token response: {e}"))?;
-        validate_token_response(&tokens)?;
+        let tokens = tokens.into_tokens(&current.refresh)?;
         let account_id = extract_account_id(&tokens).or_else(|| current.account_id.clone());
         let expires =
             Self::now_ms().saturating_add(tokens.expires_in.unwrap_or(3600).saturating_mul(1000));

@@ -36,6 +36,29 @@ pub struct TokenResponse {
     pub expires_in: Option<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+pub(super) struct RefreshResponse {
+    id_token: Option<String>,
+    access_token: String,
+    refresh_token: Option<String>,
+    expires_in: Option<u64>,
+}
+
+impl RefreshResponse {
+    pub(super) fn into_tokens(self, current_refresh: &str) -> anyhow::Result<TokenResponse> {
+        let tokens = TokenResponse {
+            id_token: self.id_token,
+            access_token: self.access_token,
+            refresh_token: self
+                .refresh_token
+                .unwrap_or_else(|| current_refresh.to_string()),
+            expires_in: self.expires_in,
+        };
+        validate_token_response(&tokens)?;
+        Ok(tokens)
+    }
+}
+
 fn parse_jwt_claims(token: &str) -> Option<IdTokenClaims> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
