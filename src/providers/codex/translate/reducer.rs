@@ -112,6 +112,207 @@ pub fn parse_codex_rate_limits(payload: &serde_json::Value) -> Option<Box<CodexR
 pub type StopReason = &'static str;
 pub const STOP_END_TURN: &str = "end_turn";
 pub const STOP_TOOL_USE: &str = "tool_use";
+pub const STOP_MAX_TOKENS: &str = "max_tokens";
+pub const STOP_REFUSAL: &str = "refusal";
+
+// Share reconciliation between buffered and live output, keyed by content part.
+#[derive(Default)]
+pub(super) struct TextParts {
+    parts: std::collections::BTreeMap<(usize, usize), TextPart>,
+    retained_bytes: usize,
+}
+struct TextPart {
+    index: usize,
+    text: String,
+    refusal: bool,
+    closed: bool,
+}
+pub(super) struct TextDelta {
+    pub index: usize,
+    pub start: bool,
+    pub text: String,
+    pub refusal: bool,
+}
+impl TextParts {
+    pub fn has_refusal(&self) -> bool {
+        self.parts.values().any(|part| part.refusal)
+    }
+    pub fn has_open_parts(&self) -> bool {
+        self.parts.values().any(|part| !part.closed)
+    }
+    pub fn close_item(&mut self, output_index: Option<usize>) -> Vec<usize> {
+        self.parts
+            .iter_mut()
+            .filter_map(|((oi, _), part)| {
+                if !part.closed && output_index.is_none_or(|index| index == *oi) {
+                    part.closed = true;
+                    Some(part.index)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+    pub fn output_items(&mut self) -> Vec<(usize, ResponsesInputItem)> {
+        let mut messages = std::collections::BTreeMap::<usize, Vec<_>>::new();
+        for ((oi, _), part) in &mut self.parts {
+            if !part.refusal && !part.text.is_empty() {
+                messages.entry(*oi).or_default().push(
+                    super::request::ResponsesContentPart::OutputText {
+                        text: std::mem::take(&mut part.text),
+                    },
+                );
+            }
+        }
+        messages
+            .into_iter()
+            .map(|(oi, content)| {
+                (
+                    oi,
+                    ResponsesInputItem::Message {
+                        role: "assistant".into(),
+                        content,
+                    },
+                )
+            })
+            .collect()
+    }
+    pub fn accept(
+        &mut self,
+        payload: &serde_json::Value,
+        next: &mut usize,
+        output_index: usize,
+    ) -> Result<Vec<TextDelta>, String> {
+        let mut updates = Vec::new();
+        let kind = payload["type"].as_str().unwrap_or("");
+        if matches!(
+            kind,
+            "response.output_text.delta"
+                | "response.output_text.done"
+                | "response.refusal.delta"
+                | "response.refusal.done"
+        ) {
+            let ci = payload["content_index"].as_u64().unwrap_or(0) as usize;
+            let refusal = kind.starts_with("response.refusal.");
+            let delta = kind.ends_with(".delta");
+            let field = if delta {
+                "delta"
+            } else if refusal {
+                "refusal"
+            } else {
+                "text"
+            };
+            let text = payload[field]
+                .as_str()
+                .ok_or("text event requires string content")?;
+            if !delta || !text.is_empty() {
+                updates.push((output_index, ci, text, delta, refusal));
+            }
+        }
+        if kind == "response.content_part.done" {
+            let part = &payload["part"];
+            if matches!(part["type"].as_str(), Some("output_text" | "refusal")) {
+                let refusal = part["type"] == "refusal";
+                let text = part[if refusal { "refusal" } else { "text" }]
+                    .as_str()
+                    .ok_or("text part requires string content")?;
+                updates.push((
+                    output_index,
+                    payload["content_index"].as_u64().unwrap_or(0) as usize,
+                    text,
+                    false,
+                    refusal,
+                ));
+            }
+        }
+        let items: Vec<(usize, &serde_json::Value)> = if kind == "response.output_item.done" {
+            vec![(output_index, &payload["item"])]
+        } else if matches!(
+            kind,
+            "response.completed" | "response.done" | "response.incomplete"
+        ) {
+            payload
+                .pointer("/response/output")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .enumerate()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        for (oi, item) in items {
+            if item["type"] == "message" {
+                for (ci, part) in item["content"].as_array().into_iter().flatten().enumerate() {
+                    if matches!(part["type"].as_str(), Some("output_text" | "refusal")) {
+                        let refusal = part["type"] == "refusal";
+                        updates.push((
+                            oi,
+                            ci,
+                            part[if refusal { "refusal" } else { "text" }]
+                                .as_str()
+                                .ok_or("text part requires string content")?,
+                            false,
+                            refusal,
+                        ));
+                    }
+                }
+            }
+        }
+        // Validate the entire event before changing block state: an error must
+        // not leave unseen starts for the live error path to close.
+        let mut retained = self.retained_bytes;
+        let mut validated = Vec::with_capacity(updates.len());
+        for (oi, ci, text, delta, refusal) in updates {
+            let part = self.parts.get(&(oi, ci));
+            if part.is_some_and(|part| part.refusal != refusal) {
+                return Err("upstream text part changed type".into());
+            }
+            let suffix = if delta {
+                text
+            } else {
+                text.strip_prefix(part.map_or("", |part| part.text.as_str()))
+                    .ok_or("text completion disagrees with streamed text")?
+            };
+            if part.is_some_and(|part| part.closed) && !suffix.is_empty() {
+                return Err("completed text part changed after output item closed".into());
+            }
+            let overhead = if part.is_none() { 256 } else { 0 };
+            retained = retained
+                .saturating_add(overhead)
+                .saturating_add(suffix.len());
+            if retained > crate::providers::codex::client::MAX_PENDING_HTTP_EVENT_BYTES {
+                return Err("Codex text reconciliation exceeded its 16 MiB buffer limit".into());
+            }
+            validated.push((oi, ci, suffix, refusal));
+        }
+        self.retained_bytes = retained;
+        let mut out = Vec::with_capacity(validated.len());
+        for (oi, ci, suffix, refusal) in validated {
+            let start = !self.parts.contains_key(&(oi, ci));
+            let part = self.parts.entry((oi, ci)).or_insert_with(|| {
+                let index = *next;
+                *next += 1;
+                TextPart {
+                    index,
+                    text: String::new(),
+                    refusal,
+                    closed: false,
+                }
+            });
+            part.text.push_str(suffix);
+            if start || !suffix.is_empty() {
+                out.push(TextDelta {
+                    index: part.index,
+                    start,
+                    text: suffix.to_owned(),
+                    refusal,
+                });
+            }
+        }
+        Ok(out)
+    }
+}
 
 pub type TerminalType = &'static str;
 pub const TERM_COMPLETED: &str = "response.completed";
@@ -121,10 +322,7 @@ pub const TERM_DONE: &str = "response.done";
 impl From<CompletedFunctionCallValidationError> for UpstreamStreamError {
     fn from(error: CompletedFunctionCallValidationError) -> Self {
         Self {
-            kind: match error {
-                CompletedFunctionCallValidationError::TooLarge { .. } => UpstreamErrorKind::Failed,
-                CompletedFunctionCallValidationError::Protocol(_) => UpstreamErrorKind::Transient,
-            },
+            kind: UpstreamErrorKind::Failed,
             message: error.to_string(),
             retry_after_seconds: None,
             diagnostics: None,
@@ -132,8 +330,56 @@ impl From<CompletedFunctionCallValidationError> for UpstreamStreamError {
     }
 }
 
+pub(super) fn upstream_annotations(
+    payload: &serde_json::Value,
+    output_index: usize,
+) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    let kind = payload["type"].as_str().unwrap_or("");
+    let oi = output_index;
+    if kind == "response.output_text.annotation.added"
+        && let Some(annotation) = payload.get("annotation")
+    {
+        out.push(serde_json::json!({"output_index":oi,"content_index":payload["content_index"],"annotation":annotation}));
+    }
+    if kind == "response.content_part.done" {
+        for annotation in payload["part"]["annotations"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            out.push(serde_json::json!({"output_index":oi,"content_index":payload["content_index"],"annotation":annotation}));
+        }
+    }
+    let items: Vec<(usize, &serde_json::Value)> = if kind == "response.output_item.done" {
+        vec![(oi, &payload["item"])]
+    } else if matches!(
+        kind,
+        "response.completed" | "response.done" | "response.incomplete"
+    ) {
+        payload
+            .pointer("/response/output")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    for (oi, item) in items {
+        for (ci, part) in item["content"].as_array().into_iter().flatten().enumerate() {
+            for annotation in part["annotations"].as_array().into_iter().flatten() {
+                out.push(serde_json::json!({"output_index":oi,"content_index":ci,"annotation":annotation}));
+            }
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone)]
 pub enum ReducerEvent {
+    Annotation(serde_json::Value),
     ThinkingStart {
         index: usize,
     },
@@ -185,18 +431,12 @@ pub struct FinishMetadata {
     pub output_items: Vec<ResponsesInputItem>,
 }
 
-enum BlockState {
-    Text {
-        index: usize,
-        text_accum: String,
-    },
-    Tool {
-        index: usize,
-        call_id: String,
-        name: String,
-        args_accum: String,
-        emitted_args: bool,
-    },
+struct ToolState {
+    index: usize,
+    call_id: String,
+    name: String,
+    args_accum: String,
+    emitted_args: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -294,7 +534,7 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
     let text = String::from_utf8_lossy(input);
     let mut out = Vec::new();
 
-    let mut blocks_by_output_index: std::collections::HashMap<usize, BlockState> =
+    let mut blocks_by_output_index: std::collections::HashMap<usize, ToolState> =
         std::collections::HashMap::new();
     let mut output_items_by_index: std::collections::BTreeMap<usize, ResponsesInputItem> =
         std::collections::BTreeMap::new();
@@ -305,6 +545,8 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
     let mut anthropic_index = 0usize;
     let mut active_thinking: Option<ActiveThinking> = None;
     let mut saw_tool_use = false;
+    let mut text_parts = TextParts::default();
+    let mut output_limited = false;
     let mut final_usage: Option<CodexUsage> = None;
     let mut service_tier: Option<String> = None;
     let mut latest_rate_limits: Option<Box<CodexRateLimits>> = None;
@@ -318,43 +560,17 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
 
     fn capture_output_item(
         output_index: usize,
-        state: BlockState,
+        state: ToolState,
         items: &mut std::collections::BTreeMap<usize, ResponsesInputItem>,
     ) {
-        match state {
-            BlockState::Text {
-                index: _,
-                text_accum,
-            } => {
-                if text_accum.is_empty() {
-                    return;
-                }
-                items.insert(
-                    output_index,
-                    ResponsesInputItem::Message {
-                        role: "assistant".to_string(),
-                        content: vec![super::request::ResponsesContentPart::OutputText {
-                            text: text_accum,
-                        }],
-                    },
-                );
-            }
-            BlockState::Tool {
-                args_accum,
-                name,
-                call_id,
-                ..
-            } => {
-                items.insert(
-                    output_index,
-                    ResponsesInputItem::FunctionCall {
-                        call_id,
-                        name,
-                        arguments: args_accum,
-                    },
-                );
-            }
-        }
+        items.insert(
+            output_index,
+            ResponsesInputItem::FunctionCall {
+                call_id: state.call_id,
+                name: state.name,
+                arguments: state.args_accum,
+            },
+        );
     }
 
     for evt in sse_events(&text) {
@@ -421,6 +637,48 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
             });
         }
 
+        let text_output_index = p
+            .get("output_index")
+            .and_then(serde_json::Value::as_u64)
+            .map(|index| index as usize)
+            .or_else(|| {
+                p["item_id"]
+                    .as_str()
+                    .or_else(|| p.pointer("/item/id").and_then(serde_json::Value::as_str))
+                    .and_then(|id| item_id_to_output_index.get(id).copied())
+            })
+            .unwrap_or(0);
+        out.extend(
+            upstream_annotations(&p, text_output_index)
+                .into_iter()
+                .map(ReducerEvent::Annotation),
+        );
+        for delta in text_parts
+            .accept(&p, &mut anthropic_index, text_output_index)
+            .map_err(|message| UpstreamStreamError {
+                kind: UpstreamErrorKind::Failed,
+                message,
+                retry_after_seconds: None,
+                diagnostics: None,
+            })?
+        {
+            close_thinking(
+                &mut out,
+                &mut active_thinking,
+                &mut reasoning_by_output_index,
+                &mut output_items_by_index,
+            );
+            if delta.start {
+                out.push(ReducerEvent::TextStart { index: delta.index });
+            }
+            if !delta.text.is_empty() {
+                out.push(ReducerEvent::TextDelta {
+                    index: delta.index,
+                    text: delta.text,
+                });
+            }
+        }
+
         if t == "response.created" {
             service_tier = p
                 .pointer("/response/service_tier")
@@ -457,19 +715,9 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                     &mut reasoning_by_output_index,
                     &mut output_items_by_index,
                 );
-                let idx = anthropic_index;
-                anthropic_index += 1;
                 if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
                     item_id_to_output_index.insert(id.to_string(), output_index);
                 }
-                blocks_by_output_index.insert(
-                    output_index,
-                    BlockState::Text {
-                        index: idx,
-                        text_accum: String::new(),
-                    },
-                );
-                out.push(ReducerEvent::TextStart { index: idx });
                 continue;
             }
 
@@ -495,7 +743,7 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                     .to_string();
                 blocks_by_output_index.insert(
                     output_index,
-                    BlockState::Tool {
+                    ToolState {
                         index: idx,
                         call_id: call_id.clone(),
                         name: name.clone(),
@@ -557,44 +805,6 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
             continue;
         }
 
-        if t == "response.output_text.delta" {
-            close_thinking(
-                &mut out,
-                &mut active_thinking,
-                &mut reasoning_by_output_index,
-                &mut output_items_by_index,
-            );
-            let output_index = p
-                .get("output_index")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as usize);
-            let item_id = p.get("item_id").and_then(|v| v.as_str());
-            let state = if let Some(oi) = output_index {
-                blocks_by_output_index.get_mut(&oi)
-            } else if let Some(id) = item_id {
-                item_id_to_output_index
-                    .get(id)
-                    .and_then(|oi| blocks_by_output_index.get_mut(oi))
-            } else {
-                None
-            };
-            let delta = p.get("delta").and_then(|v| v.as_str()).unwrap_or("");
-            if delta.is_empty() {
-                continue;
-            }
-            match state {
-                Some(BlockState::Text { index, text_accum }) => {
-                    text_accum.push_str(delta);
-                    out.push(ReducerEvent::TextDelta {
-                        index: *index,
-                        text: delta.to_string(),
-                    });
-                }
-                _ => continue,
-            }
-            continue;
-        }
-
         if t == "response.function_call_arguments.delta" {
             let output_index = match p.get("output_index").and_then(|v| v.as_u64()) {
                 Some(v) => v as usize,
@@ -608,30 +818,25 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                 Some(s) => s,
                 None => continue,
             };
-            match state {
-                BlockState::Tool {
-                    args_accum,
-                    emitted_args,
-                    name,
-                    index,
-                    ..
-                } => {
-                    if args_accum.len().saturating_add(delta.len()) > BUFFERED_TOOL_MAX_ARGS_BYTES {
-                        return Err(CompletedFunctionCallValidationError::TooLarge {
-                            tool: name.clone(),
-                        }
-                        .into());
-                    }
-                    args_accum.push_str(delta);
-                    if name != "Read" {
-                        *emitted_args = true;
-                        out.push(ReducerEvent::ToolDelta {
-                            index: *index,
-                            partial_json: delta.to_string(),
-                        });
-                    }
-                }
-                _ => continue,
+            let ToolState {
+                args_accum,
+                emitted_args,
+                name,
+                index,
+                ..
+            } = state;
+            if args_accum.len().saturating_add(delta.len()) > BUFFERED_TOOL_MAX_ARGS_BYTES {
+                return Err(
+                    CompletedFunctionCallValidationError::TooLarge { tool: name.clone() }.into(),
+                );
+            }
+            args_accum.push_str(delta);
+            if name != "Read" {
+                *emitted_args = true;
+                out.push(ReducerEvent::ToolDelta {
+                    index: *index,
+                    partial_json: delta.to_string(),
+                });
             }
             continue;
         }
@@ -641,7 +846,7 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                 Some(v) => v as usize,
                 None => continue,
             };
-            if let Some(BlockState::Tool {
+            if let Some(ToolState {
                 args_accum,
                 call_id,
                 name,
@@ -662,9 +867,12 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
         }
 
         if t == "response.output_item.done" {
-            let output_index: usize =
-                p.get("output_index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let output_index = text_output_index;
             let item = p.get("item");
+            if item.is_some_and(|item| item["type"] == "message") {
+                text_parts.close_item(Some(output_index));
+                continue;
+            }
 
             if let Some(item_val) = item
                 && item_val.get("type").and_then(|v| v.as_str()) == Some("reasoning")
@@ -735,11 +943,11 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                 let explicit_tool = p.get("output_index").is_some()
                     && matches!(
                         blocks_by_output_index.get(&output_index),
-                        Some(BlockState::Tool { .. })
+                        Some(ToolState { .. })
                     );
                 if !explicit_tool {
                     let mut matching = blocks_by_output_index.iter().filter_map(|(output_index, state)| {
-                        matches!(state, BlockState::Tool { call_id, .. } if call_id == completed.call_id)
+                        matches!(state, ToolState { call_id, .. } if call_id == completed.call_id)
                             .then_some(*output_index)
                     });
                     let matching_index = matching.next().filter(|_| matching.next().is_none());
@@ -771,10 +979,12 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                         if p.get("output_index").is_none()
                             || blocks_by_output_index.contains_key(&output_index)
                             || output_items_by_index.contains_key(&output_index)
+                            || text_parts.parts.keys().any(|(oi, _)| *oi == output_index)
                         {
                             output_index = blocks_by_output_index
                                 .keys()
                                 .chain(output_items_by_index.keys())
+                                .chain(text_parts.parts.keys().map(|(oi, _)| oi))
                                 .copied()
                                 .max()
                                 .map_or(0, |index| index + 1);
@@ -795,15 +1005,14 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                 continue;
             };
 
-            if let BlockState::Tool {
-                args_accum,
-                name,
-                call_id,
-                emitted_args,
-                index,
-                ..
-            } = &mut state
             {
+                let ToolState {
+                    args_accum,
+                    name,
+                    call_id,
+                    emitted_args,
+                    index,
+                } = &mut state;
                 let completed = completed.as_ref().ok_or_else(|| {
                     CompletedFunctionCallValidationError::Protocol(
                         "tool output closed without a completed function call".to_string(),
@@ -839,7 +1048,22 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                 usage.service_tier = usage.service_tier.take().or(service_tier.take());
                 usage.rate_limits = latest_rate_limits.take();
             }
-            continuation_eligible = t == "response.completed" || t == "response.done";
+            output_limited = crate::providers::codex::events::response_is_incomplete_terminal(&p);
+            continuation_eligible = !output_limited && !text_parts.has_refusal();
+            if output_limited || text_parts.has_refusal() {
+                // A capped/refusal text part may not receive output_item.done. Retain
+                // real text, but never finalize an unvalidated tool call.
+                if !blocks_by_output_index.is_empty() {
+                    return Err(UpstreamStreamError {
+                        kind: UpstreamErrorKind::Failed,
+                        message: "output limit truncated an unfinished tool call".into(),
+                        retry_after_seconds: None,
+                        diagnostics: None,
+                    });
+                }
+            }
+            text_parts.close_item(None);
+            output_items_by_index.extend(text_parts.output_items());
             continue;
         }
     }
@@ -871,7 +1095,11 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
         &mut output_items_by_index,
     );
 
-    let stop_reason: StopReason = if saw_tool_use {
+    let stop_reason: StopReason = if output_limited {
+        STOP_MAX_TOKENS
+    } else if text_parts.has_refusal() {
+        STOP_REFUSAL
+    } else if saw_tool_use {
         STOP_TOOL_USE
     } else {
         STOP_END_TURN
@@ -893,35 +1121,18 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
 }
 
 fn describe_open_blocks(
-    blocks: &std::collections::HashMap<usize, BlockState>,
+    blocks: &std::collections::HashMap<usize, ToolState>,
 ) -> Vec<OpenBlockDiagnostic> {
     let mut out: Vec<_> = blocks
         .iter()
-        .map(|(output_index, state)| match state {
-            BlockState::Text { index, text_accum } => OpenBlockDiagnostic {
-                output_index: *output_index,
-                anthropic_index: *index,
-                kind: "text".to_string(),
-                name: None,
-                call_id: None,
-                text_bytes: Some(text_accum.len()),
-                argument_bytes: None,
-            },
-            BlockState::Tool {
-                index,
-                call_id,
-                name,
-                args_accum,
-                ..
-            } => OpenBlockDiagnostic {
-                output_index: *output_index,
-                anthropic_index: *index,
-                kind: "tool".to_string(),
-                name: Some(name.clone()),
-                call_id: Some(call_id.clone()),
-                text_bytes: None,
-                argument_bytes: Some(args_accum.len()),
-            },
+        .map(|(output_index, state)| OpenBlockDiagnostic {
+            output_index: *output_index,
+            anthropic_index: state.index,
+            kind: "tool".to_string(),
+            name: Some(state.name.clone()),
+            call_id: Some(state.call_id.clone()),
+            text_bytes: None,
+            argument_bytes: Some(state.args_accum.len()),
         })
         .collect();
     out.sort_by_key(|block| block.output_index);
@@ -969,7 +1180,7 @@ pub fn map_codex_usage_to_anthropic(
         },
         input_tokens,
         output_tokens: usage.output_tokens.unwrap_or(0),
-        cache_creation_input_tokens: 0,
+        cache_creation_input_tokens: None,
         cache_read_input_tokens: cached,
         server_tool_use: None,
         output_tokens_details: usage
@@ -999,7 +1210,9 @@ pub struct AnthropicUsage {
     pub speed: Option<String>,
     pub input_tokens: u64,
     pub output_tokens: u64,
-    pub cache_creation_input_tokens: u64,
+    /// The authenticated lane does not report cache-write accounting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u64>,
     pub cache_read_input_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_tool_use: Option<WebSearchUsage>,

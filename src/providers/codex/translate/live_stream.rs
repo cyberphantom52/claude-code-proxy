@@ -1,16 +1,16 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::anthropic::sse::append_json_sse_event;
-use crate::providers::codex::client::MAX_PENDING_HTTP_EVENT_BYTES;
 use crate::providers::codex::events::classify_event_failure;
 use crate::traffic::TrafficCapture;
 
 use super::read_rewrite::{repair_whitespace_stalled_read_args, sanitize_parsed_read_args};
 use super::reasoning_signature::{PendingReasoning, encode_reasoning_signature};
 use super::reducer::{
-    CodexRateLimits, CodexUsage, STOP_END_TURN, STOP_TOOL_USE, map_codex_usage_to_anthropic,
-    parse_codex_rate_limits, parse_codex_usage,
+    CodexRateLimits, CodexUsage, STOP_END_TURN, STOP_MAX_TOKENS, STOP_REFUSAL, STOP_TOOL_USE,
+    TextDelta, TextParts, map_codex_usage_to_anthropic, parse_codex_rate_limits, parse_codex_usage,
+    upstream_annotations,
 };
 use super::web_search_compat::web_search_query;
 
@@ -58,6 +58,14 @@ impl std::fmt::Display for CompletedFunctionCallValidationError {
 pub(crate) fn validate_completed_function_call(
     item: &serde_json::Value,
 ) -> Result<CompletedFunctionCall<'_>, CompletedFunctionCallValidationError> {
+    if item
+        .get("status")
+        .is_some_and(|status| status != "completed")
+    {
+        return Err(CompletedFunctionCallValidationError::Protocol(
+            "function call is not completed".into(),
+        ));
+    }
     validate_completed_function_call_fields(
         item.get("call_id").and_then(serde_json::Value::as_str),
         item.get("name").and_then(serde_json::Value::as_str),
@@ -170,19 +178,12 @@ pub(crate) fn validate_streamed_function_call(
     Ok(())
 }
 
-enum LiveBlock {
-    Text {
-        index: usize,
-        text: String,
-        deferred: bool,
-    },
-    Tool {
-        index: usize,
-        call_id: String,
-        name: String,
-        args_accum: String,
-        emitted_args: bool,
-    },
+struct LiveTool {
+    index: usize,
+    call_id: String,
+    name: String,
+    args_accum: String,
+    emitted_args: bool,
 }
 
 struct LiveWebSearch {
@@ -190,12 +191,6 @@ struct LiveWebSearch {
     result_index: usize,
     id: String,
     query: String,
-}
-
-#[derive(Clone)]
-struct LiveWebSearchResult {
-    title: String,
-    url: String,
 }
 
 #[derive(Clone, Copy)]
@@ -208,17 +203,18 @@ pub struct LiveStreamTranslator {
     message_id: String,
     model: String,
     message_started: bool,
-    blocks_by_output_index: HashMap<usize, LiveBlock>,
+    blocks_by_output_index: HashMap<usize, LiveTool>,
     item_id_to_output_index: HashMap<String, usize>,
     anthropic_index: usize,
     thinking: Option<LiveThinking>,
     reasoning_by_output_index: HashMap<usize, PendingReasoning>,
     saw_tool_use: bool,
+    text_parts: TextParts,
     web_search_requests: usize,
     web_searches: Vec<LiveWebSearch>,
-    web_search_results: Vec<LiveWebSearchResult>,
-    deferred_text: Vec<(usize, String)>,
-    deferred_text_bytes: usize,
+    annotations: Vec<serde_json::Value>,
+    annotation_bytes: u64,
+    deferred_text: BTreeMap<usize, String>,
     semantic_output_started: bool,
     current_generation_semantic_output_started: bool,
     text_output_started: bool,
@@ -248,11 +244,12 @@ impl LiveStreamTranslator {
             thinking: None,
             reasoning_by_output_index: HashMap::new(),
             saw_tool_use: false,
+            text_parts: TextParts::default(),
             web_search_requests: 0,
             web_searches: Vec::new(),
-            web_search_results: Vec::new(),
-            deferred_text: Vec::new(),
-            deferred_text_bytes: 0,
+            annotations: Vec::new(),
+            annotation_bytes: 0,
+            deferred_text: BTreeMap::new(),
             semantic_output_started: false,
             current_generation_semantic_output_started: false,
             text_output_started: false,
@@ -278,7 +275,35 @@ impl LiveStreamTranslator {
         if let Some(failure) = classify_event_failure(payload) {
             return Err(failure.message);
         }
+        if matches!(
+            kind,
+            "response.completed" | "response.incomplete" | "response.done"
+        ) && !self.blocks_by_output_index.is_empty()
+        {
+            return Err("upstream stream ended with open Codex tool blocks".to_string());
+        }
 
+        let text_output_index = self.text_output_index(payload);
+        for annotation in upstream_annotations(payload, text_output_index) {
+            if !self.annotations.contains(&annotation) {
+                let bytes =
+                    crate::providers::codex::request_summary::serialized_json_bytes(&annotation)
+                        .max(256);
+                self.annotation_bytes = self.annotation_bytes.saturating_add(bytes);
+                if self.annotation_bytes
+                    > crate::providers::codex::client::MAX_PENDING_HTTP_EVENT_BYTES as u64
+                {
+                    return Err("Codex annotations exceeded their 16 MiB buffer limit".into());
+                }
+                self.annotations.push(annotation);
+            }
+        }
+        for delta in
+            self.text_parts
+                .accept(payload, &mut self.anthropic_index, text_output_index)?
+        {
+            self.text_delta(delta, traffic, &mut out);
+        }
         match kind {
             "codex.rate_limits" => {
                 self.rate_limits = parse_codex_rate_limits(payload).or(self.rate_limits.take());
@@ -321,12 +346,6 @@ impl LiveStreamTranslator {
             "response.reasoning_summary_text.delta" => {
                 self.reasoning_delta(payload, traffic, &mut out);
             }
-            "response.output_text.delta" => {
-                self.text_delta(payload, traffic, &mut out)?;
-            }
-            "response.output_text.annotation.added" => {
-                self.web_search_annotation(payload);
-            }
             "response.function_call_arguments.delta" => {
                 self.tool_delta(payload, traffic, &mut out)?;
             }
@@ -337,7 +356,7 @@ impl LiveStreamTranslator {
                 self.output_item_done(payload, traffic, &mut out)?;
             }
             "response.completed" | "response.incomplete" | "response.done" => {
-                self.finish(payload, traffic, &mut out)?;
+                self.finish(payload, traffic, &mut out);
             }
             _ => {}
         }
@@ -372,6 +391,8 @@ impl LiveStreamTranslator {
         self.close_thinking(traffic, &mut out);
         self.reasoning_by_output_index.clear();
         self.item_id_to_output_index.clear();
+        self.annotations.clear();
+        self.annotation_bytes = 0;
         self.service_tier = None;
         self.current_generation_semantic_output_started = false;
         // Preserve message_started and anthropic_index: one downstream message,
@@ -392,7 +413,13 @@ impl LiveStreamTranslator {
         traffic: Option<&TrafficCapture>,
     ) -> Vec<u8> {
         let mut out = Vec::new();
-        if self.finished || !self.saw_tool_use || !self.blocks_by_output_index.is_empty() {
+        if self.finished
+            || !self.saw_tool_use
+            || !self.blocks_by_output_index.is_empty()
+            || self.text_parts.has_open_parts()
+            || self.text_parts.has_refusal()
+            || !self.deferred_text.is_empty()
+        {
             return out;
         }
         self.close_thinking(traffic, &mut out);
@@ -413,7 +440,6 @@ impl LiveStreamTranslator {
         }
         self.close_open_blocks(traffic, &mut out);
         self.deferred_text.clear();
-        self.deferred_text_bytes = 0;
         self.ensure_message_start(traffic, &mut out);
         self.emit(
             traffic,
@@ -498,33 +524,9 @@ impl LiveStreamTranslator {
             }
             "message" => {
                 self.close_thinking(traffic, out);
-                let index = self.anthropic_index;
-                self.anthropic_index += 1;
                 if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
                     self.item_id_to_output_index
                         .insert(id.to_string(), output_index);
-                }
-                let deferred = !self.web_searches.is_empty();
-                self.blocks_by_output_index.insert(
-                    output_index,
-                    LiveBlock::Text {
-                        index,
-                        text: String::new(),
-                        deferred,
-                    },
-                );
-                if !deferred {
-                    self.ensure_message_start(traffic, out);
-                    self.emit(
-                        traffic,
-                        out,
-                        "content_block_start",
-                        &serde_json::json!({
-                            "type": "content_block_start",
-                            "index": index,
-                            "content_block": {"type": "text", "text": ""}
-                        }),
-                    );
                 }
             }
             "function_call" => {
@@ -536,7 +538,7 @@ impl LiveStreamTranslator {
                 let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 self.blocks_by_output_index.insert(
                     output_index,
-                    LiveBlock::Tool {
+                    LiveTool {
                         index,
                         call_id: call_id.to_owned(),
                         name: name.to_owned(),
@@ -617,95 +619,75 @@ impl LiveStreamTranslator {
         );
     }
 
-    fn text_delta(
-        &mut self,
-        payload: &serde_json::Value,
-        traffic: Option<&TrafficCapture>,
-        out: &mut Vec<u8>,
-    ) -> Result<(), String> {
-        let delta = payload.get("delta").and_then(|v| v.as_str()).unwrap_or("");
-        if delta.is_empty() {
-            self.close_thinking(traffic, out);
-            return Ok(());
-        }
-
-        let output_index = payload
+    fn text_output_index(&self, payload: &serde_json::Value) -> usize {
+        payload
             .get("output_index")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as usize)
+            .and_then(serde_json::Value::as_u64)
+            .map(|index| index as usize)
             .or_else(|| {
-                payload
-                    .get("item_id")
-                    .and_then(|v| v.as_str())
+                payload["item_id"]
+                    .as_str()
+                    .or_else(|| {
+                        payload
+                            .pointer("/item/id")
+                            .and_then(serde_json::Value::as_str)
+                    })
                     .and_then(|id| self.item_id_to_output_index.get(id).copied())
             })
-            .unwrap_or(0);
+            .unwrap_or(0)
+    }
 
-        let deferred = match self.blocks_by_output_index.get(&output_index) {
-            Some(LiveBlock::Text { deferred, .. }) => *deferred,
-            None => !self.web_searches.is_empty(),
-            _ => false,
-        };
-        let next_bytes = self.deferred_text_bytes.saturating_add(delta.len());
-        if deferred && next_bytes > MAX_PENDING_HTTP_EVENT_BYTES {
-            return Err("Codex deferred text exceeded its 16 MiB buffer limit".to_string());
-        }
+    fn text_delta(
+        &mut self,
+        delta: TextDelta,
+        traffic: Option<&TrafficCapture>,
+        out: &mut Vec<u8>,
+    ) {
         self.close_thinking(traffic, out);
-        self.semantic_output_started = true;
-        self.current_generation_semantic_output_started = true;
+        if !delta.text.is_empty() || delta.refusal {
+            self.semantic_output_started = true;
+            self.current_generation_semantic_output_started = true;
+        }
+        // Even an empty started block must not be replayed under the same index.
         self.text_output_started = true;
+        if self.deferred_text.contains_key(&delta.index)
+            || (delta.start && !self.web_searches.is_empty())
+        {
+            self.deferred_text
+                .entry(delta.index)
+                .or_default()
+                .push_str(&delta.text);
+            return;
+        }
+        self.ensure_message_start(traffic, out);
+        if delta.start {
+            self.emit(traffic, out, "content_block_start", &serde_json::json!({
+                "type":"content_block_start", "index":delta.index, "content_block":{"type":"text","text":""}
+            }));
+        }
+        if !delta.text.is_empty() {
+            self.emit(traffic, out, "content_block_delta", &serde_json::json!({
+                "type":"content_block_delta", "index":delta.index, "delta":{"type":"text_delta","text":delta.text}
+            }));
+        }
+    }
 
-        if !self.blocks_by_output_index.contains_key(&output_index) {
-            let index = self.anthropic_index;
-            self.anthropic_index += 1;
-            self.blocks_by_output_index.insert(
-                output_index,
-                LiveBlock::Text {
-                    index,
-                    text: String::new(),
-                    deferred,
-                },
-            );
-            if !deferred {
-                self.ensure_message_start(traffic, out);
+    fn close_text_parts(
+        &mut self,
+        output_index: Option<usize>,
+        traffic: Option<&TrafficCapture>,
+        out: &mut Vec<u8>,
+    ) {
+        for index in self.text_parts.close_item(output_index) {
+            if !self.deferred_text.contains_key(&index) {
                 self.emit(
                     traffic,
                     out,
-                    "content_block_start",
-                    &serde_json::json!({
-                        "type": "content_block_start",
-                        "index": index,
-                        "content_block": {"type": "text", "text": ""}
-                    }),
+                    "content_block_stop",
+                    &serde_json::json!({"type":"content_block_stop","index":index}),
                 );
             }
         }
-
-        let Some(LiveBlock::Text {
-            index,
-            text,
-            deferred,
-        }) = self.blocks_by_output_index.get_mut(&output_index)
-        else {
-            return Ok(());
-        };
-        if *deferred {
-            text.push_str(delta);
-            self.deferred_text_bytes = next_bytes;
-            return Ok(());
-        }
-        let index = *index;
-        self.emit(
-            traffic,
-            out,
-            "content_block_delta",
-            &serde_json::json!({
-                "type": "content_block_delta",
-                "index": index,
-                "delta": {"type": "text_delta", "text": delta}
-            }),
-        );
-        Ok(())
     }
 
     fn tool_delta(
@@ -727,7 +709,7 @@ impl LiveStreamTranslator {
         }
         self.semantic_output_started = true;
         self.current_generation_semantic_output_started = true;
-        let Some(LiveBlock::Tool {
+        let Some(LiveTool {
             index,
             name,
             args_accum,
@@ -761,7 +743,7 @@ impl LiveStreamTranslator {
     }
 
     fn tool_arguments_done(&mut self, payload: &serde_json::Value) -> Result<(), String> {
-        let Some(LiveBlock::Tool {
+        let Some(LiveTool {
             args_accum,
             call_id,
             name,
@@ -790,7 +772,15 @@ impl LiveStreamTranslator {
         traffic: Option<&TrafficCapture>,
         out: &mut Vec<u8>,
     ) -> Result<(), String> {
-        let mut output_index = output_index(payload);
+        let mut output_index = self.text_output_index(payload);
+        if payload
+            .pointer("/item/type")
+            .and_then(serde_json::Value::as_str)
+            == Some("message")
+        {
+            self.close_text_parts(Some(output_index), traffic, out);
+            return Ok(());
+        }
         if let Some(item) = payload
             .get("item")
             .and_then(|item| item.get("type"))
@@ -853,7 +843,7 @@ impl LiveStreamTranslator {
             None
         };
 
-        if let Some(LiveBlock::Tool {
+        if let Some(LiveTool {
             call_id,
             name,
             args_accum,
@@ -870,61 +860,35 @@ impl LiveStreamTranslator {
             return Ok(());
         };
 
-        match state {
-            LiveBlock::Text {
-                index,
-                text,
-                deferred,
-            } => {
-                if deferred {
-                    self.deferred_text.push((index, text));
-                } else {
-                    self.emit(
-                        traffic,
-                        out,
-                        "content_block_stop",
-                        &serde_json::json!({
-                            "type": "content_block_stop",
-                            "index": index,
-                        }),
-                    );
-                }
-            }
-            LiveBlock::Tool {
-                index,
-                call_id,
-                emitted_args,
-                ..
-            } => {
-                let completed = completed_function_call
-                    .as_ref()
-                    .expect("validated tool completion");
-                self.semantic_output_started = true;
-                self.current_generation_semantic_output_started = true;
-                if !emitted_args {
-                    let arguments = completed.sanitized_arguments(Some(call_id.as_str()));
-                    self.emit(
-                        traffic,
-                        out,
-                        "content_block_delta",
-                        &serde_json::json!({
-                            "type": "content_block_delta",
-                            "index": index,
-                            "delta": {"type": "input_json_delta", "partial_json": arguments}
-                        }),
-                    );
-                }
-                self.emit(
-                    traffic,
-                    out,
-                    "content_block_stop",
-                    &serde_json::json!({
-                        "type": "content_block_stop",
-                        "index": index,
-                    }),
-                );
-            }
+        let LiveTool {
+            index,
+            call_id,
+            emitted_args,
+            ..
+        } = state;
+        let completed = completed_function_call
+            .as_ref()
+            .expect("validated tool completion");
+        self.semantic_output_started = true;
+        self.current_generation_semantic_output_started = true;
+        if !emitted_args {
+            let arguments = completed.sanitized_arguments(Some(call_id.as_str()));
+            self.emit(
+                traffic,
+                out,
+                "content_block_delta",
+                &serde_json::json!({
+                    "type":"content_block_delta", "index":index,
+                    "delta":{"type":"input_json_delta", "partial_json":arguments}
+                }),
+            );
         }
+        self.emit(
+            traffic,
+            out,
+            "content_block_stop",
+            &serde_json::json!({"type":"content_block_stop", "index":index}),
+        );
         Ok(())
     }
 
@@ -992,7 +956,7 @@ impl LiveStreamTranslator {
             .and_then(|value| usize::try_from(value).ok())
             && matches!(
                 self.blocks_by_output_index.get(&output_index),
-                Some(LiveBlock::Tool { .. })
+                Some(LiveTool { .. })
             )
         {
             return Some(output_index);
@@ -1004,40 +968,12 @@ impl LiveStreamTranslator {
                 .filter_map(|(output_index, block)| {
                     matches!(
                         block,
-                        LiveBlock::Tool { call_id: open_call_id, .. } if open_call_id == call_id
+                        LiveTool { call_id: open_call_id, .. } if open_call_id == call_id
                     )
                     .then_some(*output_index)
                 });
         let output_index = matching.next()?;
         matching.next().is_none().then_some(output_index)
-    }
-
-    fn web_search_annotation(&mut self, payload: &serde_json::Value) {
-        let Some(annotation) = payload.get("annotation") else {
-            return;
-        };
-        if annotation.get("type").and_then(|v| v.as_str()) != Some("url_citation") {
-            return;
-        }
-        let Some(url) = annotation.get("url").and_then(|v| v.as_str()) else {
-            return;
-        };
-        if self
-            .web_search_results
-            .iter()
-            .any(|result| result.url == url)
-        {
-            return;
-        }
-        let title = annotation
-            .get("title")
-            .and_then(|v| v.as_str())
-            .filter(|title| !title.is_empty())
-            .unwrap_or(url);
-        self.web_search_results.push(LiveWebSearchResult {
-            title: title.to_string(),
-            url: url.to_string(),
-        });
     }
 
     fn emit_web_searches(&mut self, traffic: Option<&TrafficCapture>, out: &mut Vec<u8>) {
@@ -1078,17 +1014,6 @@ impl LiveStreamTranslator {
                 "content_block_stop",
                 &serde_json::json!({"type": "content_block_stop", "index": search.index}),
             );
-            let results: Vec<_> = self
-                .web_search_results
-                .iter()
-                .map(|result| {
-                    serde_json::json!({
-                        "type": "web_search_result",
-                        "title": result.title,
-                        "url": result.url,
-                    })
-                })
-                .collect();
             self.emit(
                 traffic,
                 out,
@@ -1099,7 +1024,7 @@ impl LiveStreamTranslator {
                     "content_block": {
                         "type": "web_search_tool_result",
                         "tool_use_id": search.id,
-                        "content": results
+                        "content": []
                     }
                 }),
             );
@@ -1141,7 +1066,6 @@ impl LiveStreamTranslator {
                 &serde_json::json!({"type": "content_block_stop", "index": index}),
             );
         }
-        self.deferred_text_bytes = 0;
     }
 
     fn finish(
@@ -1149,14 +1073,7 @@ impl LiveStreamTranslator {
         payload: &serde_json::Value,
         traffic: Option<&TrafficCapture>,
         out: &mut Vec<u8>,
-    ) -> Result<(), String> {
-        if self
-            .blocks_by_output_index
-            .values()
-            .any(|block| matches!(block, LiveBlock::Tool { .. }))
-        {
-            return Err("upstream stream ended with open Codex tool blocks".to_string());
-        }
+    ) {
         self.close_thinking(traffic, out);
         self.close_open_blocks(traffic, out);
         self.emit_web_searches(traffic, out);
@@ -1166,13 +1083,17 @@ impl LiveStreamTranslator {
             usage.service_tier = usage.service_tier.take().or(self.service_tier.take());
             usage.rate_limits = self.rate_limits.take();
         }
-        let stop_reason = if self.saw_tool_use {
-            STOP_TOOL_USE
-        } else {
-            STOP_END_TURN
-        };
+        let stop_reason =
+            if crate::providers::codex::events::response_is_incomplete_terminal(payload) {
+                STOP_MAX_TOKENS
+            } else if self.text_parts.has_refusal() {
+                STOP_REFUSAL
+            } else if self.saw_tool_use {
+                STOP_TOOL_USE
+            } else {
+                STOP_END_TURN
+            };
         self.emit_finish(stop_reason, usage, traffic, out);
-        Ok(())
     }
 
     fn emit_finish(
@@ -1183,19 +1104,15 @@ impl LiveStreamTranslator {
         out: &mut Vec<u8>,
     ) {
         let mapped = map_codex_usage_to_anthropic(&usage, Some(self.web_search_requests));
-        self.emit(
-            traffic,
-            out,
-            "message_delta",
-            &serde_json::json!({
-                "type": "message_delta",
-                "delta": {
-                    "stop_reason": stop_reason,
-                    "stop_sequence": null
-                },
-                "usage": mapped,
-            }),
-        );
+        let mut message_delta = serde_json::json!({
+            "type": "message_delta",
+            "delta": { "stop_reason": stop_reason, "stop_sequence": null },
+            "usage": mapped,
+        });
+        if !self.annotations.is_empty() {
+            message_delta["codex_annotations"] = std::mem::take(&mut self.annotations).into();
+        }
+        self.emit(traffic, out, "message_delta", &message_delta);
         self.emit(
             traffic,
             out,
@@ -1207,23 +1124,13 @@ impl LiveStreamTranslator {
 
     fn close_open_blocks(&mut self, traffic: Option<&TrafficCapture>, out: &mut Vec<u8>) {
         self.close_thinking(traffic, out);
+        self.close_text_parts(None, traffic, out);
         let open: Vec<usize> = self.blocks_by_output_index.keys().copied().collect();
         for output_index in open {
             let Some(state) = self.blocks_by_output_index.remove(&output_index) else {
                 continue;
             };
-            let index = match state {
-                LiveBlock::Text {
-                    index,
-                    text,
-                    deferred: true,
-                } => {
-                    self.deferred_text.push((index, text));
-                    continue;
-                }
-                LiveBlock::Text { index, .. } => index,
-                LiveBlock::Tool { index, .. } => index,
-            };
+            let index = state.index;
             self.emit(
                 traffic,
                 out,

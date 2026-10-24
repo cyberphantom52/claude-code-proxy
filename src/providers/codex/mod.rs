@@ -1265,6 +1265,7 @@ async fn live_stream_response_once(
         pending_chunk.extend_from_slice(&chunk);
         if terminal
             && events::event_is_success_terminal(&payload)
+            && !events::response_is_incomplete_terminal(&payload)
             && !translator.has_semantic_output()
         {
             // Record shape only; never log prompt or generated content by default.
@@ -1381,7 +1382,9 @@ fn translate_live_stream_payload(
     payload: &serde_json::Value,
     traffic: Option<&crate::traffic::TrafficCapture>,
 ) -> Result<(Vec<u8>, bool), String> {
+    let chunk = translator.accept(payload, traffic)?;
     if events::event_is_success_terminal(payload)
+        && !events::response_is_incomplete_terminal(payload)
         && translator.has_semantic_output()
         && !translator.has_current_generation_semantic_output()
     {
@@ -1389,7 +1392,6 @@ fn translate_live_stream_payload(
             "Codex replacement completed without producing output after reconnect".to_string(),
         );
     }
-    let chunk = translator.accept(payload, traffic)?;
     let terminal = events::event_is_terminal(payload) || translator.is_finished();
     Ok((chunk, terminal))
 }
@@ -1882,8 +1884,12 @@ fn is_empty_codex_success_completion(events: &[ReducerEvent]) -> bool {
             ReducerEvent::ThinkingStart { .. }
             | ReducerEvent::ToolStart { .. }
             | ReducerEvent::WebSearch { .. } => return false,
-            ReducerEvent::Finish { terminal_type, .. }
-                if terminal_type == TERM_COMPLETED || terminal_type == TERM_DONE =>
+            ReducerEvent::Finish {
+                terminal_type,
+                stop_reason,
+                ..
+            } if *stop_reason == translate::reducer::STOP_END_TURN
+                && (terminal_type == TERM_COMPLETED || terminal_type == TERM_DONE) =>
             {
                 saw_success_terminal = true;
             }
@@ -2193,7 +2199,12 @@ fn map_codex_failure_to_response(message: &str) -> Response {
 
 fn map_codex_event_failure_to_response(failure: &events::CodexEventFailure) -> Response {
     let status = StatusCode::from_u16(failure.client_status()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let response = json_error(status, failure.client_error_type(), &failure.message);
+    let mut response = json_error(status, failure.client_error_type(), &failure.message);
+    if !failure.retryable() {
+        response
+            .headers_mut()
+            .insert("x-should-retry", HeaderValue::from_static("false"));
+    }
     if let Some(retry_after) = failure.retry_after.as_deref() {
         ([(http::header::RETRY_AFTER, retry_after)], response).into_response()
     } else {

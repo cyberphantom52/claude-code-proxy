@@ -45,21 +45,9 @@ pub fn accumulate_response_and_metadata_with_traffic(
     let mut blocks: Vec<AccumulatedBlock> = Vec::new();
     let mut stop_reason = None;
     let mut metadata = None;
+    let mut annotations = Vec::new();
     let mut usage: Option<AnthropicUsage> = None;
-    let compat_blocks = if events
-        .iter()
-        .any(|event| matches!(event, ReducerEvent::WebSearch { .. }))
-    {
-        let mut text = String::new();
-        for event in &events {
-            if let ReducerEvent::TextDelta { text: delta, .. } = event {
-                text.push_str(delta);
-            }
-        }
-        build_web_search_compat_blocks(&events, &text)
-    } else {
-        Vec::new()
-    };
+    let compat_blocks = build_web_search_compat_blocks(&events);
 
     enum BlockKind {
         Thinking {
@@ -83,6 +71,11 @@ pub fn accumulate_response_and_metadata_with_traffic(
 
     for event in events {
         match event {
+            ReducerEvent::Annotation(annotation) => {
+                if !annotations.contains(&annotation) {
+                    annotations.push(annotation);
+                }
+            }
             ReducerEvent::WebSearch { .. } => {}
             ReducerEvent::ThinkingStart { index } => {
                 blocks.push(AccumulatedBlock {
@@ -278,6 +271,10 @@ pub fn accumulate_response_and_metadata_with_traffic(
     });
 
     response["content"] = Value::Array(content);
+    if !annotations.is_empty() {
+        // Raw Codex metadata, not Anthropic citation blocks or search results.
+        response["codex_annotations"] = Value::Array(annotations);
+    }
     Ok((response, metadata))
 }
 

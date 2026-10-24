@@ -55,7 +55,9 @@ pub(crate) fn classify_stream_event(payload: &Value) -> CodexStreamEventKind {
         return CodexStreamEventKind::TerminalFailure;
     }
     match payload.get("type").and_then(Value::as_str) {
-        Some("response.completed" | "response.done") => CodexStreamEventKind::TerminalSuccess,
+        Some("response.completed" | "response.done" | "response.incomplete") => {
+            CodexStreamEventKind::TerminalSuccess
+        }
         Some(
             "keepalive"
             | "response.created"
@@ -68,6 +70,7 @@ pub(crate) fn classify_stream_event(payload: &Value) -> CodexStreamEventKind {
         Some(
             "response.reasoning_summary_text.delta"
             | "response.output_text.delta"
+            | "response.refusal.delta"
             | "response.function_call_arguments.delta",
         ) if payload
             .get("delta")
@@ -76,15 +79,43 @@ pub(crate) fn classify_stream_event(payload: &Value) -> CodexStreamEventKind {
         {
             CodexStreamEventKind::Semantic
         }
+        Some("response.refusal.done") if payload.get("refusal").is_some_and(Value::is_string) => {
+            CodexStreamEventKind::Semantic
+        }
+        Some("response.output_text.done")
+            if payload
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.is_empty()) =>
+        {
+            CodexStreamEventKind::Semantic
+        }
+        Some("response.content_part.done") if part_has_semantic_text(&payload["part"]) => {
+            CodexStreamEventKind::Semantic
+        }
         Some("response.output_item.done")
             if matches!(
                 payload.pointer("/item/type").and_then(Value::as_str),
                 Some("function_call" | "web_search_call")
-            ) =>
+            ) || payload
+                .pointer("/item/content")
+                .and_then(Value::as_array)
+                .is_some_and(|parts| parts.iter().any(part_has_semantic_text)) =>
         {
             CodexStreamEventKind::Semantic
         }
         _ => CodexStreamEventKind::Structural,
+    }
+}
+
+fn part_has_semantic_text(part: &Value) -> bool {
+    match part["type"].as_str() {
+        Some("refusal") => part.get("refusal").is_some_and(Value::is_string),
+        Some("output_text") => part
+            .get("text")
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.is_empty()),
+        _ => false,
     }
 }
 
@@ -118,6 +149,10 @@ pub(crate) fn response_is_incomplete_terminal(payload: &Value) -> bool {
         Some("response.completed" | "response.incomplete" | "response.done")
     ) && (event_type == Some("response.incomplete")
         || payload.pointer("/response/status").and_then(Value::as_str) == Some("incomplete")
+        || payload
+            .pointer("/response/end_turn")
+            .and_then(Value::as_bool)
+            == Some(false)
         || incomplete_details.is_some_and(|details| !details.is_null()))
 }
 
@@ -132,11 +167,23 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
             .pointer("/response/incomplete_details/reason")
             .and_then(Value::as_str)
             .unwrap_or("unknown");
+        // This is a final capped answer, not a transport failure. Request-side
+        // cap enforcement is a separate, unverified endpoint capability.
+        if reason == "max_output_tokens" && event_error(payload).is_none() {
+            return None;
+        }
+        let id = payload
+            .pointer("/response/id")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let usage = payload.pointer("/response/usage").unwrap_or(&Value::Null);
         return Some(CodexEventFailure {
-            kind: CodexFailureKind::Transient,
+            kind: CodexFailureKind::Permanent,
             explicit_status: None,
-            status: 503,
-            message: format!("Incomplete response returned, reason: {reason}"),
+            status: 502,
+            message: format!(
+                "Incomplete response returned, reason: {reason}, id: {id}, usage: {usage}"
+            ),
             retry_after: None,
         });
     }

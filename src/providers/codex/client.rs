@@ -2960,6 +2960,10 @@ fn http_event_commits_replay(
         Some(
             "response.reasoning_summary_text.delta"
                 | "response.output_text.delta"
+                | "response.output_text.done"
+                | "response.refusal.delta"
+                | "response.refusal.done"
+                | "response.content_part.done"
                 | "response.output_item.done"
         )
     )
