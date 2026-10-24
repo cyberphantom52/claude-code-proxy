@@ -12,6 +12,7 @@ pub mod rate_limits;
 mod recovery;
 pub mod request_summary;
 pub mod search;
+mod search_loop;
 pub(crate) mod threads;
 pub mod transcription;
 pub mod translate;
@@ -125,6 +126,8 @@ impl CodexProvider {
         let message_id = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
         threads::set_message_id(&message_id);
         let want_stream = incoming.stream;
+        let lite_search =
+            search::SearchPolicy::from_request(&incoming, conversation_identity.as_ref());
         let (resolved, mut translated, compact_boundary, use_responses_lite, model) = {
             let mut body = incoming;
             let model = body.model.as_deref().unwrap_or("gpt-6-sol");
@@ -147,92 +150,6 @@ impl CodexProvider {
                     StatusCode::BAD_REQUEST,
                     "invalid_request_error",
                     e.to_string(),
-                );
-            }
-            if search::is_standalone_search_request(&body) {
-                if threads::current().is_some() {
-                    return threads::ThreadError("thread_unsupported_request").response();
-                }
-                if let Some(monitor) = ctx.monitor.as_ref() {
-                    monitor.model_resolved(&ctx.req_id, &resolved.model);
-                }
-                let (search_request, query, model) = {
-                    let search_body = body;
-                    let (search_request, query) = match search::build_search_request(
-                        &search_body,
-                        &resolved.model,
-                        conversation_identity.as_ref(),
-                    ) {
-                        Ok(request) => request,
-                        Err(error) => {
-                            return json_error(
-                                StatusCode::BAD_REQUEST,
-                                "invalid_request_error",
-                                error.to_string(),
-                            );
-                        }
-                    };
-                    (
-                        search_request,
-                        query,
-                        search_body.model.unwrap_or_else(|| "gpt-6-sol".to_string()),
-                    )
-                };
-                let log = create_logger("codex");
-                let started_at = Instant::now();
-                log.info(
-                    "codex_standalone_search_started",
-                    Some(serde_json::Map::from_iter([
-                        ("reqId".to_string(), serde_json::json!(&ctx.req_id)),
-                        ("model".to_string(), serde_json::json!(&resolved.model)),
-                        ("stream".to_string(), serde_json::json!(want_stream)),
-                    ])),
-                );
-                if let Some(monitor) = ctx.monitor.as_ref() {
-                    monitor.upstream_started(&ctx.req_id);
-                }
-                let search_response = match self.client.post_search(&search_request, &ctx).await {
-                    Ok(response) => response,
-                    Err(error) => {
-                        log.warn(
-                            "codex_standalone_search_failed",
-                            Some(serde_json::Map::from_iter([
-                                ("reqId".to_string(), serde_json::json!(&ctx.req_id)),
-                                ("model".to_string(), serde_json::json!(&resolved.model)),
-                                ("status".to_string(), serde_json::json!(error.status)),
-                                (
-                                    "ms".to_string(),
-                                    serde_json::json!(started_at.elapsed().as_millis()),
-                                ),
-                            ])),
-                        );
-                        return map_codex_error_to_response(&error);
-                    }
-                };
-                log.info(
-                    "codex_standalone_search_completed",
-                    Some(serde_json::Map::from_iter([
-                        ("reqId".to_string(), serde_json::json!(&ctx.req_id)),
-                        ("model".to_string(), serde_json::json!(&resolved.model)),
-                        (
-                            "resultCount".to_string(),
-                            serde_json::json!(search_response.results.as_ref().map(Vec::len)),
-                        ),
-                        (
-                            "ms".to_string(),
-                            serde_json::json!(started_at.elapsed().as_millis()),
-                        ),
-                    ])),
-                );
-                let input_tokens = search::search_request_input_tokens(&search_request);
-                return search::anthropic_search_response(
-                    &search_response,
-                    &query,
-                    &message_id,
-                    &model,
-                    want_stream,
-                    input_tokens,
-                    ctx.traffic.as_deref(),
                 );
             }
             let use_responses_lite = match apply_model_lane_for_request(&resolved.model, &body) {
@@ -419,6 +336,27 @@ impl CodexProvider {
         let client = self.client.clone();
         if let Some(monitor) = ctx.monitor.as_ref() {
             monitor.upstream_started(&ctx.req_id);
+        }
+        if use_responses_lite && let Some(policy) = lite_search {
+            let response = search_loop::response(
+                client,
+                message_id,
+                model,
+                ctx,
+                translated,
+                continuation,
+                LiveStreamCompaction {
+                    compact_boundary,
+                    attempt: compaction_attempt,
+                    portable_request: None,
+                },
+                configured_transport,
+                policy,
+                want_stream,
+            )
+            .await;
+            request_cleanup.disarm();
+            return response;
         }
         if want_stream {
             let response = live_stream_response(
@@ -752,13 +690,13 @@ impl CodexProvider {
     }
 }
 
-/// Hosted tools require the full lane; never substitute a different model.
+/// Preserve the model-selected lane; Lite search is orchestrated locally.
 fn apply_model_lane_for_request(model: &str, body: &MessagesRequest) -> anyhow::Result<bool> {
-    if has_hosted_web_search(body) {
+    let lite = uses_responses_lite(model);
+    if has_hosted_web_search(body) && !lite {
         validate_hosted_web_search(model)?;
-        return Ok(false);
     }
-    Ok(uses_responses_lite(model))
+    Ok(lite)
 }
 
 fn count_sse_events(bytes: &[u8]) -> u64 {

@@ -3,19 +3,17 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::anthropic::schema::MessagesRequest;
-use crate::anthropic::sse::encode_sse_event;
 use crate::request_identity::ConversationIdentity;
-use crate::traffic::TrafficCapture;
 
 use super::count_tokens::{approx_token_count, truncate_to_token_budget};
-use super::translate::request::{ResponsesFunctionTool, ResponsesTool};
+use super::translate::request::{
+    ResponsesContentPart, ResponsesFunctionTool, ResponsesInputItem, ResponsesTool,
+};
 
 const SEARCH_OUTPUT_TOKEN_BUDGET: u64 = 2_500;
-const SEARCH_ASSISTANT_CONTEXT_TOKEN_BUDGET: u64 = 1_000;
-const SEARCH_USER_CONTEXT_MESSAGES: usize = 2;
-const CLAUDE_SEARCH_PROMPT_PREFIX: &str = "Perform a web search for the query:";
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct SearchRequest {
@@ -28,20 +26,88 @@ pub struct SearchRequest {
     pub max_output_tokens: u64,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+// The supported subset of pinned codex-api/src/search.rs. Unknown commands and
+// unknown nested fields are errors, never silently discarded model instructions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct SearchCommands {
-    pub search_query: Vec<SearchQuery>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_query: Option<Vec<SearchQuery>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open: Option<Vec<OpenOperation>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub click: Option<Vec<ClickOperation>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub find: Option<Vec<FindOperation>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_length: Option<SearchResponseLength>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct SearchQuery {
     pub q: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recency: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domains: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct OpenOperation {
+    pub ref_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineno: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ClickOperation {
+    pub ref_id: String,
+    pub id: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct FindOperation {
+    pub ref_id: String,
+    pub pattern: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchResponseLength {
+    Short,
+    Medium,
+    Long,
+}
+
+impl SearchCommands {
+    pub(crate) fn parse(arguments: &str) -> anyhow::Result<Self> {
+        let commands: Self = serde_json::from_str(arguments)?;
+        anyhow::ensure!(
+            commands
+                .search_query
+                .as_ref()
+                .is_some_and(|v| !v.is_empty())
+                || commands.open.as_ref().is_some_and(|v| !v.is_empty())
+                || commands.click.as_ref().is_some_and(|v| !v.is_empty())
+                || commands.find.as_ref().is_some_and(|v| !v.is_empty()),
+            "web.run requires at least one supported operation"
+        );
+        Ok(commands)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct SearchSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filters: Option<SearchFilters>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_location: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_context_size: Option<String>,
     pub allowed_callers: Vec<&'static str>,
     pub external_web_access: bool,
 }
@@ -61,467 +127,175 @@ pub struct SearchResponse {
     pub results: Option<Vec<Value>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SearchResult<'a> {
-    title: &'a str,
-    url: &'a str,
+pub(crate) struct SearchPolicy {
+    pub(crate) forced: bool,
+    pub(crate) allow_search: bool,
+    pub(crate) max_uses: u64,
+    id: String,
+    settings: SearchSettings,
 }
 
-pub fn is_standalone_search_request(req: &MessagesRequest) -> bool {
-    let Some(choice) = req.extra.get("tool_choice").and_then(Value::as_object) else {
-        return false;
-    };
-    if choice.get("type").and_then(Value::as_str) != Some("tool") {
-        return false;
-    }
-    let Some(selected_name) = choice.get("name").and_then(Value::as_str) else {
-        return false;
-    };
-    req.extra
-        .get("tools")
-        .and_then(Value::as_array)
-        .is_some_and(|tools| {
-            tools.iter().any(|tool| {
+impl SearchPolicy {
+    pub(crate) fn from_request(
+        req: &MessagesRequest,
+        owner: Option<&ConversationIdentity>,
+    ) -> Option<Self> {
+        let tool =
+            req.extra.get("tools")?.as_array()?.iter().find(|tool| {
                 tool.get("type").and_then(Value::as_str) == Some("web_search_20250305")
-                    && tool.get("name").and_then(Value::as_str) == Some(selected_name)
-            })
-        })
-}
-
-pub fn build_search_request(
-    req: &MessagesRequest,
-    model: &str,
-    owner: Option<&ConversationIdentity>,
-) -> Result<(SearchRequest, String), anyhow::Error> {
-    super::translate::request::validate_messages_capabilities(req)?;
-    anyhow::ensure!(
-        req.extra
-            .get("output_config")
-            .and_then(Value::as_object)
-            .is_none_or(|config| config.is_empty())
-            && !req.extra.contains_key("speed")
-            && req.extra.get("parallel_tool_calls") != Some(&Value::Bool(true)),
-        "standalone search has no verified reasoning, structured-output, speed or parallel-execution controls; use an ordinary Messages search turn instead"
-    );
-    let query = extract_search_query(req)
-        .ok_or_else(|| anyhow::anyhow!("web_search request does not contain a text query"))?;
-    let input = search_input(req);
-    let filters = search_filters(req);
-    let id = owner
-        .map(ConversationIdentity::search_session_id)
-        .map(Into::into)
-        .unwrap_or_else(|| format!("search-{}", uuid::Uuid::new_v4()));
-
-    Ok((
-        SearchRequest {
+            })?;
+        let choice = req.extra.get("tool_choice");
+        let choice_kind = choice.and_then(|choice| {
+            choice
+                .as_str()
+                .or_else(|| choice.get("type").and_then(Value::as_str))
+        });
+        let forced = choice.is_some_and(|choice| {
+            choice["type"] == "tool" && choice.get("name") == tool.get("name")
+        });
+        let base = owner
+            .map(|owner| owner.search_session_id().into_owned())
+            .unwrap_or_else(|| format!("search-{}", uuid::Uuid::new_v4()));
+        let id = if let Some(branch) = super::threads::branch() {
+            let mut digest = Sha256::new();
+            for value in [base.as_str(), branch.as_str()] {
+                digest.update((value.len() as u64).to_be_bytes());
+                digest.update(value.as_bytes());
+            }
+            format!("search-{:x}", digest.finalize())
+        } else {
+            base
+        };
+        let allowed_domains = string_array(tool.get("allowed_domains"));
+        let blocked_domains = string_array(tool.get("blocked_domains"));
+        Some(Self {
+            forced,
+            allow_search: choice_kind != Some("none") && (choice_kind != Some("tool") || forced),
+            max_uses: tool
+                .get("max_uses")
+                .and_then(Value::as_u64)
+                .unwrap_or(u64::MAX),
             id,
-            model: model.to_string(),
-            input,
-            commands: SearchCommands {
-                search_query: vec![SearchQuery { q: query.clone() }],
-            },
             settings: SearchSettings {
-                filters,
+                filters: (allowed_domains.is_some() || blocked_domains.is_some()).then_some(
+                    SearchFilters {
+                        allowed_domains,
+                        blocked_domains,
+                    },
+                ),
+                user_location: tool.get("user_location").cloned(),
+                search_context_size: tool
+                    .get("search_context_size")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
                 allowed_callers: vec!["direct"],
                 external_web_access: true,
             },
-            max_output_tokens: SEARCH_OUTPUT_TOKEN_BUDGET,
-        },
-        query,
-    ))
-}
-
-pub fn search_request_input_tokens(request: &SearchRequest) -> u64 {
-    let mut tokens = approx_token_count(&request.model);
-    tokens += request
-        .commands
-        .search_query
-        .iter()
-        .map(|query| approx_token_count(&query.q))
-        .sum::<u64>();
-    tokens += request.input.as_ref().map(value_text_tokens).unwrap_or(0);
-    if let Some(filters) = &request.settings.filters {
-        tokens += filters
-            .allowed_domains
-            .iter()
-            .flatten()
-            .chain(filters.blocked_domains.iter().flatten())
-            .map(|domain| approx_token_count(domain))
-            .sum::<u64>();
-    }
-    tokens.max(1)
-}
-
-pub fn search_response_output_tokens(response: &SearchResponse) -> u64 {
-    (approx_token_count(&response.output)
-        + response
-            .results
-            .as_ref()
-            .map(|results| results.iter().map(value_text_tokens).sum())
-            .unwrap_or(0))
-    .max(1)
-}
-
-fn value_text_tokens(value: &Value) -> u64 {
-    match value {
-        Value::String(text) => approx_token_count(text),
-        Value::Array(values) => values.iter().map(value_text_tokens).sum(),
-        Value::Object(values) => values.values().map(value_text_tokens).sum(),
-        _ => 0,
-    }
-}
-
-pub fn anthropic_search_response(
-    response: &SearchResponse,
-    query: &str,
-    message_id: &str,
-    model: &str,
-    stream: bool,
-    input_tokens: u64,
-    traffic: Option<&TrafficCapture>,
-) -> axum::response::Response {
-    use axum::response::IntoResponse;
-
-    let tool_use_id = format!("srvtoolu_ws_{}", uuid::Uuid::new_v4().simple());
-    let results = search_results(response);
-    let output_tokens = search_response_output_tokens(response);
-    let usage = json!({
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
-        "server_tool_use": {"web_search_requests": 1}
-    });
-
-    if !stream {
-        let content = response_content(response, query, &tool_use_id, &results);
-        return (
-            http::StatusCode::OK,
-            axum::Json(json!({
-                "id": message_id,
-                "type": "message",
-                "role": "assistant",
-                "model": model,
-                "content": content,
-                "stop_reason": "end_turn",
-                "stop_sequence": null,
-                "usage": usage,
-            })),
-        )
-            .into_response();
-    }
-
-    let mut body = Vec::new();
-    emit(
-        &mut body,
-        traffic,
-        "message_start",
-        &json!({
-            "type": "message_start",
-            "message": {
-                "id": message_id,
-                "type": "message",
-                "role": "assistant",
-                "model": model,
-                "content": [],
-                "stop_reason": null,
-                "stop_sequence": null,
-                "usage": {"input_tokens": input_tokens, "output_tokens": 0}
-            }
-        }),
-    );
-    emit(
-        &mut body,
-        traffic,
-        "content_block_start",
-        &json!({
-            "type": "content_block_start",
-            "index": 0,
-            "content_block": {
-                "type": "server_tool_use",
-                "id": tool_use_id,
-                "name": "web_search",
-                "input": {}
-            }
-        }),
-    );
-    emit(
-        &mut body,
-        traffic,
-        "content_block_delta",
-        &json!({
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {
-                "type": "input_json_delta",
-                "partial_json": json!({"query": query}).to_string()
-            }
-        }),
-    );
-    emit_block_stop(&mut body, traffic, 0);
-    emit(
-        &mut body,
-        traffic,
-        "content_block_start",
-        &json!({
-            "type": "content_block_start",
-            "index": 1,
-            "content_block": {
-                "type": "web_search_tool_result",
-                "tool_use_id": tool_use_id,
-                "content": web_search_result_values(&results)
-            }
-        }),
-    );
-    emit_block_stop(&mut body, traffic, 1);
-    if !response.output.is_empty() {
-        emit(
-            &mut body,
-            traffic,
-            "content_block_start",
-            &json!({
-                "type": "content_block_start",
-                "index": 2,
-                "content_block": {"type": "text", "text": ""}
-            }),
-        );
-        emit(
-            &mut body,
-            traffic,
-            "content_block_delta",
-            &json!({
-                "type": "content_block_delta",
-                "index": 2,
-                "delta": {"type": "text_delta", "text": response.output}
-            }),
-        );
-        emit_block_stop(&mut body, traffic, 2);
-    }
-    emit(
-        &mut body,
-        traffic,
-        "message_delta",
-        &json!({
-            "type": "message_delta",
-            "delta": {"stop_reason": "end_turn", "stop_sequence": null},
-            "usage": usage
-        }),
-    );
-    emit(
-        &mut body,
-        traffic,
-        "message_stop",
-        &json!({"type": "message_stop"}),
-    );
-
-    let headers = [
-        (http::header::CONTENT_TYPE, "text/event-stream"),
-        (http::header::CACHE_CONTROL, "no-cache"),
-        (http::header::CONNECTION, "keep-alive"),
-    ];
-    (headers, body).into_response()
-}
-
-fn extract_search_query(req: &MessagesRequest) -> Option<String> {
-    req.messages
-        .iter()
-        .rev()
-        .filter(|message| message.role == "user")
-        .find_map(|message| {
-            let text = content_text(&message.content);
-            let text = text.trim();
-            if text.is_empty() {
-                return None;
-            }
-            Some(
-                text.strip_prefix(CLAUDE_SEARCH_PROMPT_PREFIX)
-                    .map(str::trim)
-                    .filter(|query| !query.is_empty())
-                    .unwrap_or(text)
-                    .to_string(),
-            )
         })
+    }
+
+    pub(crate) fn request(
+        &self,
+        model: &str,
+        commands: SearchCommands,
+        history: &[ResponsesInputItem],
+    ) -> SearchRequest {
+        SearchRequest {
+            id: self.id.clone(),
+            model: model.to_owned(),
+            input: recent_input(history),
+            commands,
+            settings: self.settings.clone(),
+            max_output_tokens: SEARCH_OUTPUT_TOKEN_BUDGET,
+        }
+    }
 }
 
-fn search_input(req: &MessagesRequest) -> Option<Value> {
-    let latest_user = req
-        .messages
+// Pinned ext/web-search/history.rs policy: the last two visible user text
+// messages, assistant text between them (shared 1k-token budget), nothing after
+// the current user. Never send private tools, reasoning, images, or declarations.
+fn recent_input(history: &[ResponsesInputItem]) -> Option<Value> {
+    let mut messages: Vec<_> = history
         .iter()
-        .rposition(|message| message.role == "user" && has_content_text(&message.content))?;
-    let first_user = req.messages[..=latest_user]
-        .iter()
-        .enumerate()
-        .rev()
-        .filter(|(_, message)| message.role == "user" && has_content_text(&message.content))
-        .take(SEARCH_USER_CONTEXT_MESSAGES)
-        .last()
-        .map(|(index, _)| index)
-        .unwrap_or(latest_user);
-
-    let mut assistant_budget = SEARCH_ASSISTANT_CONTEXT_TOKEN_BUDGET;
-    let items: Vec<Value> = req.messages[first_user..=latest_user]
-        .iter()
-        .filter(|message| matches!(message.role.as_str(), "user" | "assistant"))
-        .filter_map(|message| {
-            let role = message.role.as_str();
-            if role == "assistant" && assistant_budget == 0 {
+        .filter_map(|item| {
+            let ResponsesInputItem::Message {
+                role,
+                content,
+                metadata,
+            } = item
+            else {
                 return None;
-            }
-            let text = content_text(&message.content);
-            if text.is_empty() {
-                return None;
-            }
-            let (content_type, text) = if role == "assistant" {
-                let text = truncate_to_token_budget(text, assistant_budget);
-                assistant_budget = assistant_budget.saturating_sub(approx_token_count(&text));
-                ("output_text", text)
-            } else {
-                ("input_text", text)
             };
-            (!text.is_empty()).then(|| {
-                let mut item = json!({
-                    "type": "message",
-                    "role": role,
-                    "content": [{"type": content_type, "text": null}]
-                });
-                item["content"][0]["text"] = Value::String(text.into_owned());
-                item
+            if role != "user" && role != "assistant" {
+                return None;
+            }
+            let content: Vec<_> = content
+                .iter()
+                .filter(|part| {
+                    matches!(
+                        (role.as_str(), part),
+                        ("user", ResponsesContentPart::InputText { .. })
+                            | ("assistant", ResponsesContentPart::OutputText { .. })
+                    )
+                })
+                .cloned()
+                .collect();
+            if content.is_empty() {
+                return None;
+            }
+            let mut metadata = metadata.clone();
+            metadata.id = None;
+            metadata.status = None;
+            metadata.encrypted_content = None;
+            Some(ResponsesInputItem::Message {
+                role: role.clone(),
+                content,
+                metadata,
             })
         })
         .collect();
-    (!items.is_empty()).then_some(Value::Array(items))
-}
-
-fn has_content_text(content: &Value) -> bool {
-    match content {
-        Value::String(text) => !text.is_empty(),
-        Value::Array(blocks) => {
-            let mut texts = blocks
-                .iter()
-                .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
-                .filter_map(|block| block.get("text").and_then(Value::as_str));
-            // Even two empty text blocks join to a nonempty newline.
-            texts
-                .next()
-                .is_some_and(|first| !first.is_empty() || texts.next().is_some())
-        }
-        _ => false,
-    }
-}
-
-fn content_text(content: &Value) -> Cow<'_, str> {
-    match content {
-        Value::String(text) => Cow::Borrowed(text),
-        Value::Array(blocks) => Cow::Owned(
-            blocks
-                .iter()
-                .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
-                .filter_map(|block| block.get("text").and_then(Value::as_str))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        ),
-        _ => Cow::Borrowed(""),
-    }
-}
-
-fn search_filters(req: &MessagesRequest) -> Option<SearchFilters> {
-    let tool = req
-        .extra
-        .get("tools")?
-        .as_array()?
+    let users: Vec<_> = messages
         .iter()
-        .find(|tool| tool.get("type").and_then(Value::as_str) == Some("web_search_20250305"))?;
-    let allowed_domains = string_array(tool.get("allowed_domains"));
-    let blocked_domains = string_array(tool.get("blocked_domains"));
-    (allowed_domains.is_some() || blocked_domains.is_some()).then_some(SearchFilters {
-        allowed_domains,
-        blocked_domains,
-    })
+        .enumerate()
+        .filter_map(|(i, item)| {
+            matches!(item, ResponsesInputItem::Message { role, .. } if role == "user").then_some(i)
+        })
+        .collect();
+    let last = *users.last()?;
+    let first = users[users.len().saturating_sub(2)];
+    messages.truncate(last + 1);
+    messages.drain(..first);
+    let mut budget = 1_000;
+    messages.retain_mut(|item| {
+        if let ResponsesInputItem::Message { role, content, .. } = item
+            && role == "assistant"
+        {
+            content.retain_mut(|part| {
+                let ResponsesContentPart::OutputText { text, .. } = part else {
+                    return false;
+                };
+                if budget == 0 {
+                    return false;
+                }
+                *text = truncate_to_token_budget(Cow::Borrowed(text), budget).into_owned();
+                budget = budget.saturating_sub(approx_token_count(text));
+                true
+            });
+            return !content.is_empty();
+        }
+        true
+    });
+    serde_json::to_value(messages).ok()
 }
 
 fn string_array(value: Option<&Value>) -> Option<Vec<String>> {
-    let values = value?.as_array()?;
-    let values: Vec<String> = values
-        .iter()
-        .filter_map(Value::as_str)
-        .map(str::to_owned)
-        .collect();
-    (!values.is_empty()).then_some(values)
-}
-
-fn search_results(response: &SearchResponse) -> Vec<SearchResult<'_>> {
-    let mut results = Vec::new();
-    let mut seen = HashSet::new();
-    for result in response.results.iter().flatten() {
-        let Some(url) = result.get("url").and_then(Value::as_str) else {
-            continue;
-        };
-        if !seen.insert(url) {
-            continue;
-        }
-        let title = result
-            .get("title")
-            .and_then(Value::as_str)
-            .or_else(|| result.get("ref_id").and_then(Value::as_str))
-            .unwrap_or(url);
-        results.push(SearchResult { title, url });
-    }
-    results
-}
-
-fn response_content(
-    response: &SearchResponse,
-    query: &str,
-    tool_use_id: &str,
-    results: &[SearchResult<'_>],
-) -> Vec<Value> {
-    let mut content = vec![
-        json!({
-            "type": "server_tool_use",
-            "id": tool_use_id,
-            "name": "web_search",
-            "input": {"query": query}
-        }),
-        json!({
-            "type": "web_search_tool_result",
-            "tool_use_id": tool_use_id,
-            "content": web_search_result_values(results)
-        }),
-    ];
-    if !response.output.is_empty() {
-        content.push(json!({"type": "text", "text": response.output}));
-    }
-    content
-}
-
-fn web_search_result_values(results: &[SearchResult<'_>]) -> Vec<Value> {
-    results
-        .iter()
-        .map(|result| {
-            json!({
-                "type": "web_search_result",
-                "title": result.title,
-                "url": result.url,
-            })
-        })
-        .collect()
-}
-
-fn emit_block_stop(out: &mut Vec<u8>, traffic: Option<&TrafficCapture>, index: usize) {
-    emit(
-        out,
-        traffic,
-        "content_block_stop",
-        &json!({"type": "content_block_stop", "index": index}),
-    );
-}
-
-fn emit(out: &mut Vec<u8>, traffic: Option<&TrafficCapture>, event: &str, data: &Value) {
-    if let Some(traffic) = traffic {
-        traffic.write_json_event(
-            "050-downstream-event",
-            &json!({"event": event, "data": data}),
-        );
-    }
-    out.extend_from_slice(&encode_sse_event(Some(event), &data.to_string()));
+    value?.as_array().map(|values| {
+        values
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect()
+    })
 }
 
 pub(crate) fn native_search_tool() -> ResponsesTool {
@@ -575,4 +349,46 @@ pub(crate) fn native_search_tool() -> ResponsesTool {
             strict: false,
         })],
     }
+}
+
+pub(crate) fn compatibility_blocks(
+    call_id: &str,
+    arguments: &Value,
+    response: Result<&SearchResponse, &str>,
+) -> Vec<Value> {
+    let id = format!("srvtoolu_{call_id}");
+    let content = match response {
+        Ok(response) => {
+            let mut seen = HashSet::new();
+            Value::Array(
+                response
+                    .results
+                    .iter()
+                    .flatten()
+                    .filter_map(|result| {
+                        let url = result.get("url")?.as_str()?;
+                        if !seen.insert(url) {
+                            return None;
+                        }
+                        Some(json!({"type":"web_search_result", "url":url,
+                    "title":result.get("title").and_then(Value::as_str).unwrap_or(url)}))
+                    })
+                    .collect(),
+            )
+        }
+        Err(message) => {
+            let code = if message == "web search max_uses limit reached" {
+                "max_uses_exceeded"
+            } else if message.starts_with("invalid web.run commands:") {
+                "invalid_input"
+            } else {
+                "unavailable"
+            };
+            json!({"type":"web_search_tool_result_error", "error_code":code, "message":message})
+        }
+    };
+    vec![
+        json!({"type":"server_tool_use", "id":id, "name":"web_search", "input":arguments}),
+        json!({"type":"web_search_tool_result", "tool_use_id":id, "content":content}),
+    ]
 }

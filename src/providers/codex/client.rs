@@ -20,6 +20,18 @@ use super::models::OperationAuth;
 use super::search::{SearchRequest, SearchResponse};
 use super::translate::request::ResponsesRequest;
 
+fn has_opaque_native_history(body: &ResponsesRequest) -> bool {
+    use super::translate::request::ResponsesInputItem;
+    body.input.iter().any(|item| {
+        matches!(item, ResponsesInputItem::Compaction { .. } | ResponsesInputItem::CompactionTrigger
+                | ResponsesInputItem::Reasoning { .. } | ResponsesInputItem::WebSearchCall { .. })
+            || matches!(item, ResponsesInputItem::Message { metadata, .. }
+                if metadata.encrypted_content.is_some())
+            || matches!(item, ResponsesInputItem::FunctionCall { namespace: Some(namespace), name, .. }
+                if namespace == "web" && name == "run")
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -999,6 +1011,9 @@ impl CodexHttpClient {
             usage_limit: None,
             origin: CodexErrorOrigin::Auth,
         })?;
+        Arc::make_mut(&mut auth)
+            .require_opaque_provenance(&self.base_url)
+            .map_err(auth_refresh_error)?;
         let body_json = serde_json::to_vec(body)
             .map(|body| Bytes::from(body.into_boxed_slice()))
             .map_err(|e| CodexError {
@@ -1068,13 +1083,7 @@ impl CodexHttpClient {
             usage_limit: None,
             origin: CodexErrorOrigin::Auth,
         })?;
-        if body.input.iter().any(|item| {
-            matches!(
-                item,
-                super::translate::request::ResponsesInputItem::Compaction { .. }
-                    | super::translate::request::ResponsesInputItem::CompactionTrigger
-            )
-        }) {
+        if has_opaque_native_history(body) {
             Arc::make_mut(&mut auth)
                 .require_opaque_provenance(&self.base_url)
                 .map_err(auth_refresh_error)?;
@@ -2032,13 +2041,7 @@ impl CodexHttpClient {
             usage_limit: None,
             origin: CodexErrorOrigin::Auth,
         })?;
-        if body.input.iter().any(|item| {
-            matches!(
-                item,
-                super::translate::request::ResponsesInputItem::Compaction { .. }
-                    | super::translate::request::ResponsesInputItem::CompactionTrigger
-            )
-        }) {
+        if has_opaque_native_history(&body) {
             Arc::make_mut(&mut auth)
                 .require_opaque_provenance(&self.base_url)
                 .map_err(auth_refresh_error)?;
