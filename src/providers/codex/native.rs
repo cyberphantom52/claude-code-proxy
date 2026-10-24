@@ -485,6 +485,7 @@ struct NativeBodyState {
 struct NativeResponseObserver {
     ctx: RequestContext,
     is_sse: bool,
+    terminal_seen: bool,
     generation_started: bool,
     raw: Vec<u8>,
     raw_truncated: u64,
@@ -505,6 +506,7 @@ impl NativeResponseObserver {
         Self {
             ctx,
             is_sse,
+            terminal_seen: false,
             generation_started: false,
             raw: Vec::new(),
             raw_truncated: 0,
@@ -619,6 +621,7 @@ impl NativeResponseObserver {
         }
         self.update_usage(&value);
         value = self.update_outcome(value);
+        self.terminal_seen |= super::events::event_is_terminal(&value);
         if self.ctx.traffic.is_none() {
             return;
         }
@@ -706,6 +709,10 @@ impl NativeResponseObserver {
             return;
         }
         self.finished = true;
+        if outcome == "complete" && self.is_sse && !self.terminal_seen {
+            self.outcome
+                .fail("Native Responses stream ended before a terminal event".to_string());
+        }
         if !self.is_sse
             && let Ok(value) = serde_json::from_slice::<Value>(&self.raw)
         {
