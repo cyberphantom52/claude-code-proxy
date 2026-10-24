@@ -196,6 +196,27 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
     if event_type == "codex.rate_limits" {
         return None;
     }
+    // Codex's ResponseCompleted requires a response object with a string id;
+    // usage is optional. Apply this before any consumer can certify success.
+    if matches!(
+        event_type,
+        "response.completed" | "response.done" | "response.incomplete"
+    ) && response_status != Some("failed")
+        && event_error(payload).is_none()
+        && payload
+            .get("response")
+            .and_then(Value::as_object)
+            .and_then(|response| response.get("id"))
+            .is_none_or(|id| !id.is_string())
+    {
+        return Some(CodexEventFailure {
+            kind: CodexFailureKind::Transient,
+            explicit_status: None,
+            status: 502,
+            message: "terminal Codex response requires a response object with a string id".into(),
+            retry_after: None,
+        });
+    }
     if response_is_incomplete_terminal(payload) {
         let reason = payload
             .get("response")
