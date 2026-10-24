@@ -10,7 +10,8 @@ use crate::providers::codex::client::{CodexError, CodexHttpClient};
 use crate::request_identity::ConversationIdentity;
 
 use super::translate::request::{
-    ResponsesContentPart, ResponsesInputItem, ResponsesRequest, is_compact_message_text,
+    ResponsesContentPart, ResponsesInputItem, ResponsesRequest, ResponsesToolChoice,
+    ResponsesToolChoiceMode, is_compact_message_text,
 };
 
 const RETAINED_MESSAGE_TOKEN_BUDGET: u64 = 20_000;
@@ -81,19 +82,7 @@ pub async fn request_compaction(
     request: &ResponsesRequest,
     ctx: &RequestContext,
 ) -> Result<Vec<ResponsesInputItem>, CompactionError> {
-    let (envelope, conversation) = split_input_envelope(&request.input);
-    let conversation = without_compaction_instruction(conversation);
-    let input = envelope
-        .iter()
-        .filter(|item| matches!(item, ResponsesInputItem::AdditionalTools { .. }))
-        .cloned()
-        .chain(conversation)
-        .chain(std::iter::once(ResponsesInputItem::CompactionTrigger))
-        .collect::<Vec<_>>();
-    let mut compaction_request = request.with_input(input);
-    compaction_request.instructions = None;
-    compaction_request.include = Some(vec!["reasoning.encrypted_content".to_string()]);
-
+    let compaction_request = build_compaction_request(request);
     let response = client
         .post_codex_for_owner(&compaction_request, ctx, None)
         .await
@@ -110,6 +99,27 @@ pub async fn request_compaction(
         compaction_request.input,
         compaction,
     ))
+}
+
+fn build_compaction_request(request: &ResponsesRequest) -> ResponsesRequest {
+    let (envelope, conversation) = split_input_envelope(&request.input);
+    let conversation = without_compaction_instruction(conversation);
+    let input = envelope
+        .iter()
+        .filter(|item| matches!(item, ResponsesInputItem::AdditionalTools { .. }))
+        .cloned()
+        .chain(conversation)
+        .chain(std::iter::once(ResponsesInputItem::CompactionTrigger))
+        .collect::<Vec<_>>();
+    let mut compaction_request = request.with_input(input);
+    compaction_request.instructions = None;
+    compaction_request.include = Some(vec!["reasoning.encrypted_content".to_string()]);
+    // Codex 970111f6 compact_remote_v2_attempt.rs builds a fresh prompt with no
+    // output schema; core/client.rs chooses auto and disables parallelism on Lite.
+    compaction_request.tool_choice = Some(ResponsesToolChoice::Mode(ResponsesToolChoiceMode::Auto));
+    compaction_request.text.format = None;
+    compaction_request.parallel_tool_calls = request.client_metadata.is_none();
+    compaction_request
 }
 
 pub(crate) fn begin_compaction_scoped(scope: &CompactionScope, model: &str) -> CompactionAttempt {
