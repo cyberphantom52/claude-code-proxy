@@ -224,9 +224,8 @@ impl CompletedOutputs {
             let interrupted =
                 crate::providers::codex::events::response_is_interrupted_terminal(&payload);
             // Interruption may finalize partial message text, never a tool call.
-            let allows_incomplete = |item: &serde_json::Value| {
-                incomplete || (interrupted && item["type"] == "message")
-            };
+            let allows_incomplete =
+                |item: &serde_json::Value| incomplete || (interrupted && item["type"] == "message");
             if self
                 .items
                 .values()
