@@ -897,6 +897,18 @@ impl CodexHttpClient {
         use_responses_lite: bool,
         stream: bool,
     ) -> Result<reqwest::Response, CodexError> {
+        self.post_native_responses_with_turn_state(body, ctx, use_responses_lite, stream, None)
+            .await
+    }
+
+    pub(crate) async fn post_native_responses_with_turn_state(
+        &self,
+        body: &serde_json::Value,
+        ctx: &RequestContext,
+        use_responses_lite: bool,
+        stream: bool,
+        turn_state: Option<http::HeaderValue>,
+    ) -> Result<reqwest::Response, CodexError> {
         let body_json = serde_json::to_vec(body)
             .map(|body| Bytes::from(body.into_boxed_slice()))
             .map_err(|err| CodexError {
@@ -936,7 +948,10 @@ impl CodexHttpClient {
 
         loop {
             let started_at = Instant::now();
-            let headers = build_native_codex_headers(&auth, ctx, use_responses_lite, stream)?;
+            let mut headers = build_native_codex_headers(&auth, ctx, use_responses_lite, stream)?;
+            if let Some(turn_state) = turn_state.as_ref() {
+                headers.insert("x-codex-turn-state", turn_state.clone());
+            }
             if let Some(traffic) = ctx.traffic.as_deref() {
                 write_codex_http_request_capture(traffic, &self.base_url, &headers, &body_json);
             }

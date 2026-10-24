@@ -7,7 +7,7 @@ use axum::body::Body;
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
-use http::{HeaderMap, HeaderName, StatusCode};
+use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
@@ -44,7 +44,16 @@ impl CodexNativeBackend {
         }
     }
 
-    pub async fn handle(&self, mut body: Value, ctx: RequestContext) -> Response {
+    pub async fn handle(&self, body: Value, ctx: RequestContext) -> Response {
+        self.handle_with_turn_state(body, ctx, None).await
+    }
+
+    pub(crate) async fn handle_with_turn_state(
+        &self,
+        mut body: Value,
+        ctx: RequestContext,
+        turn_state: Option<HeaderValue>,
+    ) -> Response {
         let resolved = match shape_native_request(&mut body) {
             Ok(resolved) => resolved,
             Err(response) => return response,
@@ -56,7 +65,13 @@ impl CodexNativeBackend {
 
         let upstream = match self
             .client
-            .post_native_responses(&body, &ctx, resolved.use_responses_lite, resolved.stream)
+            .post_native_responses_with_turn_state(
+                &body,
+                &ctx,
+                resolved.use_responses_lite,
+                resolved.stream,
+                turn_state,
+            )
             .await
         {
             Ok(response) => response,
@@ -436,6 +451,7 @@ fn native_response_header_allowed(name: &HeaderName) -> bool {
             | "cache-control"
             | "retry-after"
             | "x-request-id"
+            | "x-codex-turn-state"
             | "openai-processing-ms"
             | "openai-version"
     ) || name.as_str().starts_with("x-ratelimit-")

@@ -948,6 +948,10 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
         monitor.request_started(&req_id, session_id.clone(), None, EndpointKind::Responses);
     }
     let request_guard = RequestMonitorGuard::new(state.monitor.clone(), req_id.clone());
+    let turn_state = match native_turn_state(&headers) {
+        Ok(turn_state) => turn_state,
+        Err(response) => return monitor_response_body(response, request_guard),
+    };
     let body = {
         let body_bytes = match axum::body::to_bytes(req.into_body(), MAX_OPENAI_REQUEST_BYTES).await
         {
@@ -1057,7 +1061,11 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
         monitor: state.monitor.clone(),
     };
     let response = match state.native_responses.as_ref() {
-        Some(backend) => backend.handle(body, context).await,
+        Some(backend) => {
+            backend
+                .handle_with_turn_state(body, context, turn_state)
+                .await
+        }
         None => openai_error(
             StatusCode::NOT_FOUND,
             "not_found_error",
@@ -1242,6 +1250,22 @@ async fn handler_chat_completions(
         started_at,
     );
     monitor_response_body(response, request_guard)
+}
+
+#[allow(clippy::result_large_err)]
+fn native_turn_state(headers: &http::HeaderMap) -> Result<Option<http::HeaderValue>, Response> {
+    let mut values = headers.get_all("x-codex-turn-state").iter();
+    let turn_state = values.next().cloned();
+    if values.next().is_some() {
+        return Err(openai_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Multiple x-codex-turn-state headers are not supported",
+            None,
+            None,
+        ));
+    }
+    Ok(turn_state)
 }
 
 fn native_session_id(headers: &http::HeaderMap) -> Option<String> {
