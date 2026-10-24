@@ -145,12 +145,24 @@ impl CompletedOutputs {
                     .then_some(*oi)
                 })
             })
+            .or_else(|| {
+                if payload["type"] != "response.output_item.done" {
+                    return None;
+                }
+                // A delta-only item has a reserved index but no retained start.
+                // Reuse it only when the unfinished same-type item is unique.
+                let mut matching = self.reserved.iter().filter_map(|(index, kind)| {
+                    (!self.items.contains_key(index) && payload["item"]["type"] == *kind)
+                        .then_some(*index)
+                });
+                let index = matching.next()?;
+                matching.next().is_none().then_some(index)
+            })
             .unwrap_or_else(|| {
-                if payload
-                    .pointer("/item/type")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("function_call")
-                    && (self.items.contains_key(&0) || self.reserved.contains_key(&0))
+                if matches!(
+                    payload["type"].as_str(),
+                    Some("response.output_item.added" | "response.output_item.done")
+                ) && (self.items.contains_key(&0) || self.reserved.contains_key(&0))
                 {
                     self.items
                         .keys()
@@ -418,7 +430,11 @@ impl CompletedOutputs {
             out.push(event);
             return Ok(out);
         }
-        out.push(payload.clone());
+        let mut event = payload.clone();
+        if matches!(kind, "response.output_item.added") || payload.get("item_id").is_some() {
+            event["output_index"] = index.into();
+        }
+        out.push(event);
         Ok(out)
     }
 
