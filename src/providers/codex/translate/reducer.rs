@@ -221,11 +221,16 @@ impl CompletedOutputs {
         ) {
             let incomplete =
                 crate::providers::codex::events::response_is_incomplete_terminal(&payload);
-            if !incomplete
-                && self
-                    .items
-                    .values()
-                    .any(|(item, _)| item["status"] == "incomplete")
+            let interrupted =
+                crate::providers::codex::events::response_is_interrupted_terminal(&payload);
+            // Interruption may finalize partial message text, never a tool call.
+            let allows_incomplete = |item: &serde_json::Value| {
+                incomplete || (interrupted && item["type"] == "message")
+            };
+            if self
+                .items
+                .values()
+                .any(|(item, _)| item["status"] == "incomplete" && !allows_incomplete(item))
             {
                 return Err("successful response contains an incomplete output item".into());
             }
@@ -237,14 +242,15 @@ impl CompletedOutputs {
                     .as_array()
                     .ok_or("terminal response output must be an array")?;
                 let unsafe_terminal = self.refused
-                    || crate::providers::codex::events::response_is_incomplete_terminal(&payload)
+                    || incomplete
+                    || interrupted
                     || items.iter().any(|item| {
                         item["content"]
                             .as_array()
                             .is_some_and(|parts| parts.iter().any(|p| p["type"] == "refusal"))
                     });
                 for (index, item) in items.iter().enumerate() {
-                    if !incomplete && item["status"] == "incomplete" {
+                    if item["status"] == "incomplete" && !allows_incomplete(item) {
                         return Err("successful response contains an incomplete output item".into());
                     }
                     let already_done = self.items.get(&index).is_some_and(|(_, done)| *done);

@@ -142,12 +142,7 @@ pub(crate) fn response_needs_follow_up(payload: &Value) -> bool {
             .and_then(|value| value.get("end_turn"))
             .and_then(Value::as_bool)
             == Some(false)
-            || payload
-                .get("response")
-                .and_then(|value| value.get("incomplete_details"))
-                .and_then(|value| value.get("reason"))
-                .and_then(Value::as_str)
-                == Some("interrupted"))
+            || response_is_interrupted_terminal(payload))
 }
 
 pub(crate) fn event_error(payload: &Value) -> Option<&Value> {
@@ -162,22 +157,23 @@ pub(crate) fn event_error(payload: &Value) -> Option<&Value> {
         })
 }
 
+// Codex only treats response.incomplete/interrupted as a resumable sampling
+// step. The same metadata on response.completed does not certify interruption.
+pub(crate) fn response_is_interrupted_terminal(payload: &Value) -> bool {
+    payload["type"] == "response.incomplete"
+        && payload["response"]["incomplete_details"]["reason"] == "interrupted"
+        && event_error(payload).is_none()
+}
+
 pub(crate) fn response_is_incomplete_terminal(payload: &Value) -> bool {
     let event_type = payload.get("type").and_then(Value::as_str);
     let incomplete_details = payload
         .get("response")
         .and_then(|value| value.get("incomplete_details"));
-    // Lite can complete a sampling step without completing the user's turn.
-    // An interrupted step is resumable, not a token cap or a failed response.
-    let interrupted = incomplete_details
-        .and_then(|details| details.get("reason"))
-        .and_then(Value::as_str)
-        == Some("interrupted")
-        && event_error(payload).is_none();
     matches!(
         event_type,
         Some("response.completed" | "response.incomplete" | "response.done")
-    ) && !interrupted
+    ) && !response_is_interrupted_terminal(payload)
         && (event_type == Some("response.incomplete")
             || payload
                 .get("response")
