@@ -1446,14 +1446,23 @@ async fn dispatch_request(
     if let Err(error) =
         crate::providers::codex::translate::request::validate_messages_capabilities(&body)
     {
-        return with_request_id(
+        return failed_request_response(
+            &log,
+            FailedResponseLogContext {
+                req_id: &req_id,
+                provider: None,
+                model: body.model.as_deref(),
+                count_tokens,
+                started_at,
+            },
             json_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
                 error.to_string(),
             ),
-            &req_id,
-        );
+            request_guard,
+        )
+        .await;
     }
     let context = state.discovery.prepare_model_context().await;
     models::with_model_context(context, async {
@@ -1465,7 +1474,19 @@ async fn dispatch_request(
         ) {
             Ok(attempt) => attempt,
             Err(error) => {
-                return with_request_id(error.response(), &req_id);
+                return failed_request_response(
+                    &log,
+                    FailedResponseLogContext {
+                        req_id: &req_id,
+                        provider: None,
+                        model: body.model.as_deref(),
+                        count_tokens,
+                        started_at,
+                    },
+                    error.response(),
+                    request_guard,
+                )
+                .await;
             }
         };
         crate::providers::codex::threads::scope(thread_attempt.clone(), async {
@@ -1854,6 +1875,35 @@ struct FailedResponseLogContext<'a> {
 
 struct FailedResponseDetails {
     message: String,
+}
+
+async fn failed_request_response(
+    log: &Logger,
+    ctx: FailedResponseLogContext<'_>,
+    response: Response,
+    mut guard: RequestMonitorGuard,
+) -> Response {
+    let status = response.status();
+    log_request_completed(
+        log,
+        RequestLogContext {
+            req_id: ctx.req_id,
+            provider: ctx.provider,
+            model: ctx.model,
+            count_tokens: ctx.count_tokens,
+            status,
+            started_at: ctx.started_at,
+        },
+    );
+    let (response, details) = record_failed_response(log, ctx, response).await;
+    guard.failed(
+        status,
+        details.map_or_else(
+            || format!("HTTP {}", status.as_u16()),
+            |details| details.message,
+        ),
+    );
+    with_request_id(response, &guard.req_id)
 }
 
 async fn record_failed_response(

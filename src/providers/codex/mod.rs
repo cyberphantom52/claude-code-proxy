@@ -1447,15 +1447,6 @@ fn translate_live_stream_payload(
     traffic: Option<&crate::traffic::TrafficCapture>,
 ) -> Result<(Vec<u8>, bool), String> {
     let chunk = translator.accept(payload, traffic)?;
-    if events::event_is_success_terminal(payload)
-        && !events::response_is_incomplete_terminal(payload)
-        && translator.has_semantic_output()
-        && !translator.has_current_generation_semantic_output()
-    {
-        return Err(
-            "Codex replacement completed without producing output after reconnect".to_string(),
-        );
-    }
     let terminal = events::event_is_terminal(payload) || translator.is_finished();
     Ok((chunk, terminal))
 }

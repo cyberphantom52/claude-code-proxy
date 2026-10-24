@@ -298,10 +298,26 @@ impl LiveStreamTranslator {
                 self.annotations.push(annotation);
             }
         }
-        for delta in
+        let next_index = self.anthropic_index;
+        let text_deltas =
             self.text_parts
-                .accept(payload, &mut self.anthropic_index, text_output_index)?
+                .accept(payload, &mut self.anthropic_index, text_output_index)?;
+        // Reconcile final-only text before deciding, but reject an empty replacement
+        // before emitting starts or marking the translator finished.
+        if crate::providers::codex::events::event_is_success_terminal(payload)
+            && !crate::providers::codex::events::response_is_incomplete_terminal(payload)
+            && self.has_semantic_output()
+            && !self.has_current_generation_semantic_output()
+            && !text_deltas
+                .iter()
+                .any(|delta| !delta.text.is_empty() || delta.refusal)
         {
+            self.text_parts.discard_unemitted_parts(next_index);
+            return Err(
+                "Codex replacement completed without producing output after reconnect".to_string(),
+            );
+        }
+        for delta in text_deltas {
             self.text_delta(delta, traffic, &mut out);
         }
         match kind {

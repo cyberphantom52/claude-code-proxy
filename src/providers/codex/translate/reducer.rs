@@ -140,6 +140,10 @@ impl TextParts {
     pub fn has_open_parts(&self) -> bool {
         self.parts.values().any(|part| !part.closed)
     }
+    pub fn discard_unemitted_parts(&mut self, first_index: usize) {
+        self.parts.retain(|_, part| part.index < first_index);
+        self.retained_bytes = self.parts.values().map(|part| 256 + part.text.len()).sum();
+    }
     pub fn close_item(&mut self, output_index: Option<usize>) -> Vec<usize> {
         self.parts
             .iter_mut()
