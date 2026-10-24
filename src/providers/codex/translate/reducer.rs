@@ -117,6 +117,7 @@ pub const STOP_PAUSE_TURN: &str = "pause_turn";
 pub const STOP_TOOL_USE: &str = "tool_use";
 pub const STOP_MAX_TOKENS: &str = "max_tokens";
 pub const STOP_REFUSAL: &str = "refusal";
+pub const STOP_STOP_SEQUENCE: &str = "stop_sequence";
 
 // Reconcile the whole output before either translator dispatches terminal-only
 // items. Retain a bounded native projection, never arbitrary output for replay.
@@ -132,6 +133,10 @@ pub(crate) struct CompletedOutputs {
 }
 
 impl CompletedOutputs {
+    pub fn has_refusal(&self) -> bool {
+        self.refused
+    }
+
     pub fn is_done(&self, output_index: usize) -> bool {
         self.items.get(&output_index).is_some_and(|(_, done)| *done)
     }
@@ -1141,6 +1146,7 @@ pub enum ReducerEvent {
     },
     Finish {
         stop_reason: StopReason,
+        stop_sequence: Option<Box<str>>,
         terminal_type: String,
         continuation_eligible: bool,
         usage: Option<CodexUsage>,
@@ -1241,7 +1247,14 @@ fn emit_signature_only_reasoning(
 pub fn finish_metadata_from_upstream(
     input: &[u8],
 ) -> Result<Option<FinishMetadata>, UpstreamStreamError> {
-    let events = reduce_upstream_bytes(input)?;
+    finish_metadata_from_upstream_with_stops(input, &[])
+}
+
+pub fn finish_metadata_from_upstream_with_stops(
+    input: &[u8],
+    stops: &[String],
+) -> Result<Option<FinishMetadata>, UpstreamStreamError> {
+    let events = reduce_upstream_bytes_with_stops(input, stops)?;
     Ok(events.into_iter().rev().find_map(|event| match event {
         ReducerEvent::Finish {
             continuation_eligible,
@@ -1258,6 +1271,16 @@ pub fn finish_metadata_from_upstream(
 }
 
 pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, UpstreamStreamError> {
+    reduce_upstream_bytes_with_stops(input, &[])
+}
+
+pub fn reduce_upstream_bytes_with_stops(
+    input: &[u8],
+    stops: &[String],
+) -> Result<Vec<ReducerEvent>, UpstreamStreamError> {
+    use super::stop_sequences::{StopSequences, text_boundary};
+    let mut stops = StopSequences::new(stops);
+    let mut stopped_at = None;
     let text = String::from_utf8_lossy(input);
     let mut out = Vec::new();
 
@@ -1386,11 +1409,21 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                     .and_then(|id| item_id_to_output_index.get(id).copied())
             })
             .unwrap_or(0);
-        out.extend(
-            upstream_annotations(&p, text_output_index)
-                .into_iter()
-                .map(ReducerEvent::Annotation),
-        );
+        if text_boundary(&p)
+            && let Some(delta) = stops.flush()
+        {
+            out.push(ReducerEvent::TextDelta {
+                index: delta.index,
+                text: delta.text,
+            });
+        }
+        if stops.matched().is_none() {
+            out.extend(
+                upstream_annotations(&p, text_output_index)
+                    .into_iter()
+                    .map(ReducerEvent::Annotation),
+            );
+        }
         for delta in text_parts
             .accept(&p, &mut anthropic_index, text_output_index)
             .map_err(|message| UpstreamStreamError {
@@ -1400,20 +1433,26 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                 diagnostics: None,
             })?
         {
-            close_thinking(
-                &mut out,
-                &mut active_thinking,
-                &mut reasoning_by_output_index,
-                &mut output_items_by_index,
-            );
-            if delta.start {
-                out.push(ReducerEvent::TextStart { index: delta.index });
+            for delta in stops.accept(delta, text_output_index).into_iter().flatten() {
+                close_thinking(
+                    &mut out,
+                    &mut active_thinking,
+                    &mut reasoning_by_output_index,
+                    &mut output_items_by_index,
+                );
+                if delta.start {
+                    out.push(ReducerEvent::TextStart { index: delta.index });
+                }
+                if !delta.text.is_empty() {
+                    out.push(ReducerEvent::TextDelta {
+                        index: delta.index,
+                        text: delta.text,
+                    });
+                }
             }
-            if !delta.text.is_empty() {
-                out.push(ReducerEvent::TextDelta {
-                    index: delta.index,
-                    text: delta.text,
-                });
+            if stops.matched().is_some() {
+                stopped_at.get_or_insert(out.len());
+                break;
             }
         }
 
@@ -1607,6 +1646,12 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
             let item = p.get("item");
             if item.is_some_and(|item| item["type"] == "message") {
                 if item.is_some_and(|item| item["status"] != "incomplete") {
+                    if let Some(delta) = stops.flush_item(Some(output_index)) {
+                        out.push(ReducerEvent::TextDelta {
+                            index: delta.index,
+                            text: delta.text,
+                        });
+                    }
                     text_parts.close_item(Some(output_index));
                 }
                 continue;
@@ -1810,6 +1855,12 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                     });
                 }
             }
+            if let Some(delta) = stops.flush() {
+                out.push(ReducerEvent::TextDelta {
+                    index: delta.index,
+                    text: delta.text,
+                });
+            }
             text_parts.close_item(None);
             continue;
         }
@@ -1842,7 +1893,17 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
         &mut output_items_by_index,
     );
 
-    let stop_reason: StopReason = if output_limited {
+    if stops.matched().is_some() && completed_outputs.has_refusal() {
+        return Err(UpstreamStreamError {
+            kind: UpstreamErrorKind::Failed,
+            message: "Codex refused after a local text stop".into(),
+            retry_after_seconds: None,
+            diagnostics: None,
+        });
+    }
+    let stop_reason: StopReason = if stops.matched().is_some() {
+        STOP_STOP_SEQUENCE
+    } else if output_limited {
         STOP_MAX_TOKENS
     } else if text_parts.has_refusal() {
         STOP_REFUSAL
@@ -1858,8 +1919,18 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
     continuation_eligible &= completed_outputs.native_items(&mut output_items_by_index);
     let output_items: Vec<ResponsesInputItem> = output_items_by_index.into_values().collect();
 
+    let output_items = if let Some(length) = stopped_at {
+        out.truncate(length);
+        out.retain(|event| !matches!(event, ReducerEvent::Annotation(_)));
+        continuation_eligible = false;
+        response_id = None;
+        Vec::new()
+    } else {
+        output_items
+    };
     out.push(ReducerEvent::Finish {
         stop_reason,
+        stop_sequence: stops.matched().map(Box::from),
         terminal_type: terminal_type.unwrap_or_else(|| TERM_INCOMPLETE.to_string()),
         continuation_eligible,
         usage: final_usage,

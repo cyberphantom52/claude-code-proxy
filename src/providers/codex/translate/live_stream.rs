@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::anthropic::sse::append_json_sse_event;
 use crate::providers::codex::events::classify_event_failure;
@@ -12,6 +12,7 @@ use super::reducer::{
     STOP_REFUSAL, STOP_TOOL_USE, TextDelta, TextParts, map_codex_usage_to_anthropic,
     parse_codex_rate_limits, parse_codex_usage, upstream_annotations,
 };
+use super::stop_sequences::{StopSequences, text_boundary};
 use super::web_search_compat::web_search_query;
 
 pub(crate) const BUFFERED_TOOL_MAX_ARGS_BYTES: usize = 5_000_000;
@@ -250,6 +251,8 @@ pub struct LiveStreamTranslator {
     reasoning_by_output_index: HashMap<usize, PendingReasoning>,
     saw_tool_use: bool,
     text_parts: TextParts,
+    stops: StopSequences,
+    exposed_text: BTreeSet<usize>,
     completed_outputs: CompletedOutputs,
     web_search_requests: usize,
     web_searches: Vec<LiveWebSearch>,
@@ -286,6 +289,8 @@ impl LiveStreamTranslator {
             reasoning_by_output_index: HashMap::new(),
             saw_tool_use: false,
             text_parts: TextParts::default(),
+            stops: StopSequences::default(),
+            exposed_text: BTreeSet::new(),
             completed_outputs: CompletedOutputs::default(),
             web_search_requests: 0,
             web_searches: Vec::new(),
@@ -300,6 +305,15 @@ impl LiveStreamTranslator {
             rate_limits: None,
             service_tier: None,
         }
+    }
+
+    pub fn with_stop_sequences(mut self, stops: &[String]) -> Self {
+        self.stops = StopSequences::new(stops);
+        self
+    }
+
+    pub fn matched_stop_sequence(&self) -> Option<&str> {
+        self.stops.matched()
     }
 
     pub fn accept(
@@ -345,6 +359,27 @@ impl LiveStreamTranslator {
         if let Some(failure) = classify_event_failure(payload) {
             return Err(failure.message);
         }
+        if self.stops.matched().is_some() && self.completed_outputs.has_refusal() {
+            return Err("Codex refused after a local text stop".into());
+        }
+        if self.stops.matched().is_some()
+            && !matches!(
+                kind,
+                "response.completed"
+                    | "response.incomplete"
+                    | "response.done"
+                    | "response.created"
+                    | "codex.rate_limits"
+            )
+        {
+            if kind == "response.output_item.done"
+                && payload["item"]["type"] == "web_search_call"
+                && payload["_ccp_output_already_done"] != true
+            {
+                self.web_search_requests += 1;
+            }
+            return Ok(out);
+        }
         if matches!(
             kind,
             "response.completed" | "response.incomplete" | "response.done"
@@ -366,6 +401,11 @@ impl LiveStreamTranslator {
             None
         };
         let text_output_index = self.text_output_index(payload);
+        if text_boundary(payload)
+            && let Some(delta) = self.stops.flush()
+        {
+            self.text_delta(delta, traffic, &mut out);
+        }
         for annotation in upstream_annotations(payload, text_output_index) {
             if !self.annotations.contains(&annotation) {
                 let bytes =
@@ -381,13 +421,17 @@ impl LiveStreamTranslator {
             }
         }
         let next_index = self.anthropic_index;
-        let text_deltas =
+        let text_deltas = if self.stops.matched().is_none() {
             self.text_parts
-                .accept(payload, &mut self.anthropic_index, text_output_index)?;
+                .accept(payload, &mut self.anthropic_index, text_output_index)?
+        } else {
+            Vec::new()
+        };
         // Reconcile final-only text before deciding, but reject an empty replacement
         // before emitting starts or marking the translator finished.
         if crate::providers::codex::events::event_is_success_terminal(payload)
             && !crate::providers::codex::events::response_is_incomplete_terminal(payload)
+            && self.stops.matched().is_none()
             && self.has_semantic_output()
             && !self.has_current_generation_semantic_output()
             && !text_deltas
@@ -400,7 +444,34 @@ impl LiveStreamTranslator {
             );
         }
         for delta in text_deltas {
-            self.text_delta(delta, traffic, &mut out);
+            for delta in self
+                .stops
+                .accept(delta, text_output_index)
+                .into_iter()
+                .flatten()
+            {
+                self.text_delta(delta, traffic, &mut out);
+            }
+            if self.stops.matched().is_some() {
+                break;
+            }
+        }
+        if self.stops.matched().is_some() {
+            if self.completed_outputs.has_refusal() {
+                return Err("Codex refused after a local text stop".into());
+            }
+            self.annotations.clear();
+            self.annotation_bytes = 0;
+            if !matches!(
+                kind,
+                "response.completed"
+                    | "response.incomplete"
+                    | "response.done"
+                    | "response.created"
+                    | "codex.rate_limits"
+            ) {
+                return Ok(out);
+            }
         }
         match kind {
             "codex.rate_limits" => {
@@ -460,6 +531,8 @@ impl LiveStreamTranslator {
     /// safely because the consumer may already have acted on them.
     pub fn can_reconnect(&self) -> bool {
         !self.finished
+            && self.stops.matched().is_none()
+            && !self.stops.has_pending()
             && !self.text_output_started
             && !self.saw_tool_use
             && self.web_search_requests == 0
@@ -468,6 +541,9 @@ impl LiveStreamTranslator {
 
     pub fn prepare_reconnect(&mut self, traffic: Option<&TrafficCapture>) -> Vec<u8> {
         let mut out = Vec::new();
+        if self.stops.matched().is_some() || self.stops.has_pending() {
+            return out;
+        }
         self.close_thinking(traffic, &mut out);
         self.reasoning_by_output_index.clear();
         self.completed_outputs = CompletedOutputs::default();
@@ -495,6 +571,8 @@ impl LiveStreamTranslator {
     ) -> Vec<u8> {
         let mut out = Vec::new();
         if self.finished
+            || self.stops.matched().is_some()
+            || self.stops.has_pending()
             || !self.saw_tool_use
             || !self.blocks_by_output_index.is_empty()
             || self.text_parts.has_open_parts()
@@ -743,6 +821,7 @@ impl LiveStreamTranslator {
         }
         self.ensure_message_start(traffic, out);
         if delta.start {
+            self.exposed_text.insert(delta.index);
             self.emit(traffic, out, "content_block_start", &serde_json::json!({
                 "type":"content_block_start", "index":delta.index, "content_block":{"type":"text","text":""}
             }));
@@ -760,8 +839,11 @@ impl LiveStreamTranslator {
         traffic: Option<&TrafficCapture>,
         out: &mut Vec<u8>,
     ) {
+        if let Some(delta) = self.stops.flush_item(output_index) {
+            self.text_delta(delta, traffic, out);
+        }
         for index in self.text_parts.close_item(output_index) {
-            if !self.deferred_text.contains_key(&index) {
+            if self.exposed_text.remove(&index) {
                 self.emit(
                     traffic,
                     out,
@@ -1175,18 +1257,19 @@ impl LiveStreamTranslator {
             usage.service_tier = usage.service_tier.take().or(self.service_tier.take());
             usage.rate_limits = self.rate_limits.take();
         }
-        let stop_reason =
-            if crate::providers::codex::events::response_is_incomplete_terminal(payload) {
-                STOP_MAX_TOKENS
-            } else if self.text_parts.has_refusal() {
-                STOP_REFUSAL
-            } else if self.saw_tool_use {
-                STOP_TOOL_USE
-            } else if crate::providers::codex::events::response_needs_follow_up(payload) {
-                STOP_PAUSE_TURN
-            } else {
-                STOP_END_TURN
-            };
+        let stop_reason = if self.stops.matched().is_some() {
+            super::reducer::STOP_STOP_SEQUENCE
+        } else if crate::providers::codex::events::response_is_incomplete_terminal(payload) {
+            STOP_MAX_TOKENS
+        } else if self.text_parts.has_refusal() {
+            STOP_REFUSAL
+        } else if self.saw_tool_use {
+            STOP_TOOL_USE
+        } else if crate::providers::codex::events::response_needs_follow_up(payload) {
+            STOP_PAUSE_TURN
+        } else {
+            STOP_END_TURN
+        };
         self.emit_finish(stop_reason, usage, traffic, out);
     }
 
@@ -1200,7 +1283,7 @@ impl LiveStreamTranslator {
         let mapped = map_codex_usage_to_anthropic(&usage, Some(self.web_search_requests));
         let mut message_delta = serde_json::json!({
             "type": "message_delta",
-            "delta": { "stop_reason": stop_reason, "stop_sequence": null },
+            "delta": { "stop_reason": stop_reason, "stop_sequence": self.stops.matched() },
             "usage": mapped,
         });
         if !self.annotations.is_empty() {

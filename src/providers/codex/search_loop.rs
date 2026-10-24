@@ -13,7 +13,7 @@ use super::native::NativeResponseOutcome;
 use super::search::{SearchCommands, SearchPolicy, compatibility_blocks};
 use super::translate::accumulate::accumulate_response_and_metadata_with_traffic;
 use super::translate::live_stream::LiveStreamTranslator;
-use super::translate::reducer::reduce_upstream_bytes;
+use super::translate::reducer::reduce_upstream_bytes_with_stops;
 use super::translate::request::{
     ResponsesFunctionCallOutput, ResponsesFunctionCallOutputContentPart, ResponsesInputItem,
     ResponsesRequest, ResponsesToolChoice, ResponsesToolChoiceMode,
@@ -183,7 +183,8 @@ async fn run(
             }
         };
         let mut translator =
-            LiveStreamTranslator::with_estimated_input_tokens(&message_id, &model, 0);
+            LiveStreamTranslator::with_estimated_input_tokens(&message_id, &model, 0)
+                .with_stop_sequences(&request.stop_sequences);
         let mut native_body = Vec::new();
         let mut terminal = None;
         frames.round_indices.clear();
@@ -235,7 +236,7 @@ async fn run(
             return Err(error("operation_provenance_changed"));
         }
         let (mut public, finish) = accumulate_response_and_metadata_with_traffic(
-            reduce_upstream_bytes(&native_body),
+            reduce_upstream_bytes_with_stops(&native_body, &request.stop_sequences),
             &message_id,
             &model,
             None,
@@ -254,9 +255,19 @@ async fn run(
                 },
             );
         }
+        let stopped = public["stop_reason"] == "stop_sequence";
+        let stopped_native = if stopped {
+            super::translate::reducer::finish_metadata_from_upstream(&native_body)
+                .map_err(|e| error(e.message))?
+                .map(|finish| finish.output_items)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let internal_ids: HashSet<_> = finish
             .output_items
             .iter()
+            .chain(stopped_native.iter())
             .filter_map(|item| {
                 if let ResponsesInputItem::FunctionCall {
                     call_id,
@@ -315,7 +326,7 @@ async fn run(
             && !events::response_is_incomplete_terminal(&terminal)
             && !matches!(
                 public["stop_reason"].as_str(),
-                Some("refusal" | "max_tokens")
+                Some("refusal" | "max_tokens" | "stop_sequence")
             );
         let mixed_round = !calls.is_empty() && external && executable;
         if executable

@@ -180,6 +180,8 @@ pub enum ResponsesToolChoice {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(bound(serialize = "I: Serialize"))]
 pub struct ResponsesRequest<I = Vec<ResponsesInputItem>> {
+    #[serde(skip)]
+    pub stop_sequences: Vec<String>,
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
@@ -208,6 +210,7 @@ pub struct ResponsesRequest<I = Vec<ResponsesInputItem>> {
 impl ResponsesRequest {
     pub(crate) fn with_input<I>(&self, input: I) -> ResponsesRequest<I> {
         ResponsesRequest {
+            stop_sequences: self.stop_sequences.clone(),
             model: self.model.clone(),
             instructions: self.instructions.clone(),
             input,
@@ -683,19 +686,7 @@ pub fn validate_messages_capabilities(req: &MessagesRequest) -> anyhow::Result<(
             );
         }
     }
-    if let Some(stops) = req.extra.get("stop_sequences") {
-        let stops = stops
-            .as_array()
-            .ok_or_else(|| anyhow::anyhow!("stop_sequences must be an array of strings"))?;
-        anyhow::ensure!(
-            stops.iter().all(Value::is_string),
-            "stop_sequences must contain only strings"
-        );
-        anyhow::ensure!(
-            stops.is_empty(),
-            "nonempty stop_sequences have no verified Codex enforcement contract"
-        );
-    }
+    parse_stop_sequences(req)?;
     if let Some(thinking) = req.extra.get("thinking") {
         anyhow::ensure!(
             thinking.is_object() && thinking.get("type").is_some_and(Value::is_string),
@@ -896,6 +887,40 @@ pub fn validate_messages_capabilities(req: &MessagesRequest) -> anyhow::Result<(
     Ok(())
 }
 
+fn parse_stop_sequences(req: &MessagesRequest) -> anyhow::Result<Vec<String>> {
+    use super::stop_sequences::{MAX_STOP_BYTES, MAX_STOP_SEQUENCES};
+    let Some(stops) = req.extra.get("stop_sequences") else {
+        return Ok(Vec::new());
+    };
+    let stops = stops
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("stop_sequences must be an array of strings"))?;
+    anyhow::ensure!(
+        stops.iter().all(Value::is_string),
+        "stop_sequences must contain only strings"
+    );
+    anyhow::ensure!(
+        stops.len() <= MAX_STOP_SEQUENCES,
+        "stop_sequences exceed the local limit of {MAX_STOP_SEQUENCES} strings"
+    );
+    let mut bytes = 0usize;
+    let mut out = Vec::with_capacity(stops.len());
+    for stop in stops {
+        let stop = stop.as_str().expect("validated string");
+        anyhow::ensure!(
+            !stop.is_empty(),
+            "stop_sequences must not contain empty strings"
+        );
+        bytes = bytes.saturating_add(stop.len());
+        anyhow::ensure!(
+            bytes <= MAX_STOP_BYTES,
+            "stop_sequences exceed the local aggregate limit of {MAX_STOP_BYTES} UTF-8 bytes"
+        );
+        out.push(stop.to_owned());
+    }
+    Ok(out)
+}
+
 fn validate_tool_definition(tool: &Value) -> anyhow::Result<()> {
     anyhow::ensure!(tool.is_object(), "tool must be an object");
     anyhow::ensure!(
@@ -1066,6 +1091,7 @@ pub fn translate_request(
     }
 
     let mut out = ResponsesRequest {
+        stop_sequences: parse_stop_sequences(req)?,
         model: opts.model,
         instructions,
         input,

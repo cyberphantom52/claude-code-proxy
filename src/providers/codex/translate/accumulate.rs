@@ -44,6 +44,7 @@ pub fn accumulate_response_and_metadata_with_traffic(
 
     let mut blocks: Vec<AccumulatedBlock> = Vec::new();
     let mut stop_reason = None;
+    let mut stop_sequence = None;
     let mut metadata = None;
     let mut annotations = Vec::new();
     let mut usage: Option<AnthropicUsage> = None;
@@ -149,6 +150,7 @@ pub fn accumulate_response_and_metadata_with_traffic(
             }
             ReducerEvent::Finish {
                 stop_reason: sr,
+                stop_sequence: sequence,
                 usage: u,
                 web_search_requests,
                 continuation_eligible,
@@ -157,6 +159,7 @@ pub fn accumulate_response_and_metadata_with_traffic(
                 ..
             } => {
                 stop_reason = Some(sr);
+                stop_sequence = sequence;
                 let ws = Some(web_search_requests).filter(|n| *n > 0);
                 usage = Some(map_codex_usage_to_anthropic(&u, ws));
                 metadata = Some(FinishMetadata {
@@ -266,7 +269,7 @@ pub fn accumulate_response_and_metadata_with_traffic(
         "model": model,
         "content": [],
         "stop_reason": stop_reason,
-        "stop_sequence": null,
+        "stop_sequence": stop_sequence,
         "usage": usage.unwrap_or_default(),
     });
 

@@ -63,7 +63,7 @@ use self::translate::model_allowlist::{
     assert_allowed_model, resolve_model_request, uses_responses_lite, validate_hosted_web_search,
 };
 use self::translate::reducer::{
-    ReducerEvent, finish_metadata_from_upstream, reduce_upstream_bytes,
+    ReducerEvent, finish_metadata_from_upstream_with_stops, reduce_upstream_bytes_with_stops,
 };
 use self::translate::request::{
     TranslateOptions, disclose_messages_compatibility, has_hosted_web_search,
@@ -449,7 +449,7 @@ impl CodexProvider {
                     return map_codex_error_to_response(&e);
                 }
             };
-            match reduce_upstream_bytes(&response.body) {
+            match reduce_upstream_bytes_with_stops(&response.body, &translated.stop_sequences) {
                 Ok(events) if is_empty_codex_success_completion(&events) => {}
                 reduction => break (response, reduction),
             }
@@ -1173,7 +1173,8 @@ async fn live_stream_response_once(
         message_id,
         model.to_string(),
         estimated_input_tokens,
-    );
+    )
+    .with_stop_sequences(&request_body.stop_sequences);
     let mut upstream_sse_body = (request_continuation.turn_id().is_some()
         || compaction.attempt.is_some()
         || threads::current().is_some())
@@ -1269,6 +1270,7 @@ async fn live_stream_response_once(
             && events::event_is_success_terminal(&payload)
             && !events::response_is_incomplete_terminal(&payload)
             && !translator.has_semantic_output()
+            && translator.matched_stop_sequence().is_none()
         {
             // Record shape only; never log prompt or generated content by default.
             create_logger("codex").warn(
@@ -1996,7 +1998,7 @@ fn update_continuation_from_upstream(
 ) {
     let finish = if threads::current().is_some() {
         accumulate_response_and_metadata_with_traffic(
-            reduce_upstream_bytes(upstream_body),
+            reduce_upstream_bytes_with_stops(upstream_body, &request_body.stop_sequences),
             "",
             &request_body.model,
             None,
@@ -2007,7 +2009,9 @@ fn update_continuation_from_upstream(
             finish
         })
     } else {
-        finish_metadata_from_upstream(upstream_body).ok().flatten()
+        finish_metadata_from_upstream_with_stops(upstream_body, &request_body.stop_sequences)
+            .ok()
+            .flatten()
     };
     update_continuation_from_finish(
         scope,
