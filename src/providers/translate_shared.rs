@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 
+use base64::Engine;
 use serde_json::Value;
 
 use crate::anthropic::schema::MessagesRequest;
@@ -21,6 +22,9 @@ pub enum ContentBlock<'a> {
         tool_use_id: &'a str,
         content: Cow<'a, Value>,
         is_error: Option<bool>,
+    },
+    ToolAddition {
+        tool: &'a Value,
     },
     Thinking {
         signature: Option<&'a str>,
@@ -97,6 +101,48 @@ fn string_field<'a>(value: &'a Value, field: &str) -> anyhow::Result<&'a str> {
         .ok_or_else(|| anyhow::anyhow!("{field} must be a string"))
 }
 
+pub(crate) fn validated_image_data_url(media_type: &str, data: &str) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        matches!(
+            media_type,
+            "image/jpeg" | "image/png" | "image/gif" | "image/webp"
+        ),
+        "unsupported base64 image media_type '{media_type}'"
+    );
+    let compact: String = data.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    anyhow::ensure!(!compact.is_empty(), "base64 image data must not be empty");
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(&compact)
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(&compact))?;
+    Ok(format!(
+        "data:{media_type};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(decoded)
+    ))
+}
+
+fn validate_tool_result_content(content: &Value) -> anyhow::Result<()> {
+    if content.is_string() {
+        return Ok(());
+    }
+    let blocks = content
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("tool_result.content must be a string or array"))?;
+    for (index, block) in blocks.iter().enumerate() {
+        let result = match block.get("type").and_then(Value::as_str) {
+            Some("text" | "image") => parse_content_block(block).map(|_| ()),
+            Some("tool_reference") => string_field(block, "tool_name").and_then(|name| {
+                anyhow::ensure!(!name.is_empty(), "tool_name must not be empty");
+                Ok(())
+            }),
+            _ => anyhow::bail!(
+                "tool_result.content[{index}]: unsupported content block; only text, base64 images and tool_reference are supported"
+            ),
+        };
+        result.map_err(|error| anyhow::anyhow!("tool_result.content[{index}]: {error}"))?;
+    }
+    Ok(())
+}
+
 fn parse_content_block(value: &Value) -> anyhow::Result<ContentBlock<'_>> {
     let kind = string_field(value, "type")?;
     let parsed = || -> anyhow::Result<ContentBlock<'_>> {
@@ -111,7 +157,9 @@ fn parse_content_block(value: &Value) -> anyhow::Result<ContentBlock<'_>> {
                     .ok_or_else(|| anyhow::anyhow!("source must be an object"))?;
                 let source_type = string_field(source, "type")?;
                 let (media_type, data) = match source_type {
-                    "url" => ("", string_field(source, "url")?),
+                    "url" => anyhow::bail!(
+                        "remote image URLs have no verified Codex fetching contract; use a base64 image source"
+                    ),
                     "base64" => (
                         string_field(source, "media_type")?,
                         string_field(source, "data")?,
@@ -123,6 +171,7 @@ fn parse_content_block(value: &Value) -> anyhow::Result<ContentBlock<'_>> {
                     source_type != "base64" || !media_type.is_empty(),
                     "image source media_type must not be empty"
                 );
+                validated_image_data_url(media_type, data)?;
                 ContentBlock::Image {
                     source: ImageSource {
                         media_type,
@@ -151,12 +200,7 @@ fn parse_content_block(value: &Value) -> anyhow::Result<ContentBlock<'_>> {
                     .get("content")
                     .map(Cow::Borrowed)
                     .unwrap_or_else(|| Cow::Owned(Value::String(String::new())));
-                // Nested blocks keep the renderer's explicit placeholders and client
-                // extensions (tool_reference); only an invalid container was silent loss.
-                anyhow::ensure!(
-                    content.is_string() || content.is_array(),
-                    "tool_result.content must be a string or an array of content blocks"
-                );
+                validate_tool_result_content(&content)?;
                 let is_error = match value.get("is_error") {
                     None | Some(Value::Null) => None,
                     Some(Value::Bool(is_error)) => Some(*is_error),
@@ -168,6 +212,35 @@ fn parse_content_block(value: &Value) -> anyhow::Result<ContentBlock<'_>> {
                     is_error,
                 }
             }
+            "tool_addition" => {
+                let tool = value
+                    .get("tool")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| anyhow::anyhow!("tool_addition requires a tool object"))?;
+                let valid = match tool.get("type").and_then(Value::as_str) {
+                    Some("tool_reference") => {
+                        tool.len() == 2
+                            && tool
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .is_some_and(|name| !name.is_empty())
+                    }
+                    Some("tool_definition") => {
+                        tool.len() == 2 && tool.get("definition").is_some_and(Value::is_object)
+                    }
+                    _ => false,
+                };
+                anyhow::ensure!(
+                    valid,
+                    "tool_addition requires tool_reference.name or tool_definition.definition"
+                );
+                ContentBlock::ToolAddition {
+                    tool: &value["tool"],
+                }
+            }
+            "tool_removal" => anyhow::bail!(
+                "temporal tool removal has no verified authenticated Codex withdrawal contract"
+            ),
             "thinking" => {
                 let signature = match value.get("signature") {
                     None | Some(Value::Null) => None,

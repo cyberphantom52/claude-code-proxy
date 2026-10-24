@@ -439,11 +439,15 @@ async fn handler_models(
 }
 
 async fn handler_messages(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
-    dispatch_request(state, req, false).await
+    crate::providers::codex::translate::request::disclose_messages_compatibility(
+        dispatch_request(state, req, false).await,
+    )
 }
 
 async fn handler_count_tokens(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
-    dispatch_request(state, req, true).await
+    crate::providers::codex::translate::request::disclose_messages_compatibility(
+        dispatch_request(state, req, true).await,
+    )
 }
 
 async fn handler_transcription(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {

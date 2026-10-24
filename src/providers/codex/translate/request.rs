@@ -1,7 +1,6 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
-use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -9,6 +8,7 @@ use crate::anthropic::schema::MessagesRequest;
 use crate::config;
 use crate::providers::translate_shared::{
     ContentBlock, flatten_system_text, image_source_to_url, normalize_content, parallel_tool_calls,
+    validated_image_data_url,
 };
 
 use super::model_allowlist::{
@@ -368,6 +368,7 @@ pub struct ResponsesWebSearchFilters {
     pub blocked_domains: Option<Vec<String>>,
 }
 
+#[derive(Clone)]
 pub struct TranslateOptions {
     pub session_id: Option<String>,
     pub service_tier: Option<ServiceTier>,
@@ -389,6 +390,12 @@ pub(crate) fn resolve_effort_override(
 ) -> Result<Option<Effort>, anyhow::Error> {
     if let Some(val) = override_effort {
         anyhow::ensure!(!val.is_empty(), "Invalid empty effort override");
+        anyhow::ensure!(
+            effort
+                .as_ref()
+                .is_none_or(|effort| effort.to_string() == val),
+            "explicit reasoning effort conflicts with configured Codex effort '{val}'"
+        );
         return Ok(to_codex_effort(Some(val)));
     }
     Ok(effort)
@@ -520,27 +527,310 @@ fn pick_service_tier(
     }
 }
 
-pub fn normalize_strict_json_schema(schema: &Value) -> Value {
-    match schema {
-        Value::Array(arr) => Value::Array(arr.iter().map(normalize_strict_json_schema).collect()),
-        Value::Object(map) => {
-            let required = map
-                .get("properties")
-                .and_then(Value::as_object)
-                .map(|properties| {
-                    Value::Array(properties.keys().cloned().map(Value::String).collect())
-                });
-            let mut out: serde_json::Map<String, Value> = map
-                .iter()
-                .map(|(key, value)| (key.clone(), normalize_strict_json_schema(value)))
-                .collect();
-            if let Some(required) = required {
-                out.insert("required".into(), required);
-            }
-            Value::Object(out)
-        }
-        _ => schema.clone(),
+/// Messages compatibility concessions, not provider enforcement guarantees.
+/// Stamp errors as well: startup failure must not hide the unsupported controls.
+pub fn disclose_messages_compatibility(
+    mut response: axum::response::Response,
+) -> axum::response::Response {
+    for header in [
+        "x-codex-max-tokens-enforced",
+        "x-codex-cache-policy-enforced",
+    ] {
+        response
+            .headers_mut()
+            .insert(header, http::HeaderValue::from_static("false"));
     }
+    response
+}
+
+/// Validate Messages intent before search, replay, compaction or inference.
+/// Native Responses passthrough deliberately does not use this adapter.
+pub fn validate_messages_capabilities(req: &MessagesRequest) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        req.max_tokens != Some(0),
+        "max_tokens must be a positive integer; its bound is not enforced by this Codex adapter"
+    );
+    for field in ["temperature", "top_p", "top_k"] {
+        if let Some(value) = req.extra.get(field) {
+            let valid = match field {
+                "top_k" => value.as_u64().is_some(),
+                _ => value
+                    .as_f64()
+                    .is_some_and(|value| (0.0..=1.0).contains(&value)),
+            };
+            anyhow::ensure!(valid, "{field} has an invalid type or range");
+            anyhow::bail!(
+                "{field} enforcement has no verified authenticated Codex contract; omit this control"
+            );
+        }
+    }
+    if let Some(stops) = req.extra.get("stop_sequences") {
+        let stops = stops
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("stop_sequences must be an array of strings"))?;
+        anyhow::ensure!(
+            stops.iter().all(Value::is_string),
+            "stop_sequences must contain only strings"
+        );
+        anyhow::ensure!(
+            stops.is_empty(),
+            "nonempty stop_sequences have no verified Codex enforcement contract"
+        );
+    }
+    if let Some(thinking) = req.extra.get("thinking") {
+        anyhow::ensure!(
+            thinking.is_object() && thinking.get("type").is_some_and(Value::is_string),
+            "thinking must be an object with a string type"
+        );
+        if let Some(budget) = thinking.get("budget_tokens") {
+            anyhow::ensure!(
+                budget.as_u64().is_some_and(|budget| budget >= 1024),
+                "thinking.budget_tokens must be an integer >= 1024"
+            );
+        }
+        // Compatibility only: existing clients send these defaults. Codex effort
+        // remains independent; neither the mode nor budget is enforced here.
+        anyhow::ensure!(
+            matches!(
+                thinking["type"].as_str(),
+                Some("enabled" | "adaptive" | "disabled")
+            ),
+            "unsupported thinking type"
+        );
+    }
+    if let Some(context) = req.extra.get("context_management") {
+        let context = context
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("context_management must be an object"))?;
+        anyhow::ensure!(
+            context.keys().all(|key| key == "edits"),
+            "unsupported context_management field"
+        );
+        if let Some(edits) = context.get("edits") {
+            let edits = edits
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("context_management.edits must be an array"))?;
+            for edit in edits {
+                let edit = edit
+                    .as_object()
+                    .ok_or_else(|| anyhow::anyhow!("context edit must be an object"))?;
+                anyhow::ensure!(
+                    edit.get("type").and_then(Value::as_str) == Some("clear_thinking_20251015")
+                        && edit.get("keep").and_then(Value::as_str) == Some("all")
+                        && edit
+                            .keys()
+                            .all(|key| matches!(key.as_str(), "type" | "keep")),
+                    "context edit requires unavailable exact accounting or encrypted-context semantics; only empty edits and clear_thinking keep='all' are supported"
+                );
+            }
+        }
+    }
+    for field in [
+        "prompt_cache_retention",
+        "cache_policy",
+        "cache_breakpoints",
+    ] {
+        anyhow::ensure!(
+            !req.extra.contains_key(field),
+            "{field} has no verified Codex cache-policy contract"
+        );
+    }
+    validate_cache_hint(req.extra.get("cache_control"))?;
+    if let Some(system) = req.extra.get("system") {
+        anyhow::ensure!(
+            system.is_string() || system.is_array(),
+            "system must be text or text blocks"
+        );
+        if let Some(blocks) = system.as_array() {
+            for block in blocks {
+                anyhow::ensure!(
+                    block.get("type").and_then(Value::as_str) == Some("text")
+                        && block.get("text").is_some_and(Value::is_string),
+                    "system supports only text blocks"
+                );
+                validate_cache_hint(block.get("cache_control"))?;
+            }
+        }
+    }
+    for (message_index, message) in req.messages.iter().enumerate() {
+        if message.role == "system"
+            && (message_index == 0 || req.messages[message_index - 1].role != "system")
+        {
+            let end = message_index
+                + req.messages[message_index..]
+                    .iter()
+                    .take_while(|message| message.role == "system")
+                    .count();
+            let has_tool_update = req.messages[message_index..end].iter().any(|message| {
+                message.content.as_array().is_some_and(|blocks| {
+                    blocks.iter().any(|block| block["type"] == "tool_addition")
+                })
+            });
+            if has_tool_update {
+                anyhow::ensure!(
+                    message_index > 0 && req.messages[message_index - 1].role == "user",
+                    "system tool updates must follow a user turn"
+                );
+                anyhow::ensure!(
+                    end == req.messages.len() || req.messages[end].role == "assistant",
+                    "system tool updates must precede an assistant turn or end the request"
+                );
+            }
+        }
+        anyhow::ensure!(
+            matches!(message.role.as_str(), "user" | "assistant" | "system"),
+            "messages[{message_index}]: unsupported role"
+        );
+        let parsed = normalize_content(&message.content)
+            .map_err(|error| anyhow::anyhow!("messages[{message_index}].{error}"))?;
+        for (block_index, block) in parsed.iter().enumerate() {
+            anyhow::ensure!(
+                matches!(
+                    (message.role.as_str(), block),
+                    (_, ContentBlock::Text { .. })
+                        | (
+                            "user",
+                            ContentBlock::Image { .. } | ContentBlock::ToolResult { .. }
+                        )
+                        | (
+                            "assistant",
+                            ContentBlock::ToolUse { .. } | ContentBlock::Thinking { .. }
+                        )
+                        | ("system", ContentBlock::ToolAddition { .. })
+                ),
+                "messages[{message_index}].content[{block_index}]: unsupported content block for role '{}'",
+                message.role
+            );
+            if let ContentBlock::ToolAddition { tool } = block
+                && tool["type"] == "tool_definition"
+            {
+                let definition = &tool["definition"];
+                validate_tool_definition(definition)?;
+                anyhow::ensure!(
+                    definition.get("input_schema").is_some(),
+                    "inline tool definition requires input_schema"
+                );
+                anyhow::ensure!(
+                    definition
+                        .get("type")
+                        .is_none_or(|kind| matches!(kind.as_str(), Some("custom" | "function"))),
+                    "inline hosted tool additions have no verified Codex contract"
+                );
+            }
+        }
+        if let Some(blocks) = message.content.as_array() {
+            for block in blocks {
+                validate_cache_hint(block.get("cache_control"))?;
+                if block.get("type").and_then(Value::as_str) == Some("tool_result")
+                    && let Some(children) = block.get("content").and_then(Value::as_array)
+                {
+                    for child in children {
+                        validate_cache_hint(child.get("cache_control"))?;
+                    }
+                }
+            }
+        }
+    }
+    if let Some(tools) = req.extra.get("tools") {
+        let tools = tools
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("tools must be an array"))?;
+        for tool in tools {
+            validate_tool_definition(tool)?;
+        }
+    }
+    if let Some(parallel) = req.extra.get("parallel_tool_calls") {
+        anyhow::ensure!(
+            parallel.is_boolean(),
+            "parallel_tool_calls must be a boolean"
+        );
+    }
+    if let Some(disabled) = req
+        .extra
+        .get("tool_choice")
+        .and_then(|choice| choice.get("disable_parallel_tool_use"))
+    {
+        anyhow::ensure!(
+            disabled.is_boolean(),
+            "disable_parallel_tool_use must be a boolean"
+        );
+    }
+    if let Some(output) = req.extra.get("output_config") {
+        anyhow::ensure!(output.is_object(), "output_config must be an object");
+        if let Some(effort) = output.get("effort") {
+            let effort = effort
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("output_config.effort must be a string"))?;
+            anyhow::ensure!(!effort.is_empty(), "output_config.effort must not be empty");
+            resolve_effort_override(
+                to_codex_effort(Some(effort)),
+                config::codex_effort().as_deref(),
+            )?;
+        }
+        read_output_format(req)?;
+    }
+    Ok(())
+}
+
+fn validate_tool_definition(tool: &Value) -> anyhow::Result<()> {
+    anyhow::ensure!(tool.is_object(), "tool must be an object");
+    anyhow::ensure!(
+        tool.get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| !name.is_empty()),
+        "tool.name must be a nonempty string"
+    );
+    for field in ["strict", "defer_loading"] {
+        if let Some(value) = tool.get(field) {
+            anyhow::ensure!(value.is_boolean(), "tool.{field} must be a boolean");
+        }
+    }
+    anyhow::ensure!(
+        tool.get("strict") != Some(&Value::Bool(true)),
+        "strict=true tool enforcement has no verified Codex contract"
+    );
+    validate_cache_hint(tool.get("cache_control"))?;
+    match tool.get("type") {
+        None => {}
+        Some(Value::String(kind))
+            if matches!(kind.as_str(), "custom" | "function" | "web_search_20250305") => {}
+        _ => anyhow::bail!(
+            "unsupported hosted tool type; only ordinary functions and verified web_search_20250305 are supported"
+        ),
+    }
+    if let Some(description) = tool.get("description") {
+        anyhow::ensure!(description.is_string(), "tool.description must be a string");
+    }
+    if let Some(schema) = tool.get("input_schema") {
+        anyhow::ensure!(
+            schema.is_object() || schema.is_boolean(),
+            "input_schema must be a JSON Schema object or boolean"
+        );
+    }
+    for field in ["allowed_domains", "blocked_domains"] {
+        if let Some(domains) = tool.get(field) {
+            anyhow::ensure!(
+                domains
+                    .as_array()
+                    .is_some_and(|domains| domains.iter().all(Value::is_string)),
+                "{field} must be an array of strings"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_cache_hint(hint: Option<&Value>) -> anyhow::Result<()> {
+    if let Some(hint) = hint {
+        let hint = hint
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("cache_control must be an object"))?;
+        anyhow::ensure!(
+            hint.len() == 1 && hint.get("type").and_then(Value::as_str) == Some("ephemeral"),
+            "explicit cache TTL/breakpoint policy has no verified Codex contract; only advisory ephemeral hints without TTL are accepted (not enforced)"
+        );
+    }
+    Ok(())
 }
 
 /// Hosted tools (web_search) are rejected by the Responses Lite lane, which
@@ -561,12 +851,13 @@ pub fn translate_request(
     mut req: MessagesRequest,
     opts: TranslateOptions,
 ) -> Result<ResponsesRequest, anyhow::Error> {
+    validate_messages_capabilities(&req)?;
     if has_hosted_web_search(&req) {
         validate_hosted_web_search(&opts.model)?;
     }
     let instructions = flatten_system_text(req.extra.get("system"));
     let is_compact = is_compact_messages_request(&req);
-    let input = build_input(&req)?;
+    let input = build_input(&req, opts.use_responses_lite)?;
     let tools = read_tools(&mut req)?;
     let req = &req;
     let tool_choice = map_tool_choice(req)?;
@@ -590,7 +881,7 @@ pub fn translate_request(
         format: None,
     };
 
-    if let Some(fmt) = read_output_format(req) {
+    if let Some(fmt) = read_output_format(req)? {
         text.format = Some(fmt);
     }
 
@@ -626,7 +917,7 @@ pub fn translate_request(
             && !tools.is_empty()
         {
             let loads = tool_reference_loads(req);
-            let (prefix_tools, loaded_tools) = split_loaded_deferred_tools(req, tools, &loads)?;
+            let prefix_tools = split_loaded_deferred_tools(req, tools, &loads)?;
             if !prefix_tools.is_empty() {
                 prefix.push(ResponsesInputItem::AdditionalTools {
                     id: None,
@@ -634,7 +925,6 @@ pub fn translate_request(
                     tools: prefix_tools,
                 });
             }
-            append_loaded_tools(&mut out.input, &loads, loaded_tools);
         }
         if let Some(instructions) = out.instructions.take()
             && !instructions.is_empty()
@@ -694,12 +984,13 @@ pub fn translate_request(
         Some(Value::String(effort)) => Some(effort.as_str()),
         Some(_) => anyhow::bail!("output_config.effort must be a string"),
     };
+    let configured_effort = config::codex_effort();
     let mut resolved_effort =
-        resolve_effort_override(to_codex_effort(effort), config::codex_effort().as_deref())?;
+        resolve_effort_override(to_codex_effort(effort), configured_effort.as_deref())?;
     let resolved_string = resolved_effort.as_ref().map(ToString::to_string);
     resolved_effort =
         resolve_model_effort(&out.model, resolved_string.as_deref())?.map(Effort::from);
-    if is_compact {
+    if is_compact && effort.is_none() && configured_effort.is_none() {
         let capped = apply_compact_effort_cap(resolved_effort.clone(), compact_effort_cap());
         // A local compaction optimization must not invent an unadvertised level.
         if let Ok(effort) = resolve_model_effort(
@@ -710,6 +1001,10 @@ pub fn translate_request(
         }
     }
     let wants_reasoning = reasoning_requested(resolved_effort.as_ref());
+    anyhow::ensure!(
+        resolved_effort != Some(Effort::None),
+        "no-reasoning effort has no verified authenticated Codex model/lane contract"
+    );
     if resolved_effort.is_some() || opts.use_responses_lite {
         let summary = if wants_reasoning && !req.omit_reasoning_artifacts {
             model_reasoning_summary(
@@ -737,28 +1032,43 @@ pub fn translate_request(
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn read_output_format(req: &MessagesRequest) -> Option<ResponsesTextFormat> {
-    let output_config = req.extra.get("output_config")?.as_object()?;
-    let format = output_config.get("format")?.as_object()?;
-    let kind = format.get("type")?.as_str()?;
-    match kind {
+fn read_output_format(req: &MessagesRequest) -> anyhow::Result<Option<ResponsesTextFormat>> {
+    let Some(format) = req
+        .extra
+        .get("output_config")
+        .and_then(|config| config.get("format"))
+    else {
+        return Ok(None);
+    };
+    let kind = format.get("type").and_then(Value::as_str).ok_or_else(|| {
+        anyhow::anyhow!("output_config.format must be an object with a string type")
+    })?;
+    let format = match kind {
         "json_schema" => {
-            let name = format
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("response")
-                .to_string();
-            let schema = format.get("schema")?;
-            let normalized = normalize_strict_json_schema(schema);
-            Some(ResponsesTextFormat::JsonSchema {
-                name,
-                schema: normalized,
+            let name = match format.get("name") {
+                None => "response",
+                Some(Value::String(name)) if !name.is_empty() => name,
+                _ => anyhow::bail!("output_config.format.name must be a nonempty string"),
+            };
+            let schema = format
+                .get("schema")
+                .filter(|schema| schema.is_object() || schema.is_boolean())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "output_config.format.schema must be a JSON Schema object or boolean"
+                    )
+                })?;
+            ResponsesTextFormat::JsonSchema {
+                name: name.to_string(),
+                schema: schema.clone(),
                 strict: Some(true),
-            })
+            }
         }
-        "json_object" => Some(ResponsesTextFormat::JsonObject),
-        _ => Some(ResponsesTextFormat::Text),
-    }
+        "json_object" => ResponsesTextFormat::JsonObject,
+        "text" => ResponsesTextFormat::Text,
+        _ => anyhow::bail!("unsupported output_config.format.type '{kind}'"),
+    };
+    Ok(Some(format))
 }
 
 /// Claude Code sends this deferred stub only to keep Anthropic's deferred loading on.
@@ -827,11 +1137,11 @@ fn split_loaded_deferred_tools(
     req: &MessagesRequest,
     tools: Vec<ResponsesTool>,
     loads: &HashMap<String, Vec<String>>,
-) -> Result<(Vec<Value>, HashMap<String, Value>), anyhow::Error> {
+) -> Result<Vec<Value>, anyhow::Error> {
     let deferred = deferred_tool_names(req);
     let loaded: HashSet<&str> = loads.values().flatten().map(String::as_str).collect();
+    let temporal = temporal_tool_names(req);
     let mut prefix = Vec::new();
-    let mut appended = HashMap::new();
     for mut tool in tools {
         if is_deferred_placeholder(&tool, &deferred) {
             continue;
@@ -847,48 +1157,13 @@ fn split_loaded_deferred_tools(
             value["parameters"] = parameters;
         }
         match responses_tool_name(&tool) {
-            Some(name) if deferred.contains(name) && loaded.contains(name) => {
-                appended.insert(name.to_string(), value);
-            }
+            Some(name)
+                if deferred.contains(name)
+                    && (loaded.contains(name) || temporal.contains(name)) => {}
             _ => prefix.push(value),
         }
     }
-    Ok((prefix, appended))
-}
-
-fn append_loaded_tools(
-    input: &mut Vec<ResponsesInputItem>,
-    loads: &HashMap<String, Vec<String>>,
-    mut loaded_tools: HashMap<String, Value>,
-) {
-    if loaded_tools.is_empty() {
-        return;
-    }
-    let mut out = Vec::with_capacity(input.len() + loads.len());
-    for item in input.drain(..) {
-        let names = match &item {
-            ResponsesInputItem::FunctionCallOutput { call_id, .. } => loads.get(call_id),
-            _ => None,
-        };
-        out.push(item);
-        let tools: Vec<Value> = names
-            .into_iter()
-            .flatten()
-            .filter_map(|name| loaded_tools.remove(name))
-            .collect();
-        if !tools.is_empty() {
-            out.push(ResponsesInputItem::AdditionalTools {
-                id: None,
-                role: "developer".to_string(),
-                tools,
-            });
-        }
-    }
-    debug_assert!(
-        loaded_tools.is_empty(),
-        "every loaded tool should follow the tool_result that loaded it"
-    );
-    *input = out;
+    Ok(prefix)
 }
 
 fn read_tools(req: &mut MessagesRequest) -> Result<Option<Vec<ResponsesTool>>, anyhow::Error> {
@@ -931,29 +1206,7 @@ fn read_tools(req: &mut MessagesRequest) -> Result<Option<Vec<ResponsesTool>>, a
                 filters: if has_filters { Some(filters) } else { None },
             }));
         } else {
-            let name = tool
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let description = tool
-                .get("description")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            // Keep names and deferred-loading metadata in the request.
-            let parameters = tool
-                .get_mut("input_schema")
-                .map(std::mem::take)
-                .unwrap_or(serde_json::json!({}));
-            let description = codex_tool_description(&name, description);
-            let parameters = codex_tool_parameters(&name, parameters);
-            out.push(ResponsesTool::Function(ResponsesFunctionTool {
-                kind: "function".to_string(),
-                name,
-                description,
-                parameters,
-                strict: false,
-            }));
+            out.push(function_tool(tool));
         }
     }
     if out.is_empty() {
@@ -961,6 +1214,92 @@ fn read_tools(req: &mut MessagesRequest) -> Result<Option<Vec<ResponsesTool>>, a
     } else {
         Ok(Some(out))
     }
+}
+
+fn function_tool(tool: &mut Value) -> ResponsesTool {
+    let name = tool["name"]
+        .as_str()
+        .expect("validated tool name")
+        .to_string();
+    let description = tool
+        .get("description")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let parameters = tool
+        .get_mut("input_schema")
+        .map(std::mem::take)
+        .unwrap_or(serde_json::json!({}));
+    ResponsesTool::Function(ResponsesFunctionTool {
+        kind: "function".into(),
+        description: codex_tool_description(&name, description),
+        parameters: codex_tool_parameters(&name, parameters),
+        name,
+        strict: false,
+    })
+}
+
+/// References in SYSTEM blocks use `name`, unlike tool-result references' `tool_name`.
+fn temporal_tool_names(req: &MessagesRequest) -> HashSet<String> {
+    req.messages
+        .iter()
+        .filter(|message| message.role == "system")
+        .filter_map(|message| message.content.as_array())
+        .flatten()
+        .filter(|block| block["type"] == "tool_addition")
+        .filter_map(|block| match block["tool"]["type"].as_str() {
+            Some("tool_reference") => block["tool"]["name"].as_str(),
+            Some("tool_definition") => block["tool"]["definition"]["name"].as_str(),
+            _ => None,
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+fn add_temporal_tool(
+    tool: &Value,
+    catalog: &mut HashMap<String, Value>,
+    active: &mut HashSet<String>,
+) -> anyhow::Result<Option<Value>> {
+    let definition = if tool["type"] == "tool_reference" {
+        let name = tool["name"].as_str().expect("validated reference name");
+        catalog
+            .get(name)
+            .ok_or_else(|| {
+                anyhow::anyhow!("tool_addition reference '{name}' has no retained definition")
+            })?
+            .clone()
+    } else {
+        tool["definition"].clone()
+    };
+    let name = definition["name"]
+        .as_str()
+        .expect("validated tool name")
+        .to_string();
+    anyhow::ensure!(
+        definition
+            .get("type")
+            .is_none_or(|kind| matches!(kind.as_str(), Some("custom" | "function"))),
+        "temporal hosted tools have no verified Codex contract"
+    );
+    // Compare provider declarations, not advisory cache/deferred-loading metadata.
+    let wire = serde_json::to_value(function_tool(&mut definition.clone()))?;
+    let identical = catalog.get(&name).is_some_and(|old| {
+        old.get("type")
+            .is_none_or(|kind| matches!(kind.as_str(), Some("custom" | "function")))
+            && serde_json::to_value(function_tool(&mut old.clone()))
+                .ok()
+                .as_ref()
+                == Some(&wire)
+    });
+    if let Some(old) = catalog.get(&name) {
+        anyhow::ensure!(
+            old.get("type")
+                .is_none_or(|kind| matches!(kind.as_str(), Some("custom" | "function"))),
+            "temporal tool type collision"
+        );
+    }
+    catalog.insert(name.clone(), definition);
+    Ok((active.insert(name) || !identical).then_some(wire))
 }
 
 fn codex_tool_description(name: &str, description: Option<String>) -> Option<String> {
@@ -972,54 +1311,7 @@ fn codex_tool_description(name: &str, description: Option<String>) -> Option<Str
     Some(format!("{base}\n\n{}", read_offset_guidance()))
 }
 
-// OpenAI's regex dialect differs from schemas emitted by clients. Drop pattern
-// constraints rather than guessing backend compatibility with a local regex engine.
-// This relaxes tool argument validation, including otherwise compatible patterns.
-// Only visit schema-bearing keywords: defaults, examples and other literal data
-// must remain intact, as must names in property and definition maps.
-fn strip_tool_schema_patterns(schema: &mut Value) {
-    let Some(schema) = schema.as_object_mut() else {
-        return;
-    };
-    schema.remove("pattern");
-
-    for (keyword, value) in schema {
-        match keyword.as_str() {
-            "properties" | "patternProperties" | "$defs" | "definitions" | "dependentSchemas"
-            | "dependencies" => {
-                if let Some(schemas) = value.as_object_mut() {
-                    for schema in schemas.values_mut() {
-                        strip_tool_schema_patterns(schema);
-                    }
-                }
-            }
-            "allOf" | "anyOf" | "oneOf" | "prefixItems" | "items" => {
-                if let Some(schemas) = value.as_array_mut() {
-                    for schema in schemas {
-                        strip_tool_schema_patterns(schema);
-                    }
-                } else if keyword == "items" {
-                    strip_tool_schema_patterns(value);
-                }
-            }
-            "additionalProperties"
-            | "additionalItems"
-            | "unevaluatedProperties"
-            | "unevaluatedItems"
-            | "contains"
-            | "propertyNames"
-            | "not"
-            | "if"
-            | "then"
-            | "else"
-            | "contentSchema" => strip_tool_schema_patterns(value),
-            _ => {}
-        }
-    }
-}
-
 fn codex_tool_parameters(name: &str, mut parameters: Value) -> Value {
-    strip_tool_schema_patterns(&mut parameters);
     if name != "Read" {
         return parameters;
     }
@@ -1107,37 +1399,38 @@ fn map_tool_choice(req: &MessagesRequest) -> Result<Option<ResponsesToolChoice>,
     }
 }
 
-fn build_input(req: &MessagesRequest) -> anyhow::Result<Vec<ResponsesInputItem>> {
+fn build_input(req: &MessagesRequest, lite: bool) -> anyhow::Result<Vec<ResponsesInputItem>> {
     let mut out: Vec<ResponsesInputItem> = Vec::new();
     let mut read_tool_uses_with_offset = HashSet::new();
+    let temporal = temporal_tool_names(req);
+    let loads = tool_reference_loads(req);
+    let loaded: HashSet<&str> = loads.values().flatten().map(String::as_str).collect();
+    let mut catalog = HashMap::new();
+    let mut active = HashSet::new();
+    for tool in req
+        .extra
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let name = tool["name"]
+            .as_str()
+            .expect("validated tool name")
+            .to_string();
+        let deferred = tool.get("defer_loading") == Some(&Value::Bool(true));
+        if !deferred || (!temporal.contains(&name) && !loaded.contains(name.as_str())) {
+            active.insert(name.clone());
+        }
+        anyhow::ensure!(
+            catalog.insert(name, tool.clone()).is_none(),
+            "duplicate tool names are ambiguous"
+        );
+    }
 
     for (message_index, msg) in req.messages.iter().enumerate() {
-        anyhow::ensure!(
-            matches!(msg.role.as_str(), "user" | "assistant" | "system"),
-            "messages[{message_index}].role: unsupported role '{}'",
-            msg.role
-        );
         let blocks = normalize_content(&msg.content)
             .map_err(|error| anyhow::anyhow!("messages[{message_index}].{error}"))?;
-        for (block_index, block) in blocks.iter().enumerate() {
-            anyhow::ensure!(
-                matches!(
-                    (msg.role.as_str(), block),
-                    (_, ContentBlock::Text { .. })
-                        | (
-                            "user",
-                            ContentBlock::Image { .. } | ContentBlock::ToolResult { .. }
-                        )
-                        | (
-                            "assistant",
-                            ContentBlock::ToolUse { .. } | ContentBlock::Thinking { .. }
-                        )
-                ),
-                "messages[{message_index}].content[{block_index}]: unsupported content block type '{}' for role '{}'",
-                msg.content[block_index]["type"].as_str().unwrap_or("text"),
-                msg.role
-            );
-        }
         match msg.role.as_str() {
             "user" => {
                 let mut parts: Vec<ResponsesContentPart> = Vec::new();
@@ -1165,7 +1458,7 @@ fn build_input(req: &MessagesRequest) -> anyhow::Result<Vec<ResponsesInputItem>>
                                     content: std::mem::take(&mut parts),
                                 });
                             }
-                            let mut rendered = render_tool_result(&content);
+                            let mut rendered = render_tool_result(&content)?;
                             if is_error.unwrap_or(false) {
                                 rendered.prepend_text("[tool execution error]".to_string());
                             }
@@ -1184,6 +1477,25 @@ fn build_input(req: &MessagesRequest) -> anyhow::Result<Vec<ResponsesInputItem>>
                                 call_id: tool_use_id.to_string(),
                                 output: function_call_output(rendered, joined_text),
                             });
+                            if lite {
+                                let mut tools = Vec::new();
+                                for name in loads.get(tool_use_id).into_iter().flatten() {
+                                    let reference =
+                                        serde_json::json!({"type":"tool_reference","name":name});
+                                    if let Some(tool) =
+                                        add_temporal_tool(&reference, &mut catalog, &mut active)?
+                                    {
+                                        tools.push(tool);
+                                    }
+                                }
+                                if !tools.is_empty() {
+                                    out.push(ResponsesInputItem::AdditionalTools {
+                                        id: None,
+                                        role: "developer".into(),
+                                        tools,
+                                    });
+                                }
+                            }
                         }
                         _ => {}
                     }
@@ -1196,18 +1508,40 @@ fn build_input(req: &MessagesRequest) -> anyhow::Result<Vec<ResponsesInputItem>>
                 }
             }
             "system" => {
-                let parts: Vec<ResponsesContentPart> = blocks
-                    .into_iter()
-                    .filter_map(|b| match b {
-                        ContentBlock::Text { text } => Some(ResponsesContentPart::InputText {
-                            text: text.to_string(),
-                        }),
-                        _ => None,
-                    })
-                    .collect();
+                let mut parts = Vec::new();
+                for block in blocks {
+                    match block {
+                        ContentBlock::Text { text } => {
+                            parts.push(ResponsesContentPart::InputText {
+                                text: text.to_string(),
+                            })
+                        }
+                        ContentBlock::ToolAddition { tool } => {
+                            anyhow::ensure!(
+                                lite,
+                                "temporal tool additions/replacements require the verified Responses Lite lane; full-lane temporal tools are unavailable"
+                            );
+                            if !parts.is_empty() {
+                                out.push(ResponsesInputItem::Message {
+                                    role: "developer".into(),
+                                    content: std::mem::take(&mut parts),
+                                });
+                            }
+                            if let Some(tool) = add_temporal_tool(tool, &mut catalog, &mut active)?
+                            {
+                                out.push(ResponsesInputItem::AdditionalTools {
+                                    id: None,
+                                    role: "developer".into(),
+                                    tools: vec![tool],
+                                });
+                            }
+                        }
+                        _ => unreachable!("validated system content"),
+                    }
+                }
                 if !parts.is_empty() {
                     out.push(ResponsesInputItem::Message {
-                        role: "developer".to_string(),
+                        role: "developer".into(),
                         content: parts,
                     });
                 }
@@ -1387,84 +1721,56 @@ impl RenderedToolResult<'_> {
     }
 }
 
-fn render_tool_result(content: &Value) -> RenderedToolResult<'_> {
+fn render_tool_result(content: &Value) -> anyhow::Result<RenderedToolResult<'_>> {
     let parts = match content {
         Value::String(text) => vec![RenderedToolResultPart::Text(Cow::Borrowed(text))],
-        Value::Array(blocks) => blocks.iter().map(render_tool_result_block).collect(),
-        _ => Vec::new(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .map(render_tool_result_block)
+            .collect::<anyhow::Result<_>>()?,
+        _ => anyhow::bail!("tool_result.content must be text or content blocks"),
     };
-    RenderedToolResult { parts }
+    Ok(RenderedToolResult { parts })
 }
 
-fn render_tool_result_block(block: &Value) -> RenderedToolResultPart<'_> {
-    match block.get("type").and_then(Value::as_str) {
-        Some("text") => block
-            .get("text")
-            .and_then(Value::as_str)
-            .map(|text| RenderedToolResultPart::Text(Cow::Borrowed(text)))
-            .unwrap_or_else(|| {
-                RenderedToolResultPart::Text(unsupported_tool_result_block_to_string(block).into())
-            }),
-        Some("image") => render_tool_result_image(block),
-        Some("tool_reference") => match block.get("tool_name").and_then(Value::as_str) {
-            Some(name) => RenderedToolResultPart::Text(format!("Tool loaded: {name}").into()),
-            None => {
-                RenderedToolResultPart::Text(unsupported_tool_result_block_to_string(block).into())
-            }
-        },
-        Some(other) => RenderedToolResultPart::Text(
-            format!("[unsupported content block omitted: {other}]").into(),
+fn render_tool_result_block(block: &Value) -> anyhow::Result<RenderedToolResultPart<'_>> {
+    let part = match block.get("type").and_then(Value::as_str) {
+        Some("text") => RenderedToolResultPart::Text(Cow::Borrowed(
+            block
+                .get("text")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("tool_result text must be a string"))?,
+        )),
+        Some("image") => {
+            let source = block
+                .get("source")
+                .ok_or_else(|| anyhow::anyhow!("tool_result image requires source"))?;
+            anyhow::ensure!(
+                source.get("type").and_then(Value::as_str) == Some("base64"),
+                "tool_result images require base64; remote image URLs have no verified Codex fetching contract"
+            );
+            let media_type = source
+                .get("media_type")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("image media_type must be a string"))?;
+            let data = source
+                .get("data")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("image data must be a string"))?;
+            RenderedToolResultPart::Image(validated_image_data_url(media_type, data)?)
+        }
+        Some("tool_reference") => {
+            let name = block
+                .get("tool_name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("tool_reference requires tool_name"))?;
+            RenderedToolResultPart::Text(format!("Tool loaded: {name}").into())
+        }
+        _ => anyhow::bail!(
+            "unsupported nested tool_result content; use text, base64 images or tool_reference"
         ),
-        None => RenderedToolResultPart::Text(unsupported_tool_result_block_to_string(block).into()),
-    }
-}
-
-fn render_tool_result_image(block: &Value) -> RenderedToolResultPart<'_> {
-    let Some(source) = block.get("source").and_then(Value::as_object) else {
-        return RenderedToolResultPart::Text(unsupported_tool_result_block_to_string(block).into());
     };
-    match source.get("type").and_then(Value::as_str) {
-        Some("url") if source.get("url").and_then(Value::as_str).is_some() => {
-            RenderedToolResultPart::Text(Cow::Borrowed("[image omitted: url]"))
-        }
-        Some("base64") => {
-            let media_type = source.get("media_type").and_then(Value::as_str);
-            let data = source.get("data").and_then(Value::as_str);
-            match media_type
-                .zip(data)
-                .and_then(|(media_type, data)| validated_image_data_url(media_type, data))
-            {
-                Some(image_url) => RenderedToolResultPart::Image(image_url),
-                None => RenderedToolResultPart::Text(
-                    unsupported_tool_result_block_to_string(block).into(),
-                ),
-            }
-        }
-        _ => RenderedToolResultPart::Text(unsupported_tool_result_block_to_string(block).into()),
-    }
-}
-
-fn validated_image_data_url(media_type: &str, data: &str) -> Option<String> {
-    if !matches!(
-        media_type,
-        "image/jpeg" | "image/png" | "image/gif" | "image/webp"
-    ) {
-        return None;
-    }
-
-    let compact: String = data
-        .chars()
-        .filter(|character| !character.is_ascii_whitespace())
-        .collect();
-    if compact.is_empty() {
-        return None;
-    }
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(&compact)
-        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(&compact))
-        .ok()?;
-    let canonical = base64::engine::general_purpose::STANDARD.encode(decoded);
-    Some(format!("data:{media_type};base64,{canonical}"))
+    Ok(part)
 }
 
 fn function_call_output(
@@ -1494,12 +1800,4 @@ fn function_call_output(
             })
             .collect(),
     )
-}
-
-fn unsupported_tool_result_block_to_string(block: &Value) -> String {
-    let kind = block
-        .get("type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-    format!("[unsupported content block omitted: {kind}]")
 }

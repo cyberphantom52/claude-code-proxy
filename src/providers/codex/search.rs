@@ -92,6 +92,16 @@ pub fn build_search_request(
     model: &str,
     owner: Option<&ConversationIdentity>,
 ) -> Result<(SearchRequest, String), anyhow::Error> {
+    super::translate::request::validate_messages_capabilities(req)?;
+    anyhow::ensure!(
+        req.extra
+            .get("output_config")
+            .and_then(Value::as_object)
+            .is_none_or(|config| config.is_empty())
+            && !req.extra.contains_key("speed")
+            && req.extra.get("parallel_tool_calls") != Some(&Value::Bool(true)),
+        "standalone search has no verified reasoning, structured-output, speed or parallel-execution controls; use an ordinary Messages search turn instead"
+    );
     let query = extract_search_query(req)
         .ok_or_else(|| anyhow::anyhow!("web_search request does not contain a text query"))?;
     let input = search_input(req);
@@ -177,8 +187,6 @@ pub fn anthropic_search_response(
     let usage = json!({
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
-        "cache_creation_input_tokens": 0,
-        "cache_read_input_tokens": 0,
         "server_tool_use": {"web_search_requests": 1}
     });
 
