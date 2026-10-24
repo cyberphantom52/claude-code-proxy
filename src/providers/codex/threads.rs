@@ -52,10 +52,12 @@ struct Snapshot {
     request: MessagesRequest,
     native: Vec<ResponsesInputItem>,
     model: String,
+    use_responses_lite: bool,
 }
 struct Replay {
     native: Vec<ResponsesInputItem>,
     model: String,
+    use_responses_lite: bool,
     messages: usize,
 }
 struct Entry {
@@ -114,6 +116,7 @@ struct AttemptState {
     settled: bool,
     closed: bool,
     message_id: Option<String>,
+    use_responses_lite: Option<bool>,
 }
 pub(crate) struct ThreadAttempt {
     id: String,
@@ -206,11 +209,7 @@ pub(crate) fn prepare(
     let Some(thread) = body.extra.remove("thread").filter(|v| !v.is_null()) else {
         return Ok(None);
     };
-    if count
-        || super::search::is_standalone_search_request(body)
-        || super::translate::request::has_hosted_web_search(body)
-    {
-        // Hosted search artifacts cannot yet be replayed truthfully as native input.
+    if count {
         return Err(unsupported());
     }
     let owner = owner.ok_or_else(unsupported)?;
@@ -284,6 +283,7 @@ pub(crate) fn prepare(
         replay = Some(Replay {
             native: snapshot.native.clone(),
             model: snapshot.model.clone(),
+            use_responses_lite: snapshot.use_responses_lite,
             messages: snapshot.request.messages.len(),
         });
         branch.clone_from(&entry.branch);
@@ -321,6 +321,21 @@ pub(crate) fn prepare(
             metadata_bytes,
         },
     );
+    let request = body.clone();
+    // Search blocks are downstream views, not native replay inputs. Only strip
+    // the registry-owned prefix for translation; retain the full snapshot above.
+    if let Some(replay) = &replay {
+        for message in body.messages.iter_mut().take(replay.messages) {
+            if message.role == "assistant"
+                && let Some(blocks) = message.content.as_array_mut()
+            {
+                blocks.retain(|block| {
+                    block["type"] != "web_search_tool_result"
+                        && !(block["type"] == "server_tool_use" && block["name"] == "web_search")
+                });
+            }
+        }
+    }
     Ok(Some(Arc::new(ThreadAttempt {
         id,
         parent,
@@ -328,12 +343,13 @@ pub(crate) fn prepare(
         provenance,
         metadata_bytes,
         state: Mutex::new(AttemptState {
-            request: Some(body.clone()),
+            request: Some(request),
             replay,
             pending: None,
             settled: false,
             closed: false,
             message_id: None,
+            use_responses_lite: None,
         }),
     })))
 }
@@ -355,16 +371,17 @@ pub(crate) fn restore_native(
     let Some(attempt) = current() else {
         return Ok(());
     };
-    let state = attempt.state.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(replay) = &state.replay else {
-        return Ok(());
-    };
-    if replay.model != translated.model {
-        return Err(mismatch());
+    let mut state = attempt.state.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(replay) = &state.replay {
+        if replay.model != translated.model || replay.use_responses_lite != opts.use_responses_lite
+        {
+            return Err(mismatch());
+        }
+        let suffix = thread_input_suffix(body, opts.use_responses_lite, replay.messages)
+            .map_err(|_| unsupported())?;
+        translated.input = replay.native.iter().chain(&suffix).cloned().collect();
     }
-    let suffix = thread_input_suffix(body, opts.use_responses_lite, replay.messages)
-        .map_err(|_| unsupported())?;
-    translated.input = replay.native.iter().chain(&suffix).cloned().collect();
+    state.use_responses_lite = Some(opts.use_responses_lite);
     Ok(())
 }
 
@@ -389,6 +406,9 @@ pub(crate) fn settle(
     if state.closed || state.settled {
         return;
     }
+    let Some(use_responses_lite) = state.use_responses_lite else {
+        return;
+    };
     let Some(mut portable) = state.request.take() else {
         return;
     };
@@ -423,6 +443,7 @@ pub(crate) fn settle(
             request: portable,
             native,
             model: request.model.clone(),
+            use_responses_lite,
         }),
         bytes,
     ));
