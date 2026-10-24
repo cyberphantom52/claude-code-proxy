@@ -1820,9 +1820,16 @@ impl CodexHttpClient {
             }
 
             if let Ok(response) = &result
-                && (200..300).contains(&response.status)
-                && let Some(failure) = super::events::first_retryable_failure(&response.body)
+                && let Some(failure) = super::events::first_event_failure(&response.body)
             {
+                if !failure.retryable() {
+                    let mut error = codex_event_failure_error(failure);
+                    error.origin = match response.transport {
+                        ActualTransport::Http => CodexErrorOrigin::BufferedHttp,
+                        ActualTransport::WebSocket => CodexErrorOrigin::BufferedWebSocket,
+                    };
+                    return Err(error);
+                }
                 if transport_failures < MAX_BUFFERED_TRANSPORT_RETRIES {
                     let delay =
                         compute_backoff_delay(transport_failures, failure.retry_after.as_deref());
@@ -1984,6 +1991,20 @@ impl CodexHttpClient {
                     response.provenance = auth.provenance(&self.base_url);
                     return Ok(response);
                 }
+                Err(err) if is_connection_limit_error(&err) => {
+                    if transport_failures >= MAX_BUFFERED_TRANSPORT_RETRIES {
+                        return Err(err);
+                    }
+                    let delay =
+                        compute_backoff_delay(transport_failures, err.retry_after.as_deref());
+                    if delay.exceeds_budget {
+                        return Err(err);
+                    }
+                    transport_failures += 1;
+                    active_continuation = full_context_continuation(active_continuation.as_ref());
+                    sleep(delay.wait_ms).await;
+                    continue;
+                }
                 Err(err)
                     if should_retry_without_continuation(&err, active_continuation.as_ref()) =>
                 {
@@ -2092,6 +2113,7 @@ impl CodexHttpClient {
             .and_then(|reservation| reservation.candidate().previous_response_id.as_deref())
             .is_some();
         let mut forwarded_any = false;
+        let mut connection_limit_retries = 0;
 
         'attempt: loop {
             socket_id_publisher.publish(None);
@@ -2274,6 +2296,30 @@ impl CodexHttpClient {
                     continuation = full_context_continuation(continuation.as_ref());
                     continuation_retry_available = false;
                     continue 'attempt;
+                }
+
+                if let Err(err) = &item
+                    && is_connection_limit_error(err)
+                    && !forwarded_any
+                    && connection_limit_retries < MAX_BUFFERED_TRANSPORT_RETRIES
+                {
+                    let delay =
+                        compute_backoff_delay(connection_limit_retries, err.retry_after.as_deref());
+                    if !delay.exceeds_budget {
+                        connection_limit_retries += 1;
+                        socket_id_publisher.mark_full_context_retry();
+                        continuation = full_context_continuation(continuation.as_ref());
+                        continuation_retry_available = false;
+                        tokio::select! {
+                            biased;
+                            _ = tx.closed() => {
+                                abort_abandoned_live_continuation(continuation.as_ref(), &socket_id_publisher);
+                                return;
+                            }
+                            _ = sleep(delay.wait_ms) => {}
+                        }
+                        continue 'attempt;
+                    }
                 }
 
                 if let Err(err) = &item
@@ -3496,6 +3542,11 @@ fn should_fallback_to_http(err: &CodexError) -> bool {
     err.origin == CodexErrorOrigin::WebSocketHandshake
         && err.status != http::StatusCode::PROXY_AUTHENTICATION_REQUIRED.as_u16()
         && err.detail.as_deref() != Some(super::websocket::WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL)
+}
+
+fn is_connection_limit_error(error: &CodexError) -> bool {
+    error.origin == CodexErrorOrigin::WebSocket
+        && error.detail.as_deref() == Some(super::websocket::WEBSOCKET_CONNECTION_LIMIT_REACHED)
 }
 
 fn should_retry_without_continuation(

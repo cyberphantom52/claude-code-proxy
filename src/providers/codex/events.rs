@@ -235,6 +235,11 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
         (Some("cyber_policy"), Some(message)) if message.trim().is_empty() => {
             "This request has been flagged for possible cybersecurity risk.".to_string()
         }
+        (Some("misalignment_policy_violation"), message)
+            if message.is_none_or(|message| message.trim().is_empty()) =>
+        {
+            "This request was blocked due to a misalignment policy violation.".to_string()
+        }
         (Some("invalid_prompt" | "bio_policy"), None) => "Invalid request.".to_string(),
         (_, Some(message)) => message.to_string(),
         _ => "Upstream error".to_string(),
@@ -254,6 +259,12 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
                     | "cyber_policy"
                     | "invalid_prompt"
                     | "bio_policy"
+                    | "misalignment_policy_violation"
+                    | "credit_balance_exhausted"
+                    | "organization_spend_limit_exceeded"
+                    | "project_spend_limit_exceeded"
+                    | "model_not_found"
+                    | "flex_unavailable"
             )
         ) {
         CodexFailureKind::Permanent
@@ -290,8 +301,17 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
         413
     } else {
         explicit_status.unwrap_or(match code {
-            Some("cyber_policy" | "invalid_prompt" | "bio_policy") => 400,
-            Some("insufficient_quota") => 429,
+            Some(
+                "cyber_policy" | "invalid_prompt" | "bio_policy" | "misalignment_policy_violation",
+            ) => 400,
+            Some(
+                "insufficient_quota"
+                | "credit_balance_exhausted"
+                | "organization_spend_limit_exceeded"
+                | "project_spend_limit_exceeded"
+                | "flex_unavailable",
+            ) => 429,
+            Some("model_not_found") => 404,
             Some("usage_not_included") => 403,
             _ => match kind {
                 CodexFailureKind::RateLimit => 429,
@@ -302,16 +322,19 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
         })
     };
     let retry_after = error
-        .and_then(|value| value.get("retry_after"))
-        .and_then(scalar_string_value)
+        .and_then(retry_after_header)
+        .or_else(|| retry_after_header(payload))
+        .or_else(|| {
+            error
+                .and_then(|value| value.get("retry_after"))
+                .and_then(scalar_string_value)
+        })
         .or_else(|| {
             error
                 .and_then(|value| value.get("retry_after_seconds"))
                 .and_then(scalar_string_value)
         })
-        .or_else(|| scalar_string(payload.get("retry_after_seconds")))
-        .or_else(|| scalar_string(payload.pointer("/headers/retry-after")))
-        .or_else(|| scalar_string(payload.pointer("/headers/Retry-After")));
+        .or_else(|| scalar_string(payload.get("retry_after_seconds")));
 
     Some(CodexEventFailure {
         kind,
@@ -544,10 +567,6 @@ fn numeric_value(value: Option<&Value>) -> Option<u64> {
     }
 }
 
-pub(crate) fn first_retryable_failure(body: &[u8]) -> Option<CodexEventFailure> {
-    first_event_failure(body).filter(CodexEventFailure::retryable)
-}
-
 pub(crate) fn first_event_failure(body: &[u8]) -> Option<CodexEventFailure> {
     let text = String::from_utf8_lossy(body);
     for event in sse_events(&text) {
@@ -569,6 +588,18 @@ pub(crate) fn numeric_status(payload: &Value) -> Option<u64> {
         .get("status")
         .and_then(Value::as_u64)
         .or_else(|| payload.get("status_code").and_then(Value::as_u64))
+}
+
+fn retry_after_header(value: &Value) -> Option<String> {
+    value
+        .get("headers")?
+        .as_object()?
+        .iter()
+        .find_map(|(name, value)| {
+            name.eq_ignore_ascii_case("retry-after")
+                .then(|| scalar_string_value(value))
+                .flatten()
+        })
 }
 
 fn scalar_string(value: Option<&Value>) -> Option<String> {

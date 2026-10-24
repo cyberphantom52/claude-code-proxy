@@ -46,6 +46,7 @@ pub const WEBSOCKET_MISSING_TERMINAL_DETAIL: &str = "websocket_missing_terminal"
 pub const WEBSOCKET_KEEPALIVE_FAILURE_DETAIL: &str = "websocket_keepalive_failure";
 pub const WEBSOCKET_CONTINUATION_SOCKET_MISSING_DETAIL: &str =
     "websocket_continuation_socket_missing";
+pub(super) const WEBSOCKET_CONNECTION_LIMIT_REACHED: &str = "websocket_connection_limit_reached";
 pub(super) const WEBSOCKET_PROXY_TUNNEL_REJECTED_DETAIL: &str = "websocket_proxy_tunnel_rejected";
 
 // Match HTTP's idle connection retention; response/read timeouts are independent.
@@ -761,6 +762,29 @@ fn is_previous_response_missing(payload: &serde_json::Value) -> bool {
     false
 }
 
+fn reconnect_event_error(payload: &serde_json::Value) -> Option<CodexError> {
+    let connection_limit = super::events::event_error(payload)
+        .and_then(|error| error.get("code"))
+        .and_then(serde_json::Value::as_str)
+        == Some(WEBSOCKET_CONNECTION_LIMIT_REACHED);
+    if !connection_limit && !is_previous_response_missing(payload) {
+        return None;
+    }
+    let failure = super::events::classify_event_failure(payload)?;
+    Some(CodexError {
+        status: if connection_limit { failure.status } else { 0 },
+        message: failure.message,
+        detail: Some(if connection_limit {
+            WEBSOCKET_CONNECTION_LIMIT_REACHED.to_string()
+        } else {
+            "previous_response_not_found".to_string()
+        }),
+        retry_after: failure.retry_after,
+        usage_limit: None,
+        origin: CodexErrorOrigin::WebSocket,
+    })
+}
+
 pub(super) fn event_error_status(payload: &serde_json::Value) -> Option<u16> {
     super::events::classify_event_failure(payload).and_then(|failure| failure.explicit_status)
 }
@@ -868,20 +892,11 @@ pub(super) async fn codex_websocket_request(
         used_pooled = false;
     }
 
-    guard
-        .send(Message::Text(body_json))
+    send_ws_message(&mut guard, Message::Text(body_json), idle_timeout_ms)
         .await
-        .map_err(|error| {
+        .inspect_err(|_| {
             if let Some(owner) = pool_owner {
                 invalidate_pool_entry(owner, &entry);
-            }
-            CodexError {
-                status: 0,
-                message: format!("WebSocket send error: {error}"),
-                detail: None,
-                retry_after: None,
-                usage_limit: None,
-                origin: CodexErrorOrigin::WebSocket,
             }
         })?;
 
@@ -910,18 +925,11 @@ pub(super) async fn codex_websocket_request(
         return Err(missing_terminal_error());
     };
 
-    if is_previous_response_missing(&terminal_event.payload) {
+    if let Some(error) = reconnect_event_error(&terminal_event.payload) {
         if let Some(owner) = pool_owner {
             invalidate_pool_entry(owner, &entry);
         }
-        return Err(CodexError {
-            status: 0,
-            message: "Previous response not found".to_string(),
-            detail: Some("previous_response_not_found".to_string()),
-            retry_after: None,
-            usage_limit: None,
-            origin: CodexErrorOrigin::WebSocket,
-        });
+        return Err(error);
     }
 
     let completed = terminal_event.event_type == "response.completed";
@@ -955,6 +963,32 @@ pub(super) async fn codex_websocket_request(
     ))
 }
 
+async fn send_ws_message<S>(
+    websocket: &mut WebSocketStream<S>,
+    message: Message,
+    timeout_ms: u64,
+) -> Result<(), CodexError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let result =
+        tokio::time::timeout(Duration::from_millis(timeout_ms), websocket.send(message)).await;
+    match result {
+        Ok(Ok(())) => Ok(()),
+        _ => Err(CodexError {
+            status: 0,
+            message: match result {
+                Ok(Err(error)) => format!("WebSocket send error: {error}"),
+                _ => format!("WebSocket send timed out after {timeout_ms}ms"),
+            },
+            detail: None,
+            retry_after: None,
+            usage_limit: None,
+            origin: CodexErrorOrigin::WebSocket,
+        }),
+    }
+}
+
 async fn validate_pooled_websocket<S>(
     websocket: &mut WebSocketStream<S>,
     timeout_ms: u64,
@@ -965,11 +999,11 @@ where
     let nonce = next_monotonic_nonzero(&POOLED_VALIDATION_SEQUENCE, "pooled validation")
         .to_be_bytes()
         .to_vec();
-    websocket
-        .send(Message::Ping(nonce.clone()))
-        .await
-        .map_err(|error| error.to_string())?;
     tokio::time::timeout(Duration::from_millis(timeout_ms), async {
+        websocket
+            .send(Message::Ping(nonce.clone()))
+            .await
+            .map_err(|error| error.to_string())?;
         loop {
             match websocket.next().await {
                 Some(Ok(Message::Pong(payload))) if payload == nonce => return Ok(()),
@@ -1114,22 +1148,20 @@ pub(super) fn start_codex_websocket_events(
             idle_timeout_ms,
         } = ready;
         let pool_owner = reservation_pool_owner(reservation.as_ref());
-        if let Err(error) = guard.send(Message::Text(body_json)).await {
+        let sent = tokio::select! {
+            biased;
+            _ = tx.closed() => None,
+            result = send_ws_message(&mut guard, Message::Text(body_json), idle_timeout_ms) => Some(result),
+        };
+        if !matches!(sent, Some(Ok(()))) {
             drop(guard);
             if let Some(owner) = pool_owner {
                 invalidate_pool_entry(owner, &entry);
             }
             socket_id_publisher.publish(None);
-            let _ = tx
-                .send(Err(CodexError {
-                    status: 0,
-                    message: format!("WebSocket send error: {error}"),
-                    detail: None,
-                    retry_after: None,
-                    usage_limit: None,
-                    origin: CodexErrorOrigin::WebSocket,
-                }))
-                .await;
+            if let Some(Err(error)) = sent {
+                let _ = tx.send(Err(error)).await;
+            }
             return;
         }
         let (reusable, terminal_item) =
@@ -2354,15 +2386,8 @@ where
                 }
 
                 if event_is_terminal(&parsed) {
-                    if is_previous_response_missing(&parsed) {
-                        terminal_item = Some(Err(CodexError {
-                            status: 0,
-                            message: "Previous response not found".to_string(),
-                            detail: Some("previous_response_not_found".to_string()),
-                            retry_after: None,
-                            usage_limit: None,
-                            origin: CodexErrorOrigin::WebSocket,
-                        }));
+                    if let Some(error) = reconnect_event_error(&parsed) {
+                        terminal_item = Some(Err(error));
                     } else {
                         reusable = parsed.get("type").and_then(|value| value.as_str())
                             == Some("response.completed");
