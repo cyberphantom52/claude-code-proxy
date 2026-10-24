@@ -219,6 +219,19 @@ fn apply_native_capabilities(
         }
     }
 
+    // Explicit null cannot satisfy Lite's context contract; do not replace it.
+    if lite
+        && (object.get("reasoning") == Some(&Value::Null)
+            || object
+                .get("reasoning")
+                .and_then(|reasoning| reasoning.get("context"))
+                .is_some_and(|context| context.as_str() != Some("all_turns")))
+    {
+        return Err(invalid_capability(
+            "reasoning.context",
+            "Responses Lite requires reasoning.context='all_turns'",
+        ));
+    }
     let mut reasoning = match object.get_mut("reasoning") {
         None | Some(Value::Null) => Map::new(),
         Some(Value::Object(reasoning)) => std::mem::take(reasoning),
@@ -229,6 +242,9 @@ fn apply_native_capabilities(
             ));
         }
     };
+    if lite {
+        reasoning.entry("context").or_insert(json!("all_turns"));
+    }
     let explicit_effort = match reasoning.get("effort") {
         None | Some(Value::Null) => None,
         Some(value) => Some(
