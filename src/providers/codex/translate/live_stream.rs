@@ -283,6 +283,18 @@ impl LiveStreamTranslator {
             return Err("upstream stream ended with open Codex tool blocks".to_string());
         }
 
+        let terminal_usage = if matches!(
+            kind,
+            "response.completed" | "response.incomplete" | "response.done"
+        ) {
+            payload
+                .get("response")
+                .map(parse_codex_usage)
+                .transpose()
+                .map_err(|error| error.message)?
+        } else {
+            None
+        };
         let text_output_index = self.text_output_index(payload);
         for annotation in upstream_annotations(payload, text_output_index) {
             if !self.annotations.contains(&annotation) {
@@ -372,7 +384,7 @@ impl LiveStreamTranslator {
                 self.output_item_done(payload, traffic, &mut out)?;
             }
             "response.completed" | "response.incomplete" | "response.done" => {
-                self.finish(payload, traffic, &mut out);
+                self.finish(payload, terminal_usage, traffic, &mut out);
             }
             _ => {}
         }
@@ -1087,6 +1099,7 @@ impl LiveStreamTranslator {
     fn finish(
         &mut self,
         payload: &serde_json::Value,
+        mut usage: Option<CodexUsage>,
         traffic: Option<&TrafficCapture>,
         out: &mut Vec<u8>,
     ) {
@@ -1094,7 +1107,6 @@ impl LiveStreamTranslator {
         self.close_open_blocks(traffic, out);
         self.emit_web_searches(traffic, out);
         self.ensure_message_start(traffic, out);
-        let mut usage = payload.get("response").map(parse_codex_usage);
         if let Some(usage) = usage.as_mut() {
             usage.service_tier = usage.service_tier.take().or(self.service_tier.take());
             usage.rate_limits = self.rate_limits.take();

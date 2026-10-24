@@ -54,6 +54,8 @@ pub struct CodexUsage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub input_tokens_details_cached: Option<u64>,
+    pub codex_cache_write_input_tokens: Option<u64>,
+    pub codex_cache_write_tokens_details: Option<serde_json::Value>,
     pub output_tokens_details_reasoning: Option<u64>,
     /// Actual tier reported by the response, not the requested tier.
     pub service_tier: Option<String>,
@@ -641,6 +643,11 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
             });
         }
 
+        let terminal_usage = if matches!(t, TERM_COMPLETED | TERM_DONE | TERM_INCOMPLETE) {
+            p.get("response").map(parse_codex_usage).transpose()?
+        } else {
+            None
+        };
         let text_output_index = p
             .get("output_index")
             .and_then(serde_json::Value::as_u64)
@@ -1047,7 +1054,7 @@ pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, Upstream
                 .and_then(|r| r.get("id"))
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
-            final_usage = p.get("response").map(parse_codex_usage);
+            final_usage = terminal_usage;
             if let Some(usage) = final_usage.as_mut() {
                 usage.service_tier = usage.service_tier.take().or(service_tier.take());
                 usage.rate_limits = latest_rate_limits.take();
@@ -1143,9 +1150,54 @@ fn describe_open_blocks(
     out
 }
 
-pub(super) fn parse_codex_usage(response: &serde_json::Value) -> CodexUsage {
+pub(super) fn parse_codex_usage(
+    response: &serde_json::Value,
+) -> Result<CodexUsage, UpstreamStreamError> {
     let usage = response.get("usage").unwrap_or(&serde_json::Value::Null);
-    CodexUsage {
+    let invalid = || UpstreamStreamError {
+        kind: UpstreamErrorKind::Failed,
+        message: "invalid Codex cache-write usage accounting".into(),
+        retry_after_seconds: None,
+        diagnostics: None,
+    };
+    let count = |value: Option<&serde_json::Value>| -> Result<Option<u64>, UpstreamStreamError> {
+        value
+            .filter(|value| !value.is_null())
+            .map(|value| value.as_u64().ok_or_else(invalid))
+            .transpose()
+    };
+    let details = usage.get("input_tokens_details");
+    let cache_write = count(details.and_then(|details| details.get("cache_write_tokens")))?;
+    let cache_write_details = details
+        .and_then(|details| details.get("cache_write_tokens_details"))
+        .filter(|value| !value.is_null());
+    if cache_write.is_some() || cache_write_details.is_some() {
+        let input = count(usage.get("input_tokens"))?.ok_or_else(invalid)?;
+        let cached = count(details.and_then(|details| details.get("cached_tokens")))?;
+        let output = count(usage.get("output_tokens"))?;
+        let total = count(usage.get("total_tokens"))?;
+        let uncached = input.checked_sub(cached.unwrap_or(0)).ok_or_else(invalid)?;
+        if cache_write.is_some_and(|tokens| tokens > uncached) {
+            return Err(invalid());
+        }
+        if let Some(details) = cache_write_details {
+            let details = details.as_object().ok_or_else(invalid)?;
+            for value in details.values() {
+                if let Some(tokens) = count(Some(value))?
+                    && tokens > cache_write.unwrap_or(uncached)
+                {
+                    return Err(invalid());
+                }
+            }
+        }
+        if let Some(total) = total
+            && (total < input
+                || output.is_some_and(|output| input.checked_add(output) != Some(total)))
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(CodexUsage {
         service_tier: response
             .get("service_tier")
             .and_then(|v| v.as_str())
@@ -1156,12 +1208,14 @@ pub(super) fn parse_codex_usage(response: &serde_json::Value) -> CodexUsage {
             .get("input_tokens_details")
             .and_then(|d| d.get("cached_tokens"))
             .and_then(|v| v.as_u64()),
+        codex_cache_write_input_tokens: cache_write,
+        codex_cache_write_tokens_details: cache_write_details.cloned(),
         output_tokens_details_reasoning: usage
             .get("output_tokens_details")
             .and_then(|d| d.get("reasoning_tokens"))
             .and_then(|v| v.as_u64()),
         rate_limits: None,
-    }
+    })
 }
 
 pub fn map_codex_usage_to_anthropic(
@@ -1194,6 +1248,8 @@ pub fn map_codex_usage_to_anthropic(
                 thinking_tokens: reasoning_tokens,
             }),
         codex_rate_limits: usage.rate_limits.clone(),
+        codex_cache_write_input_tokens: usage.codex_cache_write_input_tokens,
+        codex_cache_write_tokens_details: usage.codex_cache_write_tokens_details.clone(),
     };
 
     if let Some(requests) = web_search_requests
@@ -1214,9 +1270,15 @@ pub struct AnthropicUsage {
     pub speed: Option<String>,
     pub input_tokens: u64,
     pub output_tokens: u64,
-    /// The authenticated lane does not report cache-write accounting.
+    /// Native write counts have no verified Anthropic pricing/TTL mapping.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_creation_input_tokens: Option<u64>,
+    /// Actual Codex cache writes, independent of Anthropic cache creation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_cache_write_input_tokens: Option<u64>,
+    /// Original native detail keys, without TTL or pricing reinterpretation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_cache_write_tokens_details: Option<serde_json::Value>,
     pub cache_read_input_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_tool_use: Option<WebSearchUsage>,
