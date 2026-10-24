@@ -231,7 +231,12 @@ pub(crate) fn apply_compaction_replay_scoped(
         registry.remove(&scope.key());
         return None;
     };
-    if text.match_indices(portable_summary).count() != 1 {
+    if text != portable_summary
+        && text
+            .strip_prefix("<summary>")
+            .and_then(|text| text.strip_suffix("</summary>"))
+            != Some(portable_summary.as_str())
+    {
         registry.remove(&scope.key());
         return None;
     }
@@ -354,20 +359,17 @@ fn portable_summary_text(output: &[ResponsesInputItem]) -> Option<String> {
     (summary.len() >= MIN_PORTABLE_SUMMARY_BYTES).then(|| summary.to_string())
 }
 
-fn message_text(item: &ResponsesInputItem) -> Option<String> {
-    let ResponsesInputItem::Message { content, .. } = item else {
+fn message_text(item: &ResponsesInputItem) -> Option<&str> {
+    let ResponsesInputItem::Message { role, content, .. } = item else {
         return None;
     };
-    Some(
-        content
-            .iter()
-            .filter_map(|part| match part {
-                ResponsesContentPart::InputText { text }
-                | ResponsesContentPart::OutputText { text, .. } => Some(text.as_str()),
-                ResponsesContentPart::InputImage { .. } => None,
-            })
-            .collect(),
-    )
+    if role != "user" {
+        return None;
+    }
+    match content.as_slice() {
+        [ResponsesContentPart::InputText { text }] => Some(text),
+        _ => None,
+    }
 }
 
 fn parse_compaction_response(body: &[u8]) -> Result<ResponsesInputItem, CompactionError> {
