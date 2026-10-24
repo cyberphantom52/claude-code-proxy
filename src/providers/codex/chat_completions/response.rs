@@ -3,7 +3,8 @@ use serde_json::{Value, json};
 
 use crate::anthropic::sse::sse_events;
 use crate::provider::RequestContext;
-use crate::providers::codex::events::classify_event_failure;
+use crate::providers::codex::events::{classify_event_failure, response_is_incomplete_terminal};
+use crate::providers::codex::translate::reducer::{CompletedOutputs, TextParts};
 
 use super::ChatError;
 
@@ -40,8 +41,12 @@ pub struct CompletionState {
     pub output_bytes: usize,
     pub usage: Usage,
     pub completed: bool,
+    pub finish_reason: &'static str,
     pub service_tier: Option<String>,
     identity_frozen: bool,
+    completed_outputs: CompletedOutputs,
+    text_parts: TextParts,
+    next_text_part: usize,
 }
 
 impl CompletionState {
@@ -54,8 +59,12 @@ impl CompletionState {
             output_bytes: 0,
             usage: Usage::default(),
             completed: false,
+            finish_reason: "stop",
             service_tier: None,
             identity_frozen: false,
+            completed_outputs: CompletedOutputs::default(),
+            text_parts: TextParts::linear(),
+            next_text_part: 0,
         }
     }
 
@@ -63,7 +72,7 @@ impl CompletionState {
         self.identity_frozen = true;
     }
 
-    pub fn observe<'a>(&mut self, event: &'a Value) -> Result<Option<&'a str>, ChatError> {
+    pub fn observe(&mut self, event: &Value) -> Result<Option<String>, ChatError> {
         let kind = event.get("type").and_then(Value::as_str);
         if let Some(failure) = classify_event_failure(event) {
             let status =
@@ -76,33 +85,67 @@ impl CompletionState {
                 None,
             ));
         }
-        match kind {
-            Some("response.created" | "response.in_progress") => {
-                if let Some(response) = event.get("response") {
-                    self.update_metadata(response);
+        let mut suffix = String::new();
+        for reconciled in self
+            .completed_outputs
+            .accept(event)
+            .map_err(ChatError::upstream)?
+        {
+            let output_index = reconciled["output_index"].as_u64().unwrap_or(0) as usize;
+            let item_closed = !matches!(
+                reconciled["type"].as_str(),
+                Some(
+                    "response.output_item.done"
+                        | "response.completed"
+                        | "response.done"
+                        | "response.incomplete"
+                )
+            ) && self.completed_outputs.is_done(output_index);
+            for delta in self
+                .text_parts
+                .accept(&reconciled, &mut self.next_text_part, output_index)
+                .map_err(ChatError::upstream)?
+            {
+                if delta.refusal {
+                    continue;
                 }
-            }
-            Some("response.output_text.delta") => {
-                let delta = event.get("delta").and_then(Value::as_str).ok_or_else(|| {
-                    ChatError::upstream("Codex output-text delta did not contain text")
-                })?;
-                let output_bytes = self.output_bytes.saturating_add(delta.len());
+                if (self.completed || item_closed) && !delta.text.is_empty() {
+                    return Err(ChatError::upstream(
+                        "Codex output text changed after completion",
+                    ));
+                }
+                let output_bytes = self.output_bytes.saturating_add(delta.text.len());
                 if output_bytes > crate::traffic::MAX_SSE_CAPTURE_BYTES {
                     return Err(ChatError::upstream(
                         "Codex output text exceeded the response byte limit",
                     ));
                 }
                 self.output_bytes = output_bytes;
-                if let Some(text) = self.text.as_mut() {
-                    text.push_str(delta);
-                }
-                return Ok(Some(delta));
+                suffix.push_str(&delta.text);
             }
-            Some("response.completed" | "response.done") => {
+            if reconciled["type"] == "response.output_item.done"
+                && reconciled["item"]["status"] != "incomplete"
+            {
+                self.text_parts.close_item(Some(output_index));
+            }
+        }
+        match kind {
+            Some("response.created" | "response.in_progress") => {
+                if let Some(response) = event.get("response") {
+                    self.update_metadata(response);
+                }
+            }
+            Some("response.completed" | "response.done" | "response.incomplete") => {
                 let response = event.get("response").ok_or_else(|| {
                     ChatError::upstream("Codex completion event did not contain a response")
                 })?;
                 self.update_metadata(response);
+                self.finish_reason = if response_is_incomplete_terminal(event) {
+                    "length"
+                } else {
+                    "stop"
+                };
+                self.text_parts.close_item(None);
                 self.completed = true;
             }
             _ => {
@@ -111,7 +154,10 @@ impl CompletionState {
                 }
             }
         }
-        Ok(None)
+        if let Some(text) = self.text.as_mut() {
+            text.push_str(&suffix);
+        }
+        Ok((!suffix.is_empty()).then_some(suffix))
     }
 
     fn update_metadata(&mut self, response: &Value) {
@@ -209,7 +255,7 @@ pub fn aggregate_sse(
             "Codex event stream ended before completion",
         ));
     }
-    if state.output_bytes == 0 {
+    if state.output_bytes == 0 && state.finish_reason != "length" {
         return Err(ChatError::upstream("Codex completed without output text"));
     }
     Ok(completion_value(state))
@@ -222,7 +268,7 @@ pub fn completion_value(state: CompletionState) -> Value {
         "choices": [{
             "index": 0,
             "message": {"role":"assistant"},
-            "finish_reason": "stop",
+            "finish_reason": state.finish_reason,
         }],
     });
     value["id"] = Value::String(state.id);

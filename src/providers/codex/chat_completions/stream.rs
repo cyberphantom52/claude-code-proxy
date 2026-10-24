@@ -197,21 +197,28 @@ impl StreamState {
         }
         super::super::record_upstream_telemetry(&self.ctx, &event);
         match self.completion.observe(&event) {
-            Ok(Some(delta)) => {
-                if !self.role_sent {
-                    self.completion.freeze_identity();
-                    self.role_sent = true;
+            Ok(delta) => {
+                if let Some(delta) = delta {
+                    self.send_role();
                     self.output.push_back(sse(self.chunk(json!([
-                        {"index":0,"delta":{"role":"assistant"},"finish_reason":null}
+                        {"index":0,"delta":{"content":delta},"finish_reason":null}
                     ]))));
                 }
-                self.output.push_back(sse(self.chunk(json!([
-                    {"index":0,"delta":{"content":delta},"finish_reason":null}
-                ]))));
+                if self.completion.completed {
+                    self.finish_success();
+                }
             }
-            Ok(None) if self.completion.completed => self.finish_success(),
-            Ok(None) => {}
             Err(error) => self.fail(error),
+        }
+    }
+
+    fn send_role(&mut self) {
+        if !self.role_sent {
+            self.completion.freeze_identity();
+            self.role_sent = true;
+            self.output.push_back(sse(self.chunk(json!([
+                {"index":0,"delta":{"role":"assistant"},"finish_reason":null}
+            ]))));
         }
     }
 
@@ -236,12 +243,13 @@ impl StreamState {
         if self.ended {
             return;
         }
-        if self.completion.output_bytes == 0 {
+        if self.completion.output_bytes == 0 && self.completion.finish_reason != "length" {
             self.fail(ChatError::upstream("Codex completed without output text"));
             return;
         }
+        self.send_role();
         let terminal = self.chunk(json!([
-            {"index":0,"delta":{},"finish_reason":"stop"}
+            {"index":0,"delta":{},"finish_reason":self.completion.finish_reason}
         ]));
         self.output.push_back(sse(terminal));
         if self.include_usage {

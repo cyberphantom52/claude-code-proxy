@@ -120,8 +120,8 @@ pub const STOP_REFUSAL: &str = "refusal";
 
 // Reconcile the whole output before either translator dispatches terminal-only
 // items. Retain a bounded native projection, never arbitrary output for replay.
-#[derive(Clone, Default)]
-pub(super) struct CompletedOutputs {
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CompletedOutputs {
     items: std::collections::BTreeMap<usize, (serde_json::Value, bool)>,
     annotations: std::collections::BTreeMap<(usize, usize), Vec<serde_json::Value>>,
     logprobs: std::collections::BTreeMap<(usize, usize), Vec<serde_json::Value>>,
@@ -132,6 +132,10 @@ pub(super) struct CompletedOutputs {
 }
 
 impl CompletedOutputs {
+    pub fn is_done(&self, output_index: usize) -> bool {
+        self.items.get(&output_index).is_some_and(|(_, done)| *done)
+    }
+
     fn index(&self, payload: &serde_json::Value) -> usize {
         payload["output_index"]
             .as_u64()
@@ -779,20 +783,22 @@ fn merge_completed_output(
 }
 
 // Share reconciliation between buffered and live output, keyed by content part.
-#[derive(Clone, Default)]
-pub(super) struct TextParts {
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TextParts {
     parts: std::collections::BTreeMap<(usize, usize), TextPart>,
     retained_bytes: usize,
     ordered: bool,
+    linear: bool,
+    last_emitted: Option<(usize, usize)>,
 }
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct TextPart {
     index: usize,
     text: String,
     refusal: bool,
     closed: bool,
 }
-pub(super) struct TextDelta {
+pub(crate) struct TextDelta {
     pub index: usize,
     pub content_index: usize,
     pub start: bool,
@@ -800,6 +806,14 @@ pub(super) struct TextDelta {
     pub refusal: bool,
 }
 impl TextParts {
+    // A flat Chat stream cannot revise earlier text or reopen a finalized part.
+    pub fn linear() -> Self {
+        Self {
+            linear: true,
+            ..Self::default()
+        }
+    }
+
     pub fn has_refusal(&self) -> bool {
         self.parts.values().any(|part| part.refusal)
     }
@@ -919,6 +933,15 @@ impl TextParts {
         };
         for (oi, item) in items {
             if item["type"] == "message" {
+                if self.linear
+                    && let Some(content) = item["content"].as_array()
+                    && self
+                        .parts
+                        .range((oi, 0)..=(oi, usize::MAX))
+                        .any(|((_, ci), _)| *ci >= content.len())
+                {
+                    return Err("completed output message omitted a streamed text part".into());
+                }
                 for (ci, part) in item["content"].as_array().into_iter().flatten().enumerate() {
                     if matches!(part["type"].as_str(), Some("output_text" | "refusal")) {
                         let refusal = part["type"] == "refusal";
@@ -938,6 +961,7 @@ impl TextParts {
         // Validate the entire event before changing block state: an error must
         // not leave unseen starts for the live error path to close.
         let mut retained = self.retained_bytes;
+        let mut last_emitted = self.last_emitted;
         let mut validated = Vec::with_capacity(updates.len());
         for (oi, ci, text, delta, refusal) in updates {
             let part = self.parts.get(&(oi, ci));
@@ -963,6 +987,12 @@ impl TextParts {
             {
                 return Err("reasoning summary changed an earlier streamed paragraph".into());
             }
+            if self.linear && !refusal && !suffix.is_empty() {
+                if last_emitted.is_some_and(|last| (oi, ci) < last) {
+                    return Err("output text changed an earlier streamed part".into());
+                }
+                last_emitted = Some((oi, ci));
+            }
             let overhead = if part.is_none() { 256 } else { 0 };
             retained = retained
                 .saturating_add(overhead)
@@ -973,6 +1003,14 @@ impl TextParts {
             validated.push((oi, ci, suffix, refusal));
         }
         self.retained_bytes = retained;
+        self.last_emitted = last_emitted;
+        let close_parts = self.linear
+            && matches!(
+                kind,
+                "response.output_text.done"
+                    | "response.refusal.done"
+                    | "response.content_part.done"
+            );
         let mut out = Vec::with_capacity(validated.len());
         for (oi, ci, suffix, refusal) in validated {
             let start = !self.parts.contains_key(&(oi, ci));
@@ -987,6 +1025,7 @@ impl TextParts {
                 }
             });
             part.text.push_str(suffix);
+            part.closed |= close_parts;
             if start || !suffix.is_empty() {
                 out.push(TextDelta {
                     index: part.index,
