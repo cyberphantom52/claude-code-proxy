@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::anthropic::schema::MessagesRequest;
+use crate::anthropic::schema::{Message, MessagesRequest};
 use crate::config;
 use crate::providers::translate_shared::{
     ContentBlock, flatten_system_text, image_source_to_url, normalize_content, parallel_tool_calls,
@@ -857,7 +857,7 @@ pub fn translate_request(
     }
     let instructions = flatten_system_text(req.extra.get("system"));
     let is_compact = is_compact_messages_request(&req);
-    let input = build_input(&req, opts.use_responses_lite)?;
+    let input = build_input(&req, opts.use_responses_lite, None)?;
     let tools = read_tools(&mut req)?;
     let req = &req;
     let tool_choice = map_tool_choice(req)?;
@@ -916,7 +916,7 @@ pub fn translate_request(
         if let Some(tools) = tools
             && !tools.is_empty()
         {
-            let loads = tool_reference_loads(req);
+            let loads = tool_reference_loads(&req.messages);
             let prefix_tools = split_loaded_deferred_tools(req, tools, &loads)?;
             if !prefix_tools.is_empty() {
                 prefix.push(ResponsesInputItem::AdditionalTools {
@@ -1098,9 +1098,9 @@ fn is_deferred_placeholder(tool: &ResponsesTool, deferred: &HashSet<String>) -> 
 }
 
 /// Tool names each `tool_result` loaded through `tool_reference` blocks, keyed by tool_use_id.
-fn tool_reference_loads(req: &MessagesRequest) -> HashMap<String, Vec<String>> {
+fn tool_reference_loads(messages: &[Message]) -> HashMap<String, Vec<String>> {
     let mut loads: HashMap<String, Vec<String>> = HashMap::new();
-    for msg in req.messages.iter().filter(|msg| msg.role == "user") {
+    for msg in messages.iter().filter(|msg| msg.role == "user") {
         let Some(blocks) = msg.content.as_array() else {
             continue;
         };
@@ -1140,7 +1140,7 @@ fn split_loaded_deferred_tools(
 ) -> Result<Vec<Value>, anyhow::Error> {
     let deferred = deferred_tool_names(req);
     let loaded: HashSet<&str> = loads.values().flatten().map(String::as_str).collect();
-    let temporal = temporal_tool_names(req);
+    let temporal = temporal_tool_names(&req.messages);
     let mut prefix = Vec::new();
     for mut tool in tools {
         if is_deferred_placeholder(&tool, &deferred) {
@@ -1239,8 +1239,8 @@ fn function_tool(tool: &mut Value) -> ResponsesTool {
 }
 
 /// References in SYSTEM blocks use `name`, unlike tool-result references' `tool_name`.
-fn temporal_tool_names(req: &MessagesRequest) -> HashSet<String> {
-    req.messages
+fn temporal_tool_names(messages: &[Message]) -> HashSet<String> {
+    messages
         .iter()
         .filter(|message| message.role == "system")
         .filter_map(|message| message.content.as_array())
@@ -1399,12 +1399,41 @@ fn map_tool_choice(req: &MessagesRequest) -> Result<Option<ResponsesToolChoice>,
     }
 }
 
-fn build_input(req: &MessagesRequest, lite: bool) -> anyhow::Result<Vec<ResponsesInputItem>> {
+/// Translate only new messages, retaining the inherited catalog's activation history.
+/// The caller must validate/translate the complete request first.
+pub(crate) fn thread_input_suffix(
+    req: &MessagesRequest,
+    lite: bool,
+    messages: usize,
+) -> anyhow::Result<Vec<ResponsesInputItem>> {
+    anyhow::ensure!(
+        messages <= req.messages.len(),
+        "invalid thread message boundary"
+    );
+    build_input(req, lite, Some(messages))
+}
+
+fn build_input(
+    req: &MessagesRequest,
+    lite: bool,
+    boundary: Option<usize>,
+) -> anyhow::Result<Vec<ResponsesInputItem>> {
     let mut out: Vec<ResponsesInputItem> = Vec::new();
     let mut read_tool_uses_with_offset = HashSet::new();
-    let temporal = temporal_tool_names(req);
-    let loads = tool_reference_loads(req);
-    let loaded: HashSet<&str> = loads.values().flatten().map(String::as_str).collect();
+    // A continuation cannot retroactively move an inherited prefix declaration
+    // to a new load. Walk the retained history to recover its current catalog,
+    // then discard portable items at the explicit message boundary.
+    let history = &req.messages[..boundary.unwrap_or(req.messages.len())];
+    let temporal = temporal_tool_names(history);
+    let loads = tool_reference_loads(&req.messages);
+    let initial_loads = boundary.map(|_| tool_reference_loads(history));
+    let loaded: HashSet<&str> = initial_loads
+        .as_ref()
+        .unwrap_or(&loads)
+        .values()
+        .flatten()
+        .map(String::as_str)
+        .collect();
     let mut catalog = HashMap::new();
     let mut active = HashSet::new();
     for tool in req
@@ -1595,6 +1624,9 @@ fn build_input(req: &MessagesRequest, lite: bool) -> anyhow::Result<Vec<Response
                 }
                 flush_text(&mut out, &mut text_parts);
             }
+        }
+        if boundary.is_some_and(|boundary| message_index < boundary) {
+            out.clear();
         }
     }
 

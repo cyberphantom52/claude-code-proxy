@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 
 use super::translate::{
     reducer::FinishMetadata,
-    request::{ResponsesInputItem, ResponsesRequest, TranslateOptions, translate_request},
+    request::{ResponsesInputItem, ResponsesRequest, TranslateOptions, thread_input_suffix},
 };
 use super::{models::OperationProvenance, native::NativeResponseOutcome};
 use crate::anthropic::schema::{Message, MessagesRequest};
@@ -362,18 +362,9 @@ pub(crate) fn restore_native(
     if replay.model != translated.model {
         return Err(mismatch());
     }
-    let mut prefix = body.clone();
-    prefix.messages.truncate(replay.messages);
-    let prefix = translate_request(prefix, opts).map_err(|_| unsupported())?;
-    if !translated.input.starts_with(&prefix.input) {
-        return Err(unsupported());
-    }
-    translated.input = replay
-        .native
-        .iter()
-        .chain(&translated.input[prefix.input.len()..])
-        .cloned()
-        .collect();
+    let suffix = thread_input_suffix(body, opts.use_responses_lite, replay.messages)
+        .map_err(|_| unsupported())?;
+    translated.input = replay.native.iter().chain(&suffix).cloned().collect();
     Ok(())
 }
 
