@@ -290,8 +290,8 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
     };
     let lower = message.to_ascii_lowercase();
     let context_window = code == Some("context_length_exceeded")
-        || lower.contains("context window")
-        || lower.contains("context length exceeded");
+        || (code.is_none()
+            && (lower.contains("context window") || lower.contains("context length exceeded")));
 
     let kind = if context_window
         || matches!(
@@ -312,9 +312,12 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
             )
         ) {
         CodexFailureKind::Permanent
-    } else if matches!(code, Some("server_is_overloaded" | "slow_down")) {
+    } else if code == Some("server_is_overloaded") {
         CodexFailureKind::Overloaded
-    } else if explicit_status == Some(429) || lower.contains("rate limit") {
+    } else if matches!(code, Some("rate_limit_exceeded" | "slow_down"))
+        || explicit_status == Some(429)
+        || (code.is_none() && lower.contains("rate limit"))
+    {
         CodexFailureKind::RateLimit
     } else if explicit_status == Some(529)
         || code == Some("overloaded_error")
@@ -378,7 +381,12 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
                 .and_then(|value| value.get("retry_after_seconds"))
                 .and_then(scalar_string_value)
         })
-        .or_else(|| scalar_string(payload.get("retry_after_seconds")));
+        .or_else(|| scalar_string(payload.get("retry_after_seconds")))
+        .or_else(|| {
+            matches!(code, Some("rate_limit_exceeded" | "slow_down"))
+                .then(|| retry_after_message(&message))
+                .flatten()
+        });
 
     Some(CodexEventFailure {
         kind,
@@ -644,6 +652,25 @@ fn retry_after_header(value: &Value) -> Option<String> {
                 .then(|| scalar_string_value(value))
                 .flatten()
         })
+}
+
+// Only authoritative rate-limit codes use Codex's plaintext retry advice.
+fn retry_after_message(message: &str) -> Option<String> {
+    static RE: std::sync::OnceLock<regex_lite::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex_lite::Regex::new(r"(?i)try again in\s*(\d+(?:\.\d+)?)\s*(s|ms|seconds?)")
+            .expect("valid Codex retry delay regex")
+    });
+    let captures = re.captures(message)?;
+    let value = captures.get(1)?.as_str().parse::<f64>().ok()?;
+    let seconds = if captures.get(2)?.as_str().eq_ignore_ascii_case("ms") {
+        value / 1000.0
+    } else {
+        value
+    };
+    std::time::Duration::try_from_secs_f64(seconds)
+        .ok()
+        .map(|delay| delay.as_secs_f64().to_string())
 }
 
 fn scalar_string(value: Option<&Value>) -> Option<String> {
