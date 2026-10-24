@@ -490,6 +490,7 @@ fn prune_idle_pool(pool: &mut HashMap<ConversationIdentity, Arc<PoolEntry>>) {
 pub(crate) fn prune_idle_state() {
     super::continuation::prune_idle_state();
     super::compaction::prune_idle_state();
+    super::threads::prune_idle_state();
     let mut pool = WS_POOL.lock().unwrap();
     prune_idle_pool(&mut pool);
     pool.shrink_to_fit();

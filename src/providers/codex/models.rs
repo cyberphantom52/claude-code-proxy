@@ -65,6 +65,10 @@ impl std::fmt::Debug for OperationProvenance {
 }
 
 impl OperationProvenance {
+    pub(super) fn retained_bytes(&self) -> usize {
+        self.endpoint.len() + std::mem::size_of::<Self>()
+    }
+
     pub(super) fn selected(
         endpoint: &str,
         account: Option<&str>,
@@ -453,10 +457,14 @@ impl CodexHttpClient {
             );
             // Missing auth in a pinned fallback operation must not switch to a
             // newly logged-in account halfway through shaping the request.
-            return context
+            let mut auth = context
                 .auth
                 .clone()
-                .ok_or_else(|| anyhow::anyhow!("Not authenticated"));
+                .ok_or_else(|| anyhow::anyhow!("Not authenticated"))?;
+            if super::threads::replaying() {
+                Arc::make_mut(&mut auth).require_opaque_provenance(&self.base_url)?;
+            }
+            return Ok(auth);
         }
         OperationAuth::from_snapshot(self.auth_manager.get_auth_snapshot().await?).map(Arc::new)
     }

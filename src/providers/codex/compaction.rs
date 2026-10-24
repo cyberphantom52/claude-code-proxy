@@ -45,6 +45,13 @@ enum CompactionPhase {
 pub(crate) struct CompactionScope {
     pub(crate) owner: ConversationIdentity,
     pub(crate) provenance: OperationProvenance,
+    pub(crate) branch: Option<String>,
+}
+
+impl CompactionScope {
+    fn key(&self) -> CompactionKey {
+        (self.owner.clone(), self.branch.clone())
+    }
 }
 
 struct CompactionState {
@@ -64,7 +71,9 @@ pub struct CompactionReplay {
     pub attempt: CompactionAttempt,
 }
 
-static REGISTRY: Mutex<Option<HashMap<ConversationIdentity, CompactionState>>> = Mutex::new(None);
+type CompactionKey = (ConversationIdentity, Option<String>);
+type CompactionRegistry = HashMap<CompactionKey, CompactionState>;
+static REGISTRY: Mutex<Option<CompactionRegistry>> = Mutex::new(None);
 static NEXT_ATTEMPT_ID: AtomicU64 = AtomicU64::new(1);
 
 pub async fn request_compaction(
@@ -117,7 +126,7 @@ pub(crate) fn begin_compaction_scoped(scope: &CompactionScope, model: &str) -> C
     let mut guard = REGISTRY.lock().unwrap();
     let registry = guard.get_or_insert_with(HashMap::new);
     evict_states(registry, now);
-    registry.insert(scope.owner.clone(), state);
+    registry.insert(scope.key(), state);
     evict_states(registry, now);
     attempt
 }
@@ -133,7 +142,7 @@ pub(crate) fn store_compaction_scoped(
         return false;
     };
     evict_states(registry, now);
-    let Some(state) = registry.get_mut(&scope.owner) else {
+    let Some(state) = registry.get_mut(&scope.key()) else {
         return false;
     };
     if state.scope != *scope
@@ -145,13 +154,13 @@ pub(crate) fn store_compaction_scoped(
     state.native_history = native_history;
     state.phase = CompactionPhase::Unconfirmed;
     state.updated_at = now;
-    if state_size(&scope.owner, state) > MAX_STATE_BYTES {
-        registry.remove(&scope.owner);
+    if state_size(&scope.key(), state) > MAX_STATE_BYTES {
+        registry.remove(&scope.key());
         return false;
     }
     evict_states(registry, now);
     registry
-        .get(&scope.owner)
+        .get(&scope.key())
         .is_some_and(|state| state.scope == *scope && state.attempt == attempt)
 }
 
@@ -175,24 +184,24 @@ pub(crate) fn activate_compaction_scoped(
         return false;
     };
     evict_states(registry, now);
-    let Some(state) = registry.get_mut(&scope.owner) else {
+    let Some(state) = registry.get_mut(&scope.key()) else {
         return false;
     };
     if state.scope != *scope || state.attempt != attempt {
         return false;
     }
     if state.model != model || !matches!(state.phase, CompactionPhase::Unconfirmed) {
-        registry.remove(&scope.owner);
+        registry.remove(&scope.key());
         return false;
     }
     state.phase = CompactionPhase::Anchored { portable_summary };
     state.updated_at = now;
-    if state_size(&scope.owner, state) > MAX_STATE_BYTES {
-        registry.remove(&scope.owner);
+    if state_size(&scope.key(), state) > MAX_STATE_BYTES {
+        registry.remove(&scope.key());
         return false;
     }
     evict_states(registry, now);
-    registry.contains_key(&scope.owner)
+    registry.contains_key(&scope.key())
 }
 
 pub(crate) fn apply_compaction_replay_scoped(
@@ -204,12 +213,12 @@ pub(crate) fn apply_compaction_replay_scoped(
     let mut guard = REGISTRY.lock().unwrap();
     let registry = guard.as_mut()?;
     evict_states(registry, now);
-    let state = registry.get_mut(&scope.owner)?;
+    let state = registry.get_mut(&scope.key())?;
     if state.scope != *scope || !matches!(state.phase, CompactionPhase::Anchored { .. }) {
         return None;
     }
     if state.model != request.model {
-        registry.remove(&scope.owner);
+        registry.remove(&scope.key());
         return None;
     }
     let CompactionPhase::Anchored { portable_summary } = &state.phase else {
@@ -219,11 +228,11 @@ pub(crate) fn apply_compaction_replay_scoped(
     let (envelope, conversation) = split_input_envelope(&request.input);
     let summary_item = conversation.first()?;
     let Some(text) = message_text(summary_item) else {
-        registry.remove(&scope.owner);
+        registry.remove(&scope.key());
         return None;
     };
     if text.match_indices(portable_summary).count() != 1 {
-        registry.remove(&scope.owner);
+        registry.remove(&scope.key());
         return None;
     }
     if conversation.len() == 1 {
@@ -238,7 +247,7 @@ pub(crate) fn apply_compaction_replay_scoped(
         .collect::<Vec<_>>();
     let replay = request.with_input(input);
     if serialized_size(&replay.input) > MAX_STATE_BYTES {
-        registry.remove(&scope.owner);
+        registry.remove(&scope.key());
         return None;
     }
     state.updated_at = now;
@@ -260,10 +269,10 @@ pub(crate) fn abort_compaction_attempt_scoped(
         return;
     };
     if registry
-        .get(&scope.owner)
+        .get(&scope.key())
         .is_some_and(|state| state.scope == *scope && state.attempt == attempt)
     {
-        registry.remove(&scope.owner);
+        registry.remove(&scope.key());
     }
 }
 
@@ -271,10 +280,10 @@ pub(crate) fn clear_compaction_scoped(scope: &CompactionScope) {
     let mut guard = REGISTRY.lock().unwrap();
     if let Some(registry) = guard.as_mut()
         && registry
-            .get(&scope.owner)
+            .get(&scope.key())
             .is_some_and(|state| state.scope == *scope)
     {
-        registry.remove(&scope.owner);
+        registry.remove(&scope.key());
     }
 }
 
@@ -525,7 +534,8 @@ fn serialized_size(items: &[ResponsesInputItem]) -> usize {
         .unwrap_or(usize::MAX)
 }
 
-fn state_size(owner: &ConversationIdentity, state: &CompactionState) -> usize {
+fn state_size(key: &CompactionKey, state: &CompactionState) -> usize {
+    let (owner, branch) = key;
     let summary_len = match &state.phase {
         CompactionPhase::Preparing | CompactionPhase::Unconfirmed => 0,
         CompactionPhase::Anchored { portable_summary } => portable_summary.len(),
@@ -534,6 +544,7 @@ fn state_size(owner: &ConversationIdentity, state: &CompactionState) -> usize {
         ConversationIdentity::Main(session) => session.len(),
         ConversationIdentity::Agent(session, agent) => session.len() + agent.len(),
     }) + state.model.len()
+        + branch.as_ref().map_or(0, String::len)
         + summary_len
         + serialized_size(&state.native_history)
 }
@@ -553,7 +564,7 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn evict_states(registry: &mut HashMap<ConversationIdentity, CompactionState>, now: u64) {
+fn evict_states(registry: &mut CompactionRegistry, now: u64) {
     registry.retain(|_, state| now.saturating_sub(state.updated_at) <= STATE_TTL_MS);
     let mut total_bytes: usize = registry
         .iter()

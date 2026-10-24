@@ -12,6 +12,7 @@ pub mod rate_limits;
 mod recovery;
 pub mod request_summary;
 pub mod search;
+pub(crate) mod threads;
 pub mod transcription;
 pub mod translate;
 pub mod websocket;
@@ -64,7 +65,8 @@ use self::translate::reducer::{
     ReducerEvent, finish_metadata_from_upstream, reduce_upstream_bytes,
 };
 use self::translate::request::{
-    TranslateOptions, has_hosted_web_search, is_compact_messages_request, translate_request,
+    TranslateOptions, disclose_messages_compatibility, has_hosted_web_search,
+    is_compact_messages_request, translate_request, validate_messages_capabilities,
 };
 
 const MAX_RETRYABLE_LIVE_STREAM_RETRIES: u32 = 3;
@@ -113,7 +115,15 @@ impl CodexProvider {
         ctx: RequestContext,
         conversation_identity: Option<ConversationIdentity>,
     ) -> Response {
+        if let Err(error) = validate_messages_capabilities(&incoming) {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                error.to_string(),
+            );
+        }
         let message_id = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
+        threads::set_message_id(&message_id);
         let want_stream = incoming.stream;
         let (resolved, mut translated, compact_boundary, use_responses_lite, model) = {
             let mut body = incoming;
@@ -140,6 +150,9 @@ impl CodexProvider {
                 );
             }
             if search::is_standalone_search_request(&body) {
+                if threads::current().is_some() {
+                    return threads::ThreadError("thread_unsupported_request").response();
+                }
                 if let Some(monitor) = ctx.monitor.as_ref() {
                     monitor.model_resolved(&ctx.req_id, &resolved.model);
                 }
@@ -238,15 +251,14 @@ impl CodexProvider {
 
             let compact_boundary = is_compact_messages_request(&body);
             let model = body.model.take().unwrap_or_else(|| "gpt-6-sol".to_string());
-            let translated = match translate_request(
-                body,
-                TranslateOptions {
-                    session_id: ctx.session_id.clone(),
-                    service_tier: resolved.service_tier.clone(),
-                    model: resolved.model.clone(),
-                    use_responses_lite,
-                },
-            ) {
+            let options = TranslateOptions {
+                session_id: ctx.session_id.clone(),
+                service_tier: resolved.service_tier.clone(),
+                model: resolved.model.clone(),
+                use_responses_lite,
+            };
+            let thread_body = threads::current().map(|_| body.clone());
+            let mut translated = match translate_request(body, options.clone()) {
                 Ok(t) => t,
                 Err(e) => {
                     return json_error(
@@ -257,6 +269,11 @@ impl CodexProvider {
                 }
             };
 
+            if let Some(body) = thread_body.as_ref()
+                && let Err(error) = threads::restore_native(body, options, &mut translated)
+            {
+                return error.response();
+            }
             (
                 resolved,
                 translated,
@@ -274,6 +291,7 @@ impl CodexProvider {
             .map(|(owner, provenance)| CompactionScope {
                 owner: owner.clone(),
                 provenance,
+                branch: threads::branch(),
             });
         let mut compaction_attempt = None;
         if !server_compaction_enabled && let Some(scope) = scope.as_ref() {
@@ -460,7 +478,8 @@ impl CodexProvider {
                 Ok(r) => r,
                 Err(e)
                     if e.detail.as_deref() == Some("operation_provenance_changed")
-                        && portable_request.is_some() =>
+                        && portable_request.is_some()
+                        && !threads::replaying() =>
                 {
                     abort_compaction_attempt(scope.as_ref(), compaction_attempt.take());
                     abort_continuation_for_owner(&request_continuation);
@@ -558,6 +577,12 @@ impl CodexProvider {
             ctx.traffic.as_deref(),
         ) {
             Ok((json, finish)) => {
+                threads::settle(
+                    &json,
+                    finish.as_ref(),
+                    &translated,
+                    upstream.provenance.as_ref(),
+                );
                 update_continuation_from_finish(
                     compaction_scope(&request_continuation).as_ref(),
                     &request_continuation,
@@ -601,24 +626,58 @@ impl Provider for CodexProvider {
 
     async fn handle_messages_with_conversation_identity(
         &self,
-        body: MessagesRequest,
+        mut body: MessagesRequest,
         ctx: RequestContext,
         conversation_identity: Option<ConversationIdentity>,
     ) -> Response {
-        rate_limits::with_response_telemetry(async {
+        let response = rate_limits::with_response_telemetry(async {
             let context = self.client.prepare_model_context().await;
-            models::with_model_context(
-                context,
-                Box::pin(self.handle_messages_inner(body, ctx, conversation_identity)),
-            )
+            models::with_model_context(context, async {
+                let attempt = if threads::current().is_none() {
+                    match threads::prepare(
+                        &mut body,
+                        conversation_identity.as_ref(),
+                        models::current_operation_provenance(),
+                        false,
+                    ) {
+                        Ok(attempt) => attempt,
+                        Err(error) => return error.response(),
+                    }
+                } else {
+                    None
+                };
+                let response = threads::scope(
+                    attempt.clone().or_else(threads::current),
+                    Box::pin(self.handle_messages_inner(body, ctx, conversation_identity)),
+                )
+                .await;
+                threads::response_body(response, attempt)
+            })
             .await
         })
-        .await
+        .await;
+        disclose_messages_compatibility(response)
     }
 
-    async fn handle_count_tokens(&self, body: MessagesRequest, ctx: RequestContext) -> Response {
+    async fn handle_count_tokens(
+        &self,
+        mut body: MessagesRequest,
+        ctx: RequestContext,
+    ) -> Response {
+        if let Err(error) = threads::prepare(&mut body, None, None, true) {
+            return error.response();
+        }
+        if let Err(error) = validate_messages_capabilities(&body) {
+            return disclose_messages_compatibility(json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                error.to_string(),
+            ));
+        }
         let context = self.client.prepare_model_context().await;
-        models::with_model_context(context, self.handle_count_tokens_inner(body, ctx)).await
+        disclose_messages_compatibility(
+            models::with_model_context(context, self.handle_count_tokens_inner(body, ctx)).await,
+        )
     }
 }
 
@@ -727,6 +786,7 @@ fn compaction_scope(continuation: &ContinuationReservation) -> Option<Compaction
     Some(CompactionScope {
         owner: continuation.owner()?.clone(),
         provenance: continuation.provenance()?.clone(),
+        branch: threads::branch(),
     })
 }
 
@@ -880,7 +940,8 @@ async fn live_stream_response(
             Ok(events) => events,
             Err(err)
                 if err.detail.as_deref() == Some("operation_provenance_changed")
-                    && compaction.portable_request.is_some() =>
+                    && compaction.portable_request.is_some()
+                    && !threads::replaying() =>
             {
                 cleanup.abort();
                 request_body = compaction
@@ -1013,6 +1074,7 @@ async fn live_stream_response(
             } => {
                 if error.detail.as_deref() == Some("operation_provenance_changed")
                     && compaction.portable_request.is_some()
+                    && !threads::replaying()
                 {
                     cleanup.abort();
                     request_body = compaction
@@ -1174,8 +1236,10 @@ async fn live_stream_response_once(
         model.to_string(),
         estimated_input_tokens,
     );
-    let mut upstream_sse_body =
-        (request_continuation.turn_id().is_some() || compaction.attempt.is_some()).then(Vec::new);
+    let mut upstream_sse_body = (request_continuation.turn_id().is_some()
+        || compaction.attempt.is_some()
+        || threads::current().is_some())
+    .then(Vec::new);
     // Keep protocol framing private until real output makes a transparent retry unsafe.
     // Every branch that consumes pending_chunk returns, so it is never flushed twice.
     let mut pending_chunk = Vec::new();
@@ -1481,6 +1545,7 @@ fn remaining_live_stream_response(
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     let model_context = models::current_model_context();
+    let thread_attempt = threads::current();
     let telemetry = rate_limits::current();
     let outcome = NativeResponseOutcome::default();
     let response_outcome = outcome.clone();
@@ -1748,13 +1813,16 @@ fn remaining_live_stream_response(
             }
         }
     };
-    tokio::spawn(rate_limits::with_telemetry(telemetry, async move {
-        if let Some(context) = model_context {
-            models::with_model_context(context, worker).await;
-        } else {
-            worker.await;
-        }
-    }));
+    tokio::spawn(rate_limits::with_telemetry(
+        telemetry,
+        threads::scope(thread_attempt, async move {
+            if let Some(context) = model_context {
+                models::with_model_context(context, worker).await;
+            } else {
+                worker.await;
+            }
+        }),
+    ));
 
     let stream = futures_util::stream::unfold(rx, |mut rx| async {
         rx.recv().await.map(|item| (item, rx))
@@ -1997,7 +2065,21 @@ fn update_continuation_from_upstream(
     actual_provenance: Option<&models::OperationProvenance>,
     compact_boundary: bool,
 ) {
-    let finish = finish_metadata_from_upstream(upstream_body).ok().flatten();
+    let finish = if threads::current().is_some() {
+        accumulate_response_and_metadata_with_traffic(
+            reduce_upstream_bytes(upstream_body),
+            "",
+            &request_body.model,
+            None,
+        )
+        .ok()
+        .and_then(|(response, finish)| {
+            threads::settle(&response, finish.as_ref(), request_body, actual_provenance);
+            finish
+        })
+    } else {
+        finish_metadata_from_upstream(upstream_body).ok().flatten()
+    };
     update_continuation_from_finish(
         scope,
         continuation,
