@@ -64,6 +64,19 @@ fn count_input_item_tokens(item: &ResponsesInputItem, scratch: &mut Vec<u8>) -> 
         | ResponsesInputItem::Compaction { encrypted_content } => {
             approx_reasoning_token_count(encrypted_content)
         }
+        ResponsesInputItem::WebSearchCall {
+            encrypted_content,
+            action,
+            ..
+        } => {
+            let opaque = encrypted_content
+                .as_deref()
+                .map_or(0, approx_reasoning_token_count);
+            let visible = action
+                .as_ref()
+                .map_or(0, |action| count_serialized_tokens(action, scratch));
+            opaque.saturating_add(visible)
+        }
         ResponsesInputItem::CompactionTrigger => 0,
     }
 }
@@ -96,7 +109,7 @@ fn approx_reasoning_token_count(encoded_content: &str) -> u64 {
 fn count_content_part_tokens(part: &ResponsesContentPart) -> u64 {
     match part {
         ResponsesContentPart::InputText { text } => approx_token_count(text),
-        ResponsesContentPart::OutputText { text } => approx_token_count(text),
+        ResponsesContentPart::OutputText { text, .. } => approx_token_count(text),
         ResponsesContentPart::InputImage { .. } => 2000, // Image token estimate
     }
 }
@@ -120,7 +133,7 @@ fn count_tool_tokens(tools: &[ResponsesTool], scratch: &mut Vec<u8>) -> u64 {
     total
 }
 
-fn count_serialized_tokens(value: &serde_json::Value, scratch: &mut Vec<u8>) -> u64 {
+fn count_serialized_tokens<T: serde::Serialize>(value: &T, scratch: &mut Vec<u8>) -> u64 {
     scratch.clear();
     if serde_json::to_writer(&mut *scratch, value).is_err() {
         return 0;

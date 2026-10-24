@@ -178,10 +178,12 @@ pub enum ResponsesToolChoice {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(bound(serialize = "I: Serialize"))]
 pub struct ResponsesRequest<I = Vec<ResponsesInputItem>> {
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
+    #[serde(serialize_with = "serialize_native_input")]
     pub input: I,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ResponsesTool>>,
@@ -270,6 +272,8 @@ pub enum ResponsesInputItem {
     Message {
         role: String,
         content: Vec<ResponsesContentPart>,
+        #[serde(flatten)]
+        metadata: ResponsesMessageMetadata,
     },
     #[serde(rename = "function_call")]
     FunctionCall {
@@ -286,14 +290,106 @@ pub enum ResponsesInputItem {
     },
     #[serde(rename = "reasoning")]
     Reasoning {
+        #[serde(default, skip_serializing_if = "String::is_empty")]
         id: String,
         summary: Vec<Value>,
         encrypted_content: String,
+    },
+    #[serde(rename = "web_search_call")]
+    WebSearchCall {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        action: Option<ResponsesWebSearchAction>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        encrypted_content: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        internal_chat_message_metadata_passthrough: Option<ResponsesNativeMetadata>,
     },
     #[serde(rename = "compaction")]
     Compaction { encrypted_content: String },
     #[serde(rename = "compaction_trigger")]
     CompactionTrigger,
+}
+
+// Retain known native fields only. Request projection removes unsuitable IDs
+// and per-content attribution; no corresponding Lite feature is assumed enabled.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ResponsesNativeMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create_time: Option<serde_json::Number>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_item_metadata: Option<Vec<Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_item_kinds: Option<Vec<Value>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ResponsesMessageMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encrypted_content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub internal_chat_message_metadata_passthrough: Option<ResponsesNativeMetadata>,
+}
+
+fn invalid_native_id(id: &str) -> bool {
+    !id.split_once('_')
+        .is_some_and(|(prefix, suffix)| !prefix.is_empty() && !suffix.is_empty())
+}
+
+fn serialize_native_input<I: Serialize, S: serde::Serializer>(
+    input: &I,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    // ponytail: one temporary input tree; use borrowed per-item projection if
+    // large request serialization becomes a bottleneck.
+    let mut input = serde_json::to_value(input).map_err(serde::ser::Error::custom)?;
+    for item in input.as_array_mut().into_iter().flatten() {
+        if item["id"].as_str().is_some_and(invalid_native_id) {
+            item.as_object_mut()
+                .expect("item with ID is an object")
+                .remove("id");
+        }
+        if let Some(metadata) = item
+            .get_mut("internal_chat_message_metadata_passthrough")
+            .and_then(Value::as_object_mut)
+        {
+            metadata.remove("content_item_metadata");
+            metadata.remove("content_item_kinds");
+        }
+    }
+    input.serialize(serializer)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResponsesWebSearchAction {
+    Search {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        queries: Option<Vec<String>>,
+    },
+    OpenPage {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+    },
+    FindInPage {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pattern: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -322,7 +418,13 @@ pub enum ResponsesContentPart {
     #[serde(rename = "input_text")]
     InputText { text: String },
     #[serde(rename = "output_text")]
-    OutputText { text: String },
+    OutputText {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        annotations: Option<Vec<Value>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        logprobs: Option<Vec<Value>>,
+    },
     #[serde(rename = "input_image")]
     InputImage {
         image_url: String,
@@ -930,6 +1032,7 @@ pub fn translate_request(
             && !instructions.is_empty()
         {
             prefix.push(ResponsesInputItem::Message {
+                metadata: Default::default(),
                 role: "developer".to_string(),
                 content: vec![ResponsesContentPart::InputText { text: instructions }],
             });
@@ -1483,6 +1586,7 @@ fn build_input(
                         } => {
                             if !parts.is_empty() {
                                 out.push(ResponsesInputItem::Message {
+                                    metadata: Default::default(),
                                     role: "user".to_string(),
                                     content: std::mem::take(&mut parts),
                                 });
@@ -1531,6 +1635,7 @@ fn build_input(
                 }
                 if !parts.is_empty() {
                     out.push(ResponsesInputItem::Message {
+                        metadata: Default::default(),
                         role: "user".to_string(),
                         content: parts,
                     });
@@ -1552,6 +1657,7 @@ fn build_input(
                             );
                             if !parts.is_empty() {
                                 out.push(ResponsesInputItem::Message {
+                                    metadata: Default::default(),
                                     role: "developer".into(),
                                     content: std::mem::take(&mut parts),
                                 });
@@ -1570,6 +1676,7 @@ fn build_input(
                 }
                 if !parts.is_empty() {
                     out.push(ResponsesInputItem::Message {
+                        metadata: Default::default(),
                         role: "developer".into(),
                         content: parts,
                     });
@@ -1582,6 +1689,7 @@ fn build_input(
                      text_parts: &mut Vec<ResponsesContentPart>| {
                         if !text_parts.is_empty() {
                             out.push(ResponsesInputItem::Message {
+                                metadata: Default::default(),
                                 role: "assistant".to_string(),
                                 content: std::mem::take(text_parts),
                             });
@@ -1591,6 +1699,8 @@ fn build_input(
                     match block {
                         ContentBlock::Text { text } => {
                             text_parts.push(ResponsesContentPart::OutputText {
+                                annotations: None,
+                                logprobs: None,
                                 text: text.to_string(),
                             });
                         }

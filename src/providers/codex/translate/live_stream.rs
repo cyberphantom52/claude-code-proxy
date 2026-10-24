@@ -8,9 +8,9 @@ use crate::traffic::TrafficCapture;
 use super::read_rewrite::{repair_whitespace_stalled_read_args, sanitize_parsed_read_args};
 use super::reasoning_signature::{PendingReasoning, encode_reasoning_signature};
 use super::reducer::{
-    CodexRateLimits, CodexUsage, STOP_END_TURN, STOP_MAX_TOKENS, STOP_REFUSAL, STOP_TOOL_USE,
-    TextDelta, TextParts, map_codex_usage_to_anthropic, parse_codex_rate_limits, parse_codex_usage,
-    upstream_annotations,
+    CodexRateLimits, CodexUsage, CompletedOutputs, STOP_END_TURN, STOP_MAX_TOKENS, STOP_REFUSAL,
+    STOP_TOOL_USE, TextDelta, TextParts, map_codex_usage_to_anthropic, parse_codex_rate_limits,
+    parse_codex_usage, upstream_annotations,
 };
 use super::web_search_compat::web_search_query;
 
@@ -178,6 +178,7 @@ pub(crate) fn validate_streamed_function_call(
     Ok(())
 }
 
+#[derive(Clone)]
 struct LiveTool {
     index: usize,
     call_id: String,
@@ -186,6 +187,7 @@ struct LiveTool {
     emitted_args: bool,
 }
 
+#[derive(Clone)]
 struct LiveWebSearch {
     index: usize,
     result_index: usize,
@@ -199,6 +201,7 @@ struct LiveThinking {
     anthropic_index: usize,
 }
 
+#[derive(Clone)]
 pub struct LiveStreamTranslator {
     message_id: String,
     model: String,
@@ -210,6 +213,7 @@ pub struct LiveStreamTranslator {
     reasoning_by_output_index: HashMap<usize, PendingReasoning>,
     saw_tool_use: bool,
     text_parts: TextParts,
+    completed_outputs: CompletedOutputs,
     web_search_requests: usize,
     web_searches: Vec<LiveWebSearch>,
     annotations: Vec<serde_json::Value>,
@@ -245,6 +249,7 @@ impl LiveStreamTranslator {
             reasoning_by_output_index: HashMap::new(),
             saw_tool_use: false,
             text_parts: TextParts::default(),
+            completed_outputs: CompletedOutputs::default(),
             web_search_requests: 0,
             web_searches: Vec::new(),
             annotations: Vec::new(),
@@ -269,6 +274,34 @@ impl LiveStreamTranslator {
             return Ok(Vec::new());
         }
 
+        // Terminal batches may recover several blocks. Roll back on failure so
+        // error_chunk only closes starts actually delivered to the consumer.
+        let terminal = matches!(
+            payload["type"].as_str(),
+            Some("response.completed" | "response.done" | "response.incomplete")
+        );
+        let saved = terminal.then(|| self.clone());
+        let result = (|| {
+            let events = self.completed_outputs.accept(payload)?;
+            let mut out = Vec::new();
+            for event in events {
+                out.extend(self.accept_event(&event, traffic)?);
+            }
+            Ok(out)
+        })();
+        if result.is_err()
+            && let Some(saved) = saved
+        {
+            *self = saved;
+        }
+        result
+    }
+
+    fn accept_event(
+        &mut self,
+        payload: &serde_json::Value,
+        traffic: Option<&TrafficCapture>,
+    ) -> Result<Vec<u8>, String> {
         let kind = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
         let mut out = Vec::new();
 
@@ -353,24 +386,6 @@ impl LiveStreamTranslator {
             "response.output_item.added" => {
                 self.output_item_added(payload, traffic, &mut out);
             }
-            "response.reasoning_summary_part.added" => {
-                let output_index = output_index(payload);
-                if let Some(thinking) = self
-                    .thinking
-                    .filter(|thinking| thinking.output_index == output_index)
-                {
-                    self.emit(
-                        traffic,
-                        &mut out,
-                        "content_block_delta",
-                        &serde_json::json!({
-                            "type": "content_block_delta",
-                            "index": thinking.anthropic_index,
-                            "delta": {"type": "thinking_delta", "thinking": "\n\n"}
-                        }),
-                    );
-                }
-            }
             "response.reasoning_summary_text.delta" => {
                 self.reasoning_delta(payload, traffic, &mut out);
             }
@@ -418,6 +433,7 @@ impl LiveStreamTranslator {
         let mut out = Vec::new();
         self.close_thinking(traffic, &mut out);
         self.reasoning_by_output_index.clear();
+        self.completed_outputs = CompletedOutputs::default();
         self.item_id_to_output_index.clear();
         self.annotations.clear();
         self.annotation_bytes = 0;
@@ -590,9 +606,6 @@ impl LiveStreamTranslator {
                         }
                     }),
                 );
-            }
-            "web_search_call" => {
-                self.web_search_requests += 1;
             }
             _ => {}
         }
@@ -801,12 +814,17 @@ impl LiveStreamTranslator {
         out: &mut Vec<u8>,
     ) -> Result<(), String> {
         let mut output_index = self.text_output_index(payload);
+        if payload["_ccp_output_already_done"] == true {
+            return Ok(());
+        }
         if payload
             .pointer("/item/type")
             .and_then(serde_json::Value::as_str)
             == Some("message")
         {
-            self.close_text_parts(Some(output_index), traffic, out);
+            if payload["item"]["status"] != "incomplete" {
+                self.close_text_parts(Some(output_index), traffic, out);
+            }
             return Ok(());
         }
         if let Some(item) = payload
@@ -845,6 +863,7 @@ impl LiveStreamTranslator {
             let result_index = self.anthropic_index;
             self.anthropic_index += 1;
             let raw_id = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            self.web_search_requests += 1;
             self.web_searches.push(LiveWebSearch {
                 index,
                 result_index,

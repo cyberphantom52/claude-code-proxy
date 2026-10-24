@@ -299,7 +299,7 @@ fn split_input_envelope(
 
 fn without_compaction_instruction(input: &[ResponsesInputItem]) -> Vec<ResponsesInputItem> {
     let mut input = input.to_vec();
-    let remove_empty_message = if let Some(ResponsesInputItem::Message { role, content }) =
+    let remove_empty_message = if let Some(ResponsesInputItem::Message { role, content, .. }) =
         input.last_mut()
         && role == "user"
     {
@@ -332,13 +332,15 @@ fn portable_summary_text(output: &[ResponsesInputItem]) -> Option<String> {
     let text = output
         .iter()
         .filter_map(|item| match item {
-            ResponsesInputItem::Message { role, content } if role == "assistant" => Some(content),
+            ResponsesInputItem::Message { role, content, .. } if role == "assistant" => {
+                Some(content)
+            }
             _ => None,
         })
         .flat_map(|content| content.iter())
         .filter_map(|part| match part {
             ResponsesContentPart::InputText { text }
-            | ResponsesContentPart::OutputText { text } => Some(text.as_str()),
+            | ResponsesContentPart::OutputText { text, .. } => Some(text.as_str()),
             ResponsesContentPart::InputImage { .. } => None,
         })
         .collect::<String>();
@@ -361,7 +363,7 @@ fn message_text(item: &ResponsesInputItem) -> Option<String> {
             .iter()
             .filter_map(|part| match part {
                 ResponsesContentPart::InputText { text }
-                | ResponsesContentPart::OutputText { text } => Some(text.as_str()),
+                | ResponsesContentPart::OutputText { text, .. } => Some(text.as_str()),
                 ResponsesContentPart::InputImage { .. } => None,
             })
             .collect(),
@@ -472,14 +474,14 @@ fn message_tokens(item: &ResponsesInputItem) -> u64 {
         .iter()
         .map(|part| match part {
             ResponsesContentPart::InputText { text }
-            | ResponsesContentPart::OutputText { text } => text.len().div_ceil(4) as u64,
+            | ResponsesContentPart::OutputText { text, .. } => text.len().div_ceil(4) as u64,
             ResponsesContentPart::InputImage { .. } => 2_000,
         })
         .sum()
 }
 
 fn truncate_message(item: ResponsesInputItem, max_tokens: u64) -> Option<ResponsesInputItem> {
-    let ResponsesInputItem::Message { role, content } = item else {
+    let ResponsesInputItem::Message { role, content, .. } = item else {
         return Some(item);
     };
     let mut remaining_tokens = max_tokens;
@@ -498,15 +500,20 @@ fn truncate_message(item: ResponsesInputItem, max_tokens: u64) -> Option<Respons
                     truncated.push(ResponsesContentPart::InputText { text });
                 }
             }
-            ResponsesContentPart::OutputText { text } => {
+            ResponsesContentPart::OutputText { text, .. } => {
                 let text = truncate_text(text, &mut remaining_tokens);
                 if !text.is_empty() {
-                    truncated.push(ResponsesContentPart::OutputText { text });
+                    truncated.push(ResponsesContentPart::OutputText {
+                        text,
+                        annotations: None,
+                        logprobs: None,
+                    });
                 }
             }
         }
     }
     (!truncated.is_empty()).then_some(ResponsesInputItem::Message {
+        metadata: Default::default(),
         role,
         content: truncated,
     })
