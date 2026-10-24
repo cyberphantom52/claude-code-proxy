@@ -11,7 +11,7 @@ pub enum ContentBlock<'a> {
         text: &'a str,
     },
     Image {
-        source: ImageSource<'a>,
+        image_url: String,
     },
     ToolUse {
         id: &'a str,
@@ -29,13 +29,6 @@ pub enum ContentBlock<'a> {
     Thinking {
         signature: Option<&'a str>,
     },
-}
-
-#[derive(Debug)]
-pub struct ImageSource<'a> {
-    pub media_type: &'a str,
-    pub data: &'a str,
-    pub source_type: &'a str,
 }
 
 pub fn flatten_system_text(system_val: Option<&Value>) -> Option<String> {
@@ -83,14 +76,6 @@ pub fn normalize_content(content: &Value) -> anyhow::Result<Vec<ContentBlock<'_>
             })
             .collect(),
         _ => anyhow::bail!("content must be a string or an array of content blocks"),
-    }
-}
-
-pub fn image_source_to_url(source: &ImageSource<'_>) -> String {
-    if source.source_type == "url" {
-        source.data.to_string()
-    } else {
-        format!("data:{};base64,{}", source.media_type, source.data)
     }
 }
 
@@ -171,13 +156,8 @@ fn parse_content_block(value: &Value) -> anyhow::Result<ContentBlock<'_>> {
                     source_type != "base64" || !media_type.is_empty(),
                     "image source media_type must not be empty"
                 );
-                validated_image_data_url(media_type, data)?;
                 ContentBlock::Image {
-                    source: ImageSource {
-                        media_type,
-                        data,
-                        source_type,
-                    },
+                    image_url: validated_image_data_url(media_type, data)?,
                 }
             }
             "tool_use" => {

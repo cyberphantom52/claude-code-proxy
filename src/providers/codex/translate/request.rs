@@ -7,7 +7,7 @@ use serde_json::Value;
 use crate::anthropic::schema::{Message, MessagesRequest};
 use crate::config;
 use crate::providers::translate_shared::{
-    ContentBlock, flatten_system_text, image_source_to_url, normalize_content, parallel_tool_calls,
+    ContentBlock, flatten_system_text, normalize_content, parallel_tool_calls,
     validated_image_data_url,
 };
 
@@ -1750,9 +1750,9 @@ fn build_input(
                                 text: text.to_string(),
                             });
                         }
-                        ContentBlock::Image { source } => {
+                        ContentBlock::Image { image_url } => {
                             parts.push(ResponsesContentPart::InputImage {
-                                image_url: image_source_to_url(&source),
+                                image_url,
                                 detail: None,
                             });
                         }
