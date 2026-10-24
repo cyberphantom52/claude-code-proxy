@@ -214,48 +214,34 @@ fn handle_callback_until(
         return Ok(None);
     }
 
-    let params: HashMap<_, _> = url::form_urlencoded::parse(query.as_bytes())
-        .into_owned()
-        .collect();
-
-    if let Some(error) = params.get("error") {
-        write_response(
-            stream,
-            deadline,
-            400,
-            "text/plain",
-            &format!("Auth failed: {error}"),
-        );
-        anyhow::bail!("{error}");
+    let mut params = HashMap::new();
+    let mut duplicate = false;
+    for (key, value) in url::form_urlencoded::parse(query.as_bytes()).into_owned() {
+        duplicate |= params.insert(key, value).is_some();
+    }
+    // Unrelated/stale callbacks must not terminate the pending login. In
+    // particular, authenticate state before trusting a provider error.
+    if duplicate || params.get("state").map(String::as_str) != Some(state) {
+        write_response(stream, deadline, 400, "text/plain", "Invalid callback");
+        return Ok(None);
     }
 
-    let code = match params.get("code") {
-        Some(c) => c.clone(),
-        None => {
-            write_response(
-                stream,
-                deadline,
-                400,
-                "text/plain",
-                "Auth failed: Invalid callback",
-            );
-            anyhow::bail!("Invalid callback");
-        }
+    if let Some(error) = params.get("error").filter(|error| !error.is_empty()) {
+        let message = if error == "access_denied" {
+            "OAuth authorization denied or cancelled"
+        } else {
+            "OAuth authorization failed"
+        };
+        write_response(stream, deadline, 400, "text/plain", message);
+        anyhow::bail!("{message}");
+    }
+
+    let Some(code) = params.get("code").filter(|code| !code.is_empty()) else {
+        write_response(stream, deadline, 400, "text/plain", "Invalid callback");
+        return Ok(None);
     };
 
-    let received_state = params.get("state").cloned().unwrap_or_default();
-    if received_state != state {
-        write_response(
-            stream,
-            deadline,
-            400,
-            "text/plain",
-            "Auth failed: Invalid callback",
-        );
-        anyhow::bail!("Invalid callback: state mismatch");
-    }
-
-    match exchange_code_for_tokens_until(issuer, &code, pkce, redirect_uri, deadline) {
+    match exchange_code_for_tokens_until(issuer, code, pkce, redirect_uri, deadline) {
         Ok(tokens) => {
             write_response(
                 stream,
@@ -267,7 +253,7 @@ fn handle_callback_until(
             Ok(Some(tokens))
         }
         Err(e) => {
-            write_response(stream, deadline, 500, "text/plain", &e.to_string());
+            write_response(stream, deadline, 500, "text/plain", "Token exchange failed");
             Err(e)
         }
     }
