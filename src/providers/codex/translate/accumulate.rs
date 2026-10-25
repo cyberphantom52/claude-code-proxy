@@ -7,7 +7,6 @@ use super::reducer::{
     AnthropicUsage, FinishMetadata, ReducerEvent, UpstreamStreamError,
     map_codex_usage_to_anthropic, reduce_upstream_bytes,
 };
-use super::web_search_compat::{WebSearchCompatContent, build_web_search_compat_blocks};
 
 pub fn accumulate_response_with_traffic(
     upstream: &[u8],
@@ -48,7 +47,7 @@ pub fn accumulate_response_and_metadata_with_traffic(
     let mut metadata = None;
     let mut annotations = Vec::new();
     let mut usage: Option<AnthropicUsage> = None;
-    let compat_blocks = build_web_search_compat_blocks(&events);
+    let mut indexed_content: Vec<(usize, Value)> = Vec::new();
 
     enum BlockKind {
         Thinking {
@@ -77,7 +76,35 @@ pub fn accumulate_response_and_metadata_with_traffic(
                     annotations.push(annotation);
                 }
             }
-            ReducerEvent::WebSearch { .. } => {}
+            ReducerEvent::WebSearch {
+                index,
+                result_index,
+                id,
+                query,
+            } => {
+                indexed_content.push((
+                    index,
+                    content_block(
+                        "server_tool_use",
+                        [
+                            ("id", Value::String(id.clone())),
+                            ("name", Value::String("web_search".to_string())),
+                            ("input", serde_json::json!({"query": query})),
+                        ],
+                    ),
+                ));
+                // Answer annotations are not verified search-call provenance.
+                indexed_content.push((
+                    result_index,
+                    content_block(
+                        "web_search_tool_result",
+                        [
+                            ("tool_use_id", Value::String(id)),
+                            ("content", Value::Array(Vec::new())),
+                        ],
+                    ),
+                ));
+            }
             ReducerEvent::ThinkingStart { index } => {
                 blocks.push(AccumulatedBlock {
                     index,
@@ -169,46 +196,6 @@ pub fn accumulate_response_and_metadata_with_traffic(
                 });
             }
         }
-    }
-
-    let mut indexed_content: Vec<(usize, Value)> = Vec::new();
-
-    for block in compat_blocks {
-        let content = match block.content {
-            WebSearchCompatContent::ServerToolUse { id, name, input } => content_block(
-                "server_tool_use",
-                [
-                    ("id", Value::String(id)),
-                    ("name", Value::String(name)),
-                    ("input", input),
-                ],
-            ),
-            WebSearchCompatContent::WebSearchToolResult {
-                tool_use_id,
-                content: results,
-            } => {
-                let results = results
-                    .into_iter()
-                    .map(|result| {
-                        content_block(
-                            "web_search_result",
-                            [
-                                ("title", Value::String(result.title)),
-                                ("url", Value::String(result.url)),
-                            ],
-                        )
-                    })
-                    .collect();
-                content_block(
-                    "web_search_tool_result",
-                    [
-                        ("tool_use_id", Value::String(tool_use_id)),
-                        ("content", Value::Array(results)),
-                    ],
-                )
-            }
-        };
-        indexed_content.push((block.index, content));
     }
 
     for block in blocks {
