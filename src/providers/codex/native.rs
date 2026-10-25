@@ -639,6 +639,7 @@ struct NativeResponseObserver {
     ctx: RequestContext,
     is_sse: bool,
     inspect_sse: bool,
+    validate_json_on_eof: bool,
     terminal_seen: bool,
     buffer_terminal: bool,
     buffered_terminal: Option<Result<Value, String>>,
@@ -668,6 +669,7 @@ impl NativeResponseObserver {
             ctx,
             is_sse,
             inspect_sse,
+            validate_json_on_eof: inspect_sse,
             terminal_seen: false,
             buffer_terminal: false,
             buffered_terminal: None,
@@ -913,14 +915,27 @@ impl NativeResponseObserver {
             self.outcome
                 .fail("Native Responses stream ended before a terminal event".to_string());
         }
-        if !self.is_sse
-            && let Ok(value) = serde_json::from_slice::<Value>(&self.raw)
-        {
-            self.update_usage(&value);
-            let value = self.update_outcome(value);
-            self.capture_event(value);
-            if let Some(monitor) = self.ctx.monitor.as_ref() {
-                monitor.usage_updated(&self.ctx.req_id, self.usage);
+        if !self.is_sse {
+            match serde_json::from_slice::<Value>(&self.raw) {
+                Ok(value) if self.raw_truncated == 0 => {
+                    self.update_usage(&value);
+                    let value = self.update_outcome(value);
+                    self.capture_event(value);
+                    if let Some(monitor) = self.ctx.monitor.as_ref() {
+                        monitor.usage_updated(&self.ctx.req_id, self.usage);
+                    }
+                }
+                _ if outcome == "complete" && self.validate_json_on_eof => {
+                    // A rejected/unfinished SSE prefix is not proof of JSON.
+                    // A bounded capture cannot prove the complete body either.
+                    let message = if self.raw_truncated > 0 {
+                        "Native Responses body could not be validated within the inspection byte limit"
+                    } else {
+                        "Native Responses body ended without a terminal SSE event or complete JSON"
+                    };
+                    self.outcome.fail(message.to_string());
+                }
+                _ => {}
             }
         }
         self.write_capture(outcome);
