@@ -128,6 +128,39 @@ pub struct ActiveRequest {
 }
 
 impl ActiveRequest {
+    fn new(
+        request_id: String,
+        session_id: Option<String>,
+        session_seq: Option<u64>,
+        endpoint: EndpointKind,
+    ) -> Self {
+        Self {
+            request_id,
+            session_id,
+            session_seq,
+            project: None,
+            provider: None,
+            model: None,
+            effort: None,
+            endpoint,
+            started_at: SystemTime::now(),
+            started_instant: Instant::now(),
+            generation_started_at: None,
+            generation_started_instant: None,
+            generation_initial_output_tokens: 0,
+            generation_finished_at: None,
+            generation_duration: None,
+            status: RequestStatus::Started,
+            streamed_bytes: 0,
+            stream_chunks: 0,
+            input_tokens: None,
+            cached_input_tokens: None,
+            output_tokens: None,
+            error: None,
+            traffic_capture_path: None,
+        }
+    }
+
     pub fn elapsed(&self) -> Duration {
         self.started_instant.elapsed()
     }
@@ -335,31 +368,7 @@ impl MonitorHandle {
         self.mutate(|store| {
             store.active.insert(
                 request_id.clone(),
-                ActiveRequest {
-                    request_id,
-                    session_id,
-                    session_seq,
-                    project: None,
-                    provider: None,
-                    model: None,
-                    effort: None,
-                    endpoint,
-                    started_at: SystemTime::now(),
-                    started_instant: Instant::now(),
-                    generation_started_at: None,
-                    generation_started_instant: None,
-                    generation_initial_output_tokens: 0,
-                    generation_finished_at: None,
-                    generation_duration: None,
-                    status: RequestStatus::Started,
-                    streamed_bytes: 0,
-                    stream_chunks: 0,
-                    input_tokens: None,
-                    cached_input_tokens: None,
-                    output_tokens: None,
-                    error: None,
-                    traffic_capture_path: None,
-                },
+                ActiveRequest::new(request_id, session_id, session_seq, endpoint),
             );
         });
     }
@@ -547,34 +556,9 @@ impl MonitorStore {
         http_status: Option<u16>,
         error: Option<String>,
     ) {
-        let active = self
-            .active
-            .remove(request_id)
-            .unwrap_or_else(|| ActiveRequest {
-                request_id: request_id.to_string(),
-                session_id: None,
-                session_seq: None,
-                project: None,
-                provider: None,
-                model: None,
-                effort: None,
-                endpoint: EndpointKind::Messages,
-                started_at: SystemTime::now(),
-                started_instant: Instant::now(),
-                generation_started_at: None,
-                generation_started_instant: None,
-                generation_initial_output_tokens: 0,
-                generation_finished_at: None,
-                generation_duration: None,
-                status: RequestStatus::Started,
-                streamed_bytes: 0,
-                stream_chunks: 0,
-                input_tokens: None,
-                cached_input_tokens: None,
-                output_tokens: None,
-                error: None,
-                traffic_capture_path: None,
-            });
+        let active = self.active.remove(request_id).unwrap_or_else(|| {
+            ActiveRequest::new(request_id.to_string(), None, None, EndpointKind::Messages)
+        });
         let mut completed = CompletedRequest {
             request_id: active.request_id,
             session_id: active.session_id,

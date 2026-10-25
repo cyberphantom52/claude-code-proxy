@@ -132,7 +132,7 @@ fn create_dir(path: &Path, mode: u32) -> io::Result<()> {
     Ok(())
 }
 
-fn set_mode(path: &Path, mode: u32) {
+pub(crate) fn set_mode(path: &Path, mode: u32) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -141,6 +141,10 @@ fn set_mode(path: &Path, mode: u32) {
             perm.set_mode(mode);
             let _ = fs::set_permissions(path, perm);
         }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode);
     }
 }
 

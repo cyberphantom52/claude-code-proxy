@@ -90,7 +90,7 @@ impl CodexTranscriptionBackend {
             .await
         {
             Ok(response) => response,
-            Err(error) => return transcription_transport_error_response(error),
+            Err(error) => return super::images::transport_error_response(error, "transcription"),
         };
         let status = upstream.status();
         let headers = upstream.headers().clone();
@@ -284,61 +284,11 @@ fn copy_safe_headers(source: &http::HeaderMap, target: &mut http::HeaderMap) {
     }
 }
 
-fn transcription_transport_error_response(error: super::client::CodexError) -> Response {
-    let status = match error.status {
-        value @ 400..=599 => StatusCode::from_u16(value).unwrap_or(StatusCode::BAD_GATEWAY),
-        _ => StatusCode::BAD_GATEWAY,
-    };
-    let mut response = transcription_error_response(TranscriptionRequestError {
-        status,
-        message: if error.status == 0 {
-            "Codex transcription service is unavailable".to_string()
-        } else {
-            format!("Codex transcription service returned HTTP {}", error.status)
-        },
-        param: None,
-        code: if status == StatusCode::UNAUTHORIZED {
-            "authentication_error"
-        } else if status == StatusCode::FORBIDDEN {
-            "permission_error"
-        } else if status == StatusCode::TOO_MANY_REQUESTS {
-            "rate_limit_error"
-        } else {
-            "upstream_error"
-        },
-    });
-    if let Some(retry_after) = error.retry_after
-        && let Ok(value) = http::HeaderValue::from_str(&retry_after)
-    {
-        response
-            .headers_mut()
-            .insert(http::header::RETRY_AFTER, value);
-    }
-    response
-}
-
 pub fn transcription_error_response(error: TranscriptionRequestError) -> Response {
-    let error_type = match error.status {
-        StatusCode::UNAUTHORIZED => "authentication_error",
-        StatusCode::FORBIDDEN => "permission_error",
-        StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
-        status if status.is_client_error() => "invalid_request_error",
-        _ => "api_error",
-    };
-    (
-        error.status,
-        [
-            (http::header::CONTENT_TYPE, "application/json"),
-            (http::header::CACHE_CONTROL, "no-store"),
-        ],
-        axum::Json(serde_json::json!({
-            "error": {
-                "message": error.message,
-                "type": error_type,
-                "param": error.param,
-                "code": error.code,
-            }
-        })),
-    )
-        .into_response()
+    super::images::image_error_response(super::images::ImageRequestError {
+        status: error.status,
+        message: error.message,
+        param: error.param,
+        code: Some(error.code),
+    })
 }

@@ -641,31 +641,16 @@ fn active_request(
     elapsed: Duration,
     status: RequestStatus,
 ) -> ActiveRequest {
-    ActiveRequest {
-        request_id: request_id.to_string(),
-        session_id: session_id.map(str::to_string),
+    let mut request = ActiveRequest::new(
+        request_id.to_string(),
+        session_id.map(str::to_string),
         session_seq,
-        project: None,
-        provider: None,
-        model: None,
-        effort: None,
         endpoint,
-        started_at: now - elapsed,
-        started_instant: instant_now - elapsed,
-        generation_started_at: None,
-        generation_started_instant: None,
-        generation_initial_output_tokens: 0,
-        generation_finished_at: None,
-        generation_duration: None,
-        status,
-        streamed_bytes: 0,
-        stream_chunks: 0,
-        input_tokens: None,
-        cached_input_tokens: None,
-        output_tokens: None,
-        error: None,
-        traffic_capture_path: None,
-    }
+    );
+    request.started_at = now - elapsed;
+    request.started_instant = instant_now - elapsed;
+    request.status = status;
+    request
 }
 
 #[allow(clippy::too_many_arguments)]

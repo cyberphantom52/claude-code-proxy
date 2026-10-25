@@ -1,6 +1,6 @@
 use crate::{
     anthropic::{MAX_ANTHROPIC_REQUEST_BYTES, json_error},
-    logging::{Logger, REDACT_KEYS, create_logger},
+    logging::{Logger, REDACT_KEYS, create_logger, set_mode},
     monitor::{EndpointKind, MonitorHandle, bounded_error_message},
     openai_compat::{MAX_OPENAI_REQUEST_BYTES, OpenAiError, request::extract_model},
     project,
@@ -43,7 +43,7 @@ use std::collections::VecDeque;
 use std::fs::{self, File};
 use std::future::{Future, IntoFuture};
 use std::io::{BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
@@ -933,42 +933,18 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
         Ok(turn_state) => turn_state,
         Err(response) => return monitor_response_body(response, request_guard),
     };
-    let body = {
-        let body_bytes = match axum::body::to_bytes(req.into_body(), MAX_OPENAI_REQUEST_BYTES).await
-        {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                let response = openai_error(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "invalid_request_error",
-                    "Request body exceeded the size limit".to_string(),
-                    None,
-                    Some("request_too_large"),
-                );
-                log_native_request_completed(
-                    &log,
-                    &req_id,
-                    "responses",
-                    None,
-                    response.status(),
-                    started_at,
-                );
-                return monitor_response_body(response, request_guard);
-            }
-        };
-        match parse_native_json_body(&body_bytes) {
-            Ok(body) => body,
-            Err(response) => {
-                log_native_request_completed(
-                    &log,
-                    &req_id,
-                    "responses",
-                    None,
-                    response.status(),
-                    started_at,
-                );
-                return monitor_response_body(response, request_guard);
-            }
+    let body = match read_native_json_body(req.into_body()).await {
+        Ok(body) => body,
+        Err(response) => {
+            log_native_request_completed(
+                &log,
+                &req_id,
+                "responses",
+                None,
+                response.status(),
+                started_at,
+            );
+            return monitor_response_body(response, request_guard);
         }
     };
     let model = match extract_model(&body) {
@@ -1099,42 +1075,18 @@ async fn handler_chat_completions(
         );
     }
     let request_guard = RequestMonitorGuard::new(state.monitor.clone(), req_id.clone());
-    let body = {
-        let body_bytes = match axum::body::to_bytes(req.into_body(), MAX_OPENAI_REQUEST_BYTES).await
-        {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                let response = openai_error(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "invalid_request_error",
-                    "Request body exceeded the size limit".to_string(),
-                    None,
-                    Some("request_too_large"),
-                );
-                log_native_request_completed(
-                    &log,
-                    &req_id,
-                    "chat_completions",
-                    None,
-                    response.status(),
-                    started_at,
-                );
-                return monitor_response_body(response, request_guard);
-            }
-        };
-        match parse_native_json_body(&body_bytes) {
-            Ok(body) => body,
-            Err(response) => {
-                log_native_request_completed(
-                    &log,
-                    &req_id,
-                    "chat_completions",
-                    None,
-                    response.status(),
-                    started_at,
-                );
-                return monitor_response_body(response, request_guard);
-            }
+    let body = match read_native_json_body(req.into_body()).await {
+        Ok(body) => body,
+        Err(response) => {
+            log_native_request_completed(
+                &log,
+                &req_id,
+                "chat_completions",
+                None,
+                response.status(),
+                started_at,
+            );
+            return monitor_response_body(response, request_guard);
         }
     };
     let model = match extract_model(&body) {
@@ -1264,6 +1216,22 @@ fn native_session_id(headers: &http::HeaderMap) -> Option<String> {
             .filter(|value| !value.is_empty())
             .map(str::to_string)
     })
+}
+
+#[allow(clippy::result_large_err)]
+async fn read_native_json_body(body: Body) -> Result<Value, Response> {
+    let body_bytes = axum::body::to_bytes(body, MAX_OPENAI_REQUEST_BYTES)
+        .await
+        .map_err(|_| {
+            openai_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "invalid_request_error",
+                "Request body exceeded the size limit".to_string(),
+                None,
+                Some("request_too_large"),
+            )
+        })?;
+    parse_native_json_body(&body_bytes)
 }
 
 #[allow(clippy::result_large_err)]
@@ -2103,20 +2071,4 @@ fn current_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
-}
-
-fn set_mode(path: &Path, mode: u32) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = fs::metadata(path) {
-            let mut perm = meta.permissions();
-            perm.set_mode(mode);
-            let _ = fs::set_permissions(path, perm);
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (path, mode);
-    }
 }

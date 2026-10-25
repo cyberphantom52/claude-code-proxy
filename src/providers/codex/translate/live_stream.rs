@@ -383,7 +383,7 @@ impl LiveStreamTranslator {
         } else {
             None
         };
-        let text_output_index = self.text_output_index(payload);
+        let text_output_index = text_output_index(payload, &self.item_id_to_output_index);
         if text_boundary(payload)
             && let Some(delta) = self.stops.flush()
         {
@@ -754,25 +754,6 @@ impl LiveStreamTranslator {
         );
     }
 
-    fn text_output_index(&self, payload: &serde_json::Value) -> usize {
-        payload
-            .get("output_index")
-            .and_then(serde_json::Value::as_u64)
-            .map(|index| index as usize)
-            .or_else(|| {
-                payload["item_id"]
-                    .as_str()
-                    .or_else(|| {
-                        payload
-                            .get("item")
-                            .and_then(|value| value.get("id"))
-                            .and_then(serde_json::Value::as_str)
-                    })
-                    .and_then(|id| self.item_id_to_output_index.get(id).copied())
-            })
-            .unwrap_or(0)
-    }
-
     fn text_delta(
         &mut self,
         delta: TextDelta,
@@ -912,7 +893,7 @@ impl LiveStreamTranslator {
         traffic: Option<&TrafficCapture>,
         out: &mut Vec<u8>,
     ) -> Result<(), String> {
-        let mut output_index = self.text_output_index(payload);
+        let mut output_index = text_output_index(payload, &self.item_id_to_output_index);
         if payload["_ccp_output_already_done"] == true {
             return Ok(());
         }
@@ -1387,6 +1368,28 @@ impl LiveStreamTranslator {
             }),
         );
     }
+}
+
+pub(super) fn text_output_index(
+    payload: &serde_json::Value,
+    item_id_to_output_index: &HashMap<String, usize>,
+) -> usize {
+    payload
+        .get("output_index")
+        .and_then(serde_json::Value::as_u64)
+        .map(|index| index as usize)
+        .or_else(|| {
+            payload["item_id"]
+                .as_str()
+                .or_else(|| {
+                    payload
+                        .get("item")
+                        .and_then(|value| value.get("id"))
+                        .and_then(serde_json::Value::as_str)
+                })
+                .and_then(|id| item_id_to_output_index.get(id).copied())
+        })
+        .unwrap_or(0)
 }
 
 fn output_index(payload: &serde_json::Value) -> usize {

@@ -70,6 +70,14 @@ impl CodexError {
     }
 }
 
+fn initial_auth_error(error: anyhow::Error) -> CodexError {
+    CodexError {
+        detail: Some(error.to_string()),
+        origin: CodexErrorOrigin::Auth,
+        ..CodexError::new(401, "Auth error".to_string())
+    }
+}
+
 impl std::fmt::Display for CodexError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Codex error {}: {}", self.status, self.message)
@@ -782,14 +790,7 @@ impl CodexHttpClient {
         ctx: &RequestContext,
     ) -> Result<reqwest::Response, CodexError> {
         let url = format!("{}/transcribe", base_url.trim_end_matches('/'));
-        let mut auth = self.operation_auth().await.map_err(|error| CodexError {
-            status: 401,
-            message: "Auth error".to_string(),
-            detail: Some(error.to_string()),
-            retry_after: None,
-            usage_limit: None,
-            origin: CodexErrorOrigin::Auth,
-        })?;
+        let mut auth = self.operation_auth().await.map_err(initial_auth_error)?;
         let mut refresh_attempted = false;
 
         loop {
@@ -882,14 +883,7 @@ impl CodexHttpClient {
             base_url.trim_end_matches('/'),
             operation.upstream_path()
         );
-        let mut auth = self.operation_auth().await.map_err(|error| CodexError {
-            status: 401,
-            message: "Auth error".to_string(),
-            detail: Some(error.to_string()),
-            retry_after: None,
-            usage_limit: None,
-            origin: CodexErrorOrigin::Auth,
-        })?;
+        let mut auth = self.operation_auth().await.map_err(initial_auth_error)?;
         let mut refresh_attempted = false;
 
         loop {
@@ -972,14 +966,7 @@ impl CodexHttpClient {
                 usage_limit: None,
                 origin: CodexErrorOrigin::Http,
             })?;
-        let mut auth = self.operation_auth().await.map_err(|err| CodexError {
-            status: 401,
-            message: "Auth error".to_string(),
-            detail: Some(err.to_string()),
-            retry_after: None,
-            usage_limit: None,
-            origin: CodexErrorOrigin::Auth,
-        })?;
+        let mut auth = self.operation_auth().await.map_err(initial_auth_error)?;
         if body
             .get("input")
             .and_then(serde_json::Value::as_array)
@@ -1071,14 +1058,7 @@ impl CodexHttpClient {
         body: &SearchRequest,
         ctx: &RequestContext,
     ) -> Result<SearchResponse, CodexError> {
-        let mut auth = self.operation_auth().await.map_err(|e| CodexError {
-            status: 401,
-            message: "Auth error".to_string(),
-            detail: Some(e.to_string()),
-            retry_after: None,
-            usage_limit: None,
-            origin: CodexErrorOrigin::Auth,
-        })?;
+        let mut auth = self.operation_auth().await.map_err(initial_auth_error)?;
         Arc::make_mut(&mut auth)
             .require_opaque_provenance(&self.base_url)
             .map_err(auth_refresh_error)?;
@@ -1143,14 +1123,7 @@ impl CodexHttpClient {
         ctx: &RequestContext,
         provenance_publisher: super::websocket::CodexWebSocketSocketIdPublisher,
     ) -> Result<CodexHttpEventReceiver, CodexError> {
-        let mut auth = self.operation_auth().await.map_err(|e| CodexError {
-            status: 401,
-            message: "Auth error".to_string(),
-            detail: Some(e.to_string()),
-            retry_after: None,
-            usage_limit: None,
-            origin: CodexErrorOrigin::Auth,
-        })?;
+        let mut auth = self.operation_auth().await.map_err(initial_auth_error)?;
         if has_opaque_native_history(body) {
             Arc::make_mut(&mut auth)
                 .require_opaque_provenance(&self.base_url)
@@ -1750,14 +1723,7 @@ impl CodexHttpClient {
         // Reviewer handshake headers must never share an ordinary pooled socket.
         let continuation = continuation.filter(|_| !codex_auto_review);
 
-        let mut auth = self.operation_auth().await.map_err(|e| CodexError {
-            status: 401,
-            message: "Auth error".to_string(),
-            detail: Some(e.to_string()),
-            retry_after: None,
-            usage_limit: None,
-            origin: CodexErrorOrigin::Auth,
-        })?;
+        let mut auth = self.operation_auth().await.map_err(initial_auth_error)?;
         if body.input.iter().any(|item| {
             matches!(
                 item,
@@ -2213,14 +2179,7 @@ impl CodexHttpClient {
     ) -> Result<super::websocket::CodexWebSocketEventStream, CodexError> {
         let codex_auto_review = body.codex_auto_review && body.model == "codex-auto-review";
         let continuation = continuation.filter(|_| !codex_auto_review);
-        let mut auth = self.operation_auth().await.map_err(|e| CodexError {
-            status: 401,
-            message: "Auth error".to_string(),
-            detail: Some(e.to_string()),
-            retry_after: None,
-            usage_limit: None,
-            origin: CodexErrorOrigin::Auth,
-        })?;
+        let mut auth = self.operation_auth().await.map_err(initial_auth_error)?;
         if has_opaque_native_history(&body) {
             Arc::make_mut(&mut auth)
                 .require_opaque_provenance(&self.base_url)

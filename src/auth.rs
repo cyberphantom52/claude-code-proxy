@@ -1,10 +1,9 @@
+use crate::logging::set_mode;
 use anyhow::Result;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::to_string_pretty;
 use std::fs;
 use std::io::{self, Write};
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 
 /// A consistent value and lifecycle revision, kept outside stored credential JSON.
 #[derive(Clone)]
@@ -363,15 +362,4 @@ pub fn write_atomically<T: Serialize>(path: &str, value: &T) -> Result<()> {
     })?
     .sync_all()?;
     Ok(())
-}
-
-fn set_mode(path: &std::path::Path, mode: u32) {
-    #[cfg(unix)]
-    {
-        if let Ok(meta) = fs::metadata(path) {
-            let mut permissions = meta.permissions();
-            permissions.set_mode(mode);
-            let _ = fs::set_permissions(path, permissions);
-        }
-    }
 }

@@ -85,6 +85,16 @@ impl ContinuationReservation {
         )
     }
 
+    fn disabled_for_owner_turn(
+        owner: Option<&ConversationIdentity>,
+        turn_id: Option<u64>,
+        reason: &str,
+    ) -> Self {
+        let mut reservation = Self::for_owner_turn(owner, turn_id);
+        reservation.candidate.disabled_reason = Some(reason.to_owned());
+        reservation
+    }
+
     pub(crate) fn provenance(&self) -> Option<&OperationProvenance> {
         self.provenance.as_ref()
     }
@@ -163,29 +173,11 @@ fn continuation_candidate_inner(
     provenance: Option<&OperationProvenance>,
 ) -> ContinuationReservation {
     if !enabled {
-        return ContinuationReservation::new(
-            ContinuationCandidate {
-                turn_id: None,
-                previous_response_id: None,
-                input_delta: None,
-                disabled_reason: Some("disabled".to_string()),
-            },
-            owner.cloned(),
-            None,
-        );
+        return ContinuationReservation::disabled_for_owner_turn(owner, None, "disabled");
     }
 
     let Some(owner) = owner else {
-        return ContinuationReservation::new(
-            ContinuationCandidate {
-                turn_id: None,
-                previous_response_id: None,
-                input_delta: None,
-                disabled_reason: Some("missing_identity".to_string()),
-            },
-            None,
-            None,
-        );
+        return ContinuationReservation::disabled_for_owner_turn(None, None, "missing_identity");
     };
 
     let Some(provenance) = provenance else {
@@ -245,60 +237,40 @@ fn continuation_candidate_from_state(
     let state = match state {
         Some(state) if now.saturating_sub(state.updated_at) <= TTL_MS => state,
         Some(_) | None => {
-            return ContinuationReservation::new(
-                ContinuationCandidate {
-                    turn_id: Some(turn_id),
-                    previous_response_id: None,
-                    input_delta: None,
-                    disabled_reason: Some(if superseded_turn {
-                        "superseded_turn".to_string()
-                    } else {
-                        "missing_state".to_string()
-                    }),
+            return ContinuationReservation::disabled_for_owner_turn(
+                Some(owner),
+                Some(turn_id),
+                if superseded_turn {
+                    "superseded_turn"
+                } else {
+                    "missing_state"
                 },
-                Some(owner.clone()),
-                None,
             );
         }
     };
 
     let signature = prompt_signature(body);
     if signature != state.prompt_signature {
-        return ContinuationReservation::new(
-            ContinuationCandidate {
-                turn_id: Some(turn_id),
-                previous_response_id: None,
-                input_delta: None,
-                disabled_reason: Some("prompt_changed".to_string()),
-            },
-            Some(owner.clone()),
-            None,
+        return ContinuationReservation::disabled_for_owner_turn(
+            Some(owner),
+            Some(turn_id),
+            "prompt_changed",
         );
     }
 
     let Some(suffix) = input_suffix_after_prefix(&body.input, &state.transcript) else {
-        return ContinuationReservation::new(
-            ContinuationCandidate {
-                turn_id: Some(turn_id),
-                previous_response_id: None,
-                input_delta: None,
-                disabled_reason: Some("not_append_only".to_string()),
-            },
-            Some(owner.clone()),
-            None,
+        return ContinuationReservation::disabled_for_owner_turn(
+            Some(owner),
+            Some(turn_id),
+            "not_append_only",
         );
     };
 
     if suffix.is_empty() {
-        return ContinuationReservation::new(
-            ContinuationCandidate {
-                turn_id: Some(turn_id),
-                previous_response_id: None,
-                input_delta: None,
-                disabled_reason: Some("empty_delta".to_string()),
-            },
-            Some(owner.clone()),
-            None,
+        return ContinuationReservation::disabled_for_owner_turn(
+            Some(owner),
+            Some(turn_id),
+            "empty_delta",
         );
     }
 
@@ -316,15 +288,10 @@ fn continuation_candidate_from_state(
         && has_inline_tools(&state.transcript)
         && !has_inline_tools(&suffix)
     {
-        return ContinuationReservation::new(
-            ContinuationCandidate {
-                turn_id: Some(turn_id),
-                previous_response_id: None,
-                input_delta: None,
-                disabled_reason: Some("required_tools_outside_delta".to_string()),
-            },
-            Some(owner.clone()),
-            None,
+        return ContinuationReservation::disabled_for_owner_turn(
+            Some(owner),
+            Some(turn_id),
+            "required_tools_outside_delta",
         );
     }
 

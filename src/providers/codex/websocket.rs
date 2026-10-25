@@ -1245,11 +1245,15 @@ fn missing_terminal_error() -> CodexError {
     }
 }
 
-fn response_start_timeout_error(timeout_ms: u64) -> CodexError {
+fn response_timeout_error(response_started: bool, timeout_ms: u64) -> CodexError {
     CodexError {
         status: 0,
-        message: format!("WebSocket response start timeout after {timeout_ms}ms"),
-        detail: Some(WEBSOCKET_RESPONSE_START_TIMEOUT_DETAIL.to_string()),
+        message: if response_started {
+            format!("WebSocket idle timeout after {timeout_ms}ms")
+        } else {
+            format!("WebSocket response start timeout after {timeout_ms}ms")
+        },
+        detail: (!response_started).then(|| WEBSOCKET_RESPONSE_START_TIMEOUT_DETAIL.to_string()),
         retry_after: None,
         usage_limit: None,
         origin: CodexErrorOrigin::WebSocket,
@@ -2129,44 +2133,16 @@ where
     let mut response_started = false;
 
     loop {
-        let read_timeout = if response_started {
-            match response_event_budget.checked_sub(last_response_event_at.elapsed()) {
-                Some(remaining) if !remaining.is_zero() => remaining,
-                _ => {
-                    return Err(CodexError {
-                        status: 0,
-                        message: format!("WebSocket idle timeout after {idle_timeout_ms}ms"),
-                        detail: None,
-                        retry_after: None,
-                        usage_limit: None,
-                        origin: CodexErrorOrigin::WebSocket,
-                    });
-                }
-            }
-        } else {
-            match response_event_budget.checked_sub(last_response_event_at.elapsed()) {
-                Some(remaining) if !remaining.is_zero() => remaining,
-                _ => {
-                    return Err(response_start_timeout_error(idle_timeout_ms));
-                }
-            }
+        let read_timeout = match response_event_budget.checked_sub(last_response_event_at.elapsed())
+        {
+            Some(remaining) if !remaining.is_zero() => remaining,
+            _ => return Err(response_timeout_error(response_started, idle_timeout_ms)),
         };
 
         let frame = match read_ws_frame_with_keepalive(ws, read_timeout).await {
             WebSocketRead::Frame(frame) => frame,
             WebSocketRead::Timeout => {
-                return Err(if response_started {
-                    CodexError {
-                        status: 0,
-                        message: format!("WebSocket idle timeout after {idle_timeout_ms}ms"),
-                        detail: None,
-                        retry_after: None,
-                        usage_limit: None,
-                        origin: CodexErrorOrigin::WebSocket,
-                    }
-                } else {
-                    response_start_timeout_error(idle_timeout_ms)
-                });
+                return Err(response_timeout_error(response_started, idle_timeout_ms));
             }
             WebSocketRead::KeepaliveError(error) => {
                 return Err(CodexError {
@@ -2301,18 +2277,10 @@ where
         {
             Some(remaining) if !remaining.is_zero() => remaining,
             _ => {
-                terminal_item = Some(Err(if response_started {
-                    CodexError {
-                        status: 0,
-                        message: format!("WebSocket idle timeout after {idle_timeout_ms}ms"),
-                        detail: None,
-                        retry_after: None,
-                        usage_limit: None,
-                        origin: CodexErrorOrigin::WebSocket,
-                    }
-                } else {
-                    response_start_timeout_error(idle_timeout_ms)
-                }));
+                terminal_item = Some(Err(response_timeout_error(
+                    response_started,
+                    idle_timeout_ms,
+                )));
                 break;
             }
         };
@@ -2323,18 +2291,7 @@ where
             frame = read_ws_frame_with_keepalive(ws, read_timeout) => match frame {
                 WebSocketRead::Frame(frame) => frame,
                 WebSocketRead::Timeout => {
-                    terminal_item = Some(Err(if response_started {
-                        CodexError {
-                            status: 0,
-                            message: format!("WebSocket idle timeout after {idle_timeout_ms}ms"),
-                            detail: None,
-                            retry_after: None,
-                            usage_limit: None,
-                            origin: CodexErrorOrigin::WebSocket,
-                        }
-                    } else {
-                        response_start_timeout_error(idle_timeout_ms)
-                    }));
+                    terminal_item = Some(Err(response_timeout_error(response_started, idle_timeout_ms)));
                     break;
                 }
                 WebSocketRead::KeepaliveError(error) => {

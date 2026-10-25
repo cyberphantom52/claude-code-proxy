@@ -190,6 +190,10 @@ pub fn log_stderr() -> bool {
 // Codex config
 // ---------------------------------------------------------------------------
 
+fn codex_config() -> Option<CodexConfig> {
+    read_file_config(&config_dir()).and_then(|file| file.codex)
+}
+
 pub fn codex_base_url(default: &str) -> String {
     if let Ok(raw) = std::env::var("CCP_CODEX_BASE_URL") {
         return raw;
@@ -197,28 +201,18 @@ pub fn codex_base_url(default: &str) -> String {
     if let Ok(raw) = std::env::var("CLAUDE_CODE_PROXY_CODEX_BASE_URL") {
         return raw;
     }
-    let config_dir = config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(codex) = file.codex
-        && let Some(url) = codex.base_url
-    {
-        return url;
-    }
-    default.to_string()
+    codex_config()
+        .and_then(|codex| codex.base_url)
+        .unwrap_or_else(|| default.to_string())
 }
 
 pub fn codex_originator(default: &str) -> String {
     if let Ok(raw) = std::env::var("CCP_CODEX_ORIGINATOR") {
         return raw;
     }
-    let config_dir = config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(codex) = file.codex
-        && let Some(val) = codex.originator
-    {
-        return val;
-    }
-    default.to_string()
+    codex_config()
+        .and_then(|codex| codex.originator)
+        .unwrap_or_else(|| default.to_string())
 }
 
 pub fn codex_user_agent(default: &str) -> String {
@@ -228,28 +222,18 @@ pub fn codex_user_agent(default: &str) -> String {
     if let Ok(raw) = std::env::var("CCP_USER_AGENT") {
         return raw;
     }
-    let config_dir = config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(codex) = file.codex
-        && let Some(ua) = codex.user_agent
-    {
-        return ua;
-    }
-    default.to_string()
+    codex_config()
+        .and_then(|codex| codex.user_agent)
+        .unwrap_or_else(|| default.to_string())
 }
 
 pub fn codex_previous_response_id() -> bool {
     if let Ok(raw) = std::env::var("CCP_CODEX_PREVIOUS_RESPONSE_ID") {
         return matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
     }
-    let config_dir = config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(codex) = file.codex
-        && let Some(val) = codex.previous_response_id
-    {
-        return val;
-    }
-    false
+    codex_config()
+        .and_then(|codex| codex.previous_response_id)
+        .unwrap_or(false)
 }
 
 pub fn codex_server_compaction() -> bool {
@@ -260,109 +244,68 @@ pub fn codex_server_compaction() -> bool {
             _ => {}
         }
     }
-    let config_dir = config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(codex) = file.codex
-        && let Some(enabled) = codex.server_compaction
-    {
-        return enabled;
-    }
-    false
+    codex_config()
+        .and_then(|codex| codex.server_compaction)
+        .unwrap_or(false)
 }
 
 pub fn codex_responses_api() -> bool {
     if let Ok(raw) = std::env::var("CCP_CODEX_RESPONSES_API") {
         return matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
     }
-    let config_dir = config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(codex) = file.codex
-        && let Some(enabled) = codex.responses_api
-    {
-        return enabled;
-    }
-    false
+    codex_config()
+        .and_then(|codex| codex.responses_api)
+        .unwrap_or(false)
 }
 
 pub fn codex_images_api() -> bool {
     if let Ok(raw) = std::env::var("CCP_CODEX_IMAGES_API") {
         return matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
     }
-    let config_dir = config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(codex) = file.codex
-        && let Some(enabled) = codex.images_api
-    {
-        return enabled;
-    }
-    false
+    codex_config()
+        .and_then(|codex| codex.images_api)
+        .unwrap_or(false)
 }
 
 pub fn codex_transcriptions_api() -> bool {
     if let Ok(raw) = std::env::var("CCP_CODEX_TRANSCRIPTIONS_API") {
         return matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
     }
-    let config_dir = config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(codex) = file.codex
-        && let Some(enabled) = codex.transcriptions_api
-    {
-        return enabled;
-    }
-    false
+    codex_config()
+        .and_then(|codex| codex.transcriptions_api)
+        .unwrap_or(false)
 }
 
 pub fn codex_images_base_url() -> String {
     if let Ok(raw) = std::env::var("CCP_CODEX_IMAGES_BASE_URL") {
         return raw;
     }
-    let config_dir = config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(codex) = file.codex
-        && let Some(url) = codex.images_base_url
-    {
-        return url;
-    }
-    "https://chatgpt.com/backend-api/codex".to_string()
+    codex_config()
+        .and_then(|codex| codex.images_base_url)
+        .unwrap_or_else(|| "https://chatgpt.com/backend-api/codex".to_string())
 }
 
 pub fn codex_service_tier() -> Option<String> {
     if let Ok(raw) = std::env::var("CCP_CODEX_SERVICE_TIER") {
         return Some(raw);
     }
-    let config_dir = config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(codex) = file.codex
-    {
-        return codex.service_tier;
-    }
-    None
+    codex_config().and_then(|codex| codex.service_tier)
 }
 
 pub fn codex_effort() -> Option<String> {
     if let Ok(raw) = std::env::var("CCP_CODEX_EFFORT") {
         return Some(raw);
     }
-    let config_dir = config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(codex) = file.codex
-    {
-        return codex.effort;
-    }
-    None
+    codex_config().and_then(|codex| codex.effort)
 }
 
 pub fn codex_full_lane() -> bool {
     if let Ok(raw) = std::env::var("CCP_CODEX_FULL_LANE") {
         return raw == "1" || raw == "true";
     }
-    let config_dir = config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(codex) = file.codex
-    {
-        return codex.full_lane.unwrap_or(false);
-    }
-    false
+    codex_config()
+        .and_then(|codex| codex.full_lane)
+        .unwrap_or(false)
 }
 
 pub fn codex_reasoning_summary() -> Option<String> {
@@ -372,14 +315,9 @@ pub fn codex_reasoning_summary() -> Option<String> {
     {
         return Some(raw);
     }
-    let config_dir = config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(codex) = file.codex
-        && let Some(summary) = codex.reasoning_summary.filter(|raw| !raw.is_empty())
-    {
-        return Some(summary);
-    }
-    None
+    codex_config()
+        .and_then(|codex| codex.reasoning_summary)
+        .filter(|raw| !raw.is_empty())
 }
 
 /// Disable live discovery for explicitly offline/fixed-catalog operation.
@@ -391,8 +329,7 @@ pub fn codex_model_discovery() -> bool {
             _ => {}
         }
     }
-    read_file_config(&config_dir())
-        .and_then(|file| file.codex)
+    codex_config()
         .and_then(|codex| codex.model_discovery)
         .unwrap_or(true)
 }
@@ -402,24 +339,14 @@ pub fn codex_models_file() -> Option<PathBuf> {
     std::env::var_os("CCP_CODEX_MODELS_FILE")
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
-        .or_else(|| {
-            read_file_config(&config_dir())
-                .and_then(|file| file.codex)
-                .and_then(|codex| codex.models_file)
-        })
+        .or_else(|| codex_config().and_then(|codex| codex.models_file))
 }
 
 pub fn codex_model() -> Option<String> {
     if let Ok(raw) = std::env::var("CCP_CODEX_MODEL") {
         return Some(raw);
     }
-    let config_dir = config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(codex) = file.codex
-    {
-        return codex.model;
-    }
-    None
+    codex_config().and_then(|codex| codex.model)
 }
 
 pub fn auto_review_model() -> Option<String> {
@@ -475,14 +402,10 @@ pub fn codex_websocket_connect_spacing() -> std::time::Duration {
     {
         return std::time::Duration::from_millis(ms);
     }
-    let config_dir = config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(codex) = file.codex
-        && let Some(ms) = codex.websocket_connect_spacing_ms
-    {
-        return std::time::Duration::from_millis(ms);
-    }
-    std::time::Duration::ZERO
+    codex_config()
+        .and_then(|codex| codex.websocket_connect_spacing_ms)
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(std::time::Duration::ZERO)
 }
 
 pub fn codex_transport() -> CodexTransport {
@@ -491,14 +414,9 @@ pub fn codex_transport() -> CodexTransport {
     {
         return transport;
     }
-    let config_dir = config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(codex) = file.codex
-        && let Some(transport) = codex.transport.as_deref().and_then(parse_codex_transport)
-    {
-        return transport;
-    }
-    CodexTransport::Auto
+    codex_config()
+        .and_then(|codex| codex.transport.as_deref().and_then(parse_codex_transport))
+        .unwrap_or(CodexTransport::Auto)
 }
 
 /// How long an HTTP-transport request waits for the Codex response headers.
@@ -522,14 +440,8 @@ pub fn codex_header_timeout_ms() -> u64 {
     {
         return ms;
     }
-    let config_dir = config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(codex) = file.codex
-        && let Some(ms) = codex
-            .header_timeout_ms
-            .filter(|ms| *ms >= CODEX_MIN_HEADER_TIMEOUT_MS)
-    {
-        return ms;
-    }
-    CODEX_DEFAULT_HEADER_TIMEOUT_MS
+    codex_config()
+        .and_then(|codex| codex.header_timeout_ms)
+        .filter(|ms| *ms >= CODEX_MIN_HEADER_TIMEOUT_MS)
+        .unwrap_or(CODEX_DEFAULT_HEADER_TIMEOUT_MS)
 }

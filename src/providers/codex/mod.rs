@@ -60,7 +60,8 @@ use self::native::NativeResponseOutcome;
 use self::translate::accumulate::accumulate_response_and_metadata_with_traffic;
 use self::translate::live_stream::LiveStreamTranslator;
 use self::translate::model_allowlist::{
-    assert_allowed_model, resolve_model_request, uses_responses_lite, validate_hosted_web_search,
+    ResolvedModel, assert_allowed_model, resolve_model_request, uses_responses_lite,
+    validate_hosted_web_search, validate_model_configuration,
 };
 use self::translate::reducer::{
     ReducerEvent, finish_metadata_from_upstream_with_stops, reduce_upstream_bytes_with_stops,
@@ -130,30 +131,8 @@ impl CodexProvider {
             search::SearchPolicy::from_request(&incoming, conversation_identity.as_ref());
         let (resolved, mut translated, compact_boundary, use_responses_lite, model) = {
             let mut body = incoming;
-            let model = body.model.as_deref().unwrap_or("gpt-6-sol");
-            if body.model.is_some()
-                && let Err(error) = self::translate::model_allowlist::validate_model_configuration(
-                    model,
-                    !body.bypass_provider_model_override,
-                )
-            {
-                return json_error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_request_error",
-                    error.to_string(),
-                );
-            }
-
-            let resolved = resolve_model_request(model);
-            if let Err(e) = assert_allowed_model(&resolved.model) {
-                return json_error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_request_error",
-                    e.to_string(),
-                );
-            }
-            let use_responses_lite = match apply_model_lane_for_request(&resolved.model, &body) {
-                Ok(lite) => lite,
+            let (resolved, use_responses_lite) = match prepare_model_for_request(&body) {
+                Ok(prepared) => prepared,
                 Err(error) => {
                     return json_error(
                         StatusCode::BAD_REQUEST,
@@ -625,29 +604,8 @@ impl CodexProvider {
         body: MessagesRequest,
         ctx: RequestContext,
     ) -> Response {
-        let model = body.model.as_deref().unwrap_or("gpt-6-sol");
-        if body.model.is_some()
-            && let Err(error) = self::translate::model_allowlist::validate_model_configuration(
-                model,
-                !body.bypass_provider_model_override,
-            )
-        {
-            return json_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                error.to_string(),
-            );
-        }
-        let resolved = resolve_model_request(model);
-        if let Err(e) = assert_allowed_model(&resolved.model) {
-            return json_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                e.to_string(),
-            );
-        }
-        let use_responses_lite = match apply_model_lane_for_request(&resolved.model, &body) {
-            Ok(lite) => lite,
+        let (resolved, use_responses_lite) = match prepare_model_for_request(&body) {
+            Ok(prepared) => prepared,
             Err(error) => {
                 return json_error(
                     StatusCode::BAD_REQUEST,
@@ -691,12 +649,18 @@ impl CodexProvider {
 }
 
 /// Preserve the model-selected lane; Lite search is orchestrated locally.
-fn apply_model_lane_for_request(model: &str, body: &MessagesRequest) -> anyhow::Result<bool> {
-    let lite = uses_responses_lite(model);
-    if has_hosted_web_search(body) && !lite {
-        validate_hosted_web_search(model)?;
+fn prepare_model_for_request(body: &MessagesRequest) -> anyhow::Result<(ResolvedModel, bool)> {
+    let model = body.model.as_deref().unwrap_or("gpt-6-sol");
+    if body.model.is_some() {
+        validate_model_configuration(model, !body.bypass_provider_model_override)?;
     }
-    Ok(lite)
+    let resolved = resolve_model_request(model);
+    assert_allowed_model(&resolved.model).map_err(anyhow::Error::msg)?;
+    let lite = uses_responses_lite(&resolved.model);
+    if has_hosted_web_search(body) && !lite {
+        validate_hosted_web_search(&resolved.model)?;
+    }
+    Ok((resolved, lite))
 }
 
 fn count_sse_events(bytes: &[u8]) -> u64 {

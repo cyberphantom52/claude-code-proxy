@@ -5,7 +5,7 @@ use crate::providers::codex::events::{CodexFailureKind, classify_event_failure};
 
 use super::live_stream::{
     BUFFERED_TOOL_MAX_ARGS_BYTES, CompletedFunctionCallValidationError, function_call_display_name,
-    validate_completed_function_call, validate_completed_function_call_fields,
+    text_output_index, validate_completed_function_call, validate_completed_function_call_fields,
     validate_streamed_function_call,
 };
 use super::reasoning_signature::{PendingReasoning, ReasoningReplay, encode_reasoning_signature};
@@ -1530,21 +1530,7 @@ pub fn reduce_upstream_bytes_with_stops(
         } else {
             None
         };
-        let text_output_index = p
-            .get("output_index")
-            .and_then(serde_json::Value::as_u64)
-            .map(|index| index as usize)
-            .or_else(|| {
-                p["item_id"]
-                    .as_str()
-                    .or_else(|| {
-                        p.get("item")
-                            .and_then(|value| value.get("id"))
-                            .and_then(serde_json::Value::as_str)
-                    })
-                    .and_then(|id| item_id_to_output_index.get(id).copied())
-            })
-            .unwrap_or(0);
+        let text_output_index = text_output_index(&p, &item_id_to_output_index);
         if text_boundary(&p)
             && let Some(delta) = stops.flush()
         {

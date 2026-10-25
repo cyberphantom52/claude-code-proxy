@@ -195,7 +195,7 @@ impl CodexImagesBackend {
             .await
         {
             Ok(response) => response,
-            Err(error) => return image_transport_error_response(error),
+            Err(error) => return transport_error_response(error, "image"),
         };
         let status = upstream.status();
         let headers = upstream.headers().clone();
@@ -322,7 +322,10 @@ fn copy_safe_image_headers(source: &http::HeaderMap, target: &mut http::HeaderMa
     }
 }
 
-fn image_transport_error_response(error: super::client::CodexError) -> axum::response::Response {
+pub(super) fn transport_error_response(
+    error: super::client::CodexError,
+    service: &str,
+) -> axum::response::Response {
     let status = match error.status {
         value @ 400..=599 => StatusCode::from_u16(value).unwrap_or(StatusCode::BAD_GATEWAY),
         _ => StatusCode::BAD_GATEWAY,
@@ -330,9 +333,9 @@ fn image_transport_error_response(error: super::client::CodexError) -> axum::res
     let mut response = image_error_response(ImageRequestError {
         status,
         message: if error.status == 0 {
-            "Codex image service is unavailable".to_string()
+            format!("Codex {service} service is unavailable")
         } else {
-            format!("Codex image service returned HTTP {}", error.status)
+            format!("Codex {service} service returned HTTP {}", error.status)
         },
         param: None,
         code: Some(if status == StatusCode::UNAUTHORIZED {

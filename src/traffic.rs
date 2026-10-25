@@ -1,12 +1,12 @@
 use serde::Serialize;
 use serde::ser::{SerializeMap, SerializeSeq};
 use serde_json::{Map, Value};
-use std::fs::{self, File, create_dir_all};
+use std::fs::{File, create_dir_all};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::logging::REDACT_KEYS;
+use crate::logging::{REDACT_KEYS, set_mode};
 use crate::paths;
 use crate::providers::codex::translate::reasoning_signature::is_proxy_reasoning_signature;
 
@@ -336,17 +336,5 @@ fn looks_like_image_source(map: &Map<String, Value>) -> bool {
     match map.get("media_type").and_then(Value::as_str) {
         Some(media_type) => media_type.to_ascii_lowercase().starts_with("image/"),
         None => true,
-    }
-}
-
-fn set_mode(path: &Path, mode: u32) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = fs::metadata(path) {
-            let mut perm = meta.permissions();
-            perm.set_mode(mode);
-            let _ = fs::set_permissions(path, perm);
-        }
     }
 }
