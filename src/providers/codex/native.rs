@@ -907,7 +907,7 @@ fn validate_native_buffered_item(
             .get("status")
             .filter(|status| !status.is_null())
             .is_some_and(|status| {
-                status != "completed" && !(allow_incomplete && status == "incomplete")
+                status == "in_progress" || (status == "incomplete" && !allow_incomplete)
             })
     {
         return Err("native output snapshot is not finalized".into());
