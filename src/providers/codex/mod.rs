@@ -1560,11 +1560,7 @@ fn remaining_live_stream_response(
         let mut cleanup =
             LiveRequestStateCleanup::new(request_continuation.clone(), compaction.attempt);
         if tx.send(Ok(Bytes::from(first_chunk))).await.is_err() {
-            abort_request_state(
-                compaction_scope(&request_continuation).as_ref(),
-                &request_continuation,
-                compaction.attempt,
-            );
+            cleanup.abort();
             return;
         }
         let mut heartbeat = tokio::time::interval(LIVE_STREAM_HEARTBEAT_INTERVAL);
@@ -1596,11 +1592,7 @@ fn remaining_live_stream_response(
             let item = tokio::select! {
                 biased;
                 _ = tx.closed() => {
-                    abort_request_state(
-                        compaction_scope(&request_continuation).as_ref(),
-                        &request_continuation,
-                        compaction.attempt,
-                    );
+                    cleanup.abort();
                     return;
                 }
                 item = receive => item,
@@ -1612,11 +1604,7 @@ fn remaining_live_stream_response(
                     if !chunk.is_empty() {
                         record_live_stream_progress(&ctx, &chunk);
                         if tx.send(Ok(Bytes::from(chunk))).await.is_err() {
-                            abort_request_state(
-                                compaction_scope(&request_continuation).as_ref(),
-                                &request_continuation,
-                                compaction.attempt,
-                            );
+                            cleanup.abort();
                             return;
                         }
                     }
@@ -1672,11 +1660,7 @@ fn remaining_live_stream_response(
                     ) {
                         Ok(result) => result,
                         Err(message) => {
-                            abort_request_state(
-                                compaction_scope(&request_continuation).as_ref(),
-                                &request_continuation,
-                                compaction.attempt,
-                            );
+                            cleanup.abort();
                             let failure = events::classify_event_failure(&payload);
                             let error_type = failure
                                 .as_ref()
@@ -1700,11 +1684,7 @@ fn remaining_live_stream_response(
                     if !chunk.is_empty() {
                         record_live_stream_progress(&ctx, &chunk);
                         if tx.send(Ok(Bytes::from(chunk))).await.is_err() {
-                            abort_request_state(
-                                compaction_scope(&request_continuation).as_ref(),
-                                &request_continuation,
-                                compaction.attempt,
-                            );
+                            cleanup.abort();
                             return;
                         }
                     }
@@ -1738,11 +1718,7 @@ fn remaining_live_stream_response(
                         upstream_events.mark_provider_retry_handoff();
                         let chunk = translator.prepare_reconnect(ctx.traffic.as_deref());
                         if !chunk.is_empty() && tx.send(Ok(Bytes::from(chunk))).await.is_err() {
-                            abort_request_state(
-                                compaction_scope(&request_continuation).as_ref(),
-                                &request_continuation,
-                                compaction.attempt,
-                            );
+                            cleanup.abort();
                             return;
                         }
                         while reconnects < MAX_RETRYABLE_LIVE_STREAM_RETRIES
@@ -1847,11 +1823,7 @@ fn remaining_live_stream_response(
                             }
                         }
                     }
-                    abort_request_state(
-                        compaction_scope(&request_continuation).as_ref(),
-                        &request_continuation,
-                        compaction.attempt,
-                    );
+                    cleanup.abort();
                     if err.origin == client::CodexErrorOrigin::WebSocket {
                         let chunk = translator
                             .finish_after_closed_completed_tool_call(ctx.traffic.as_deref());
