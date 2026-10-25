@@ -2059,29 +2059,32 @@ where
     keepalive.tick().await;
 
     loop {
+        let message = tokio::select! {
+            biased;
+            frame = ws.next() => match frame {
+                Some(Ok(Message::Ping(payload))) => Message::Pong(payload),
+                frame => return WebSocketRead::Frame(frame),
+            },
+            _ = &mut timeout => return WebSocketRead::Timeout,
+            _ = keepalive.tick() => Message::Ping(Vec::new()),
+        };
+        // Both control writes share the read deadline and caller's cancellation guard.
+        let send = ws.send(message);
+        let send_timeout = tokio::time::sleep(WEBSOCKET_KEEPALIVE_SEND_TIMEOUT);
+        tokio::pin!(send_timeout);
         tokio::select! {
             biased;
-            frame = ws.next() => return WebSocketRead::Frame(frame),
-            _ = &mut timeout => return WebSocketRead::Timeout,
-            _ = keepalive.tick() => {
-                let send = ws.send(Message::Ping(Vec::new()));
-                let send_timeout = tokio::time::sleep(WEBSOCKET_KEEPALIVE_SEND_TIMEOUT);
-                tokio::pin!(send_timeout);
-                tokio::select! {
-                    biased;
-                    result = send => {
-                        if let Err(error) = result {
-                            return WebSocketRead::KeepaliveError(error.to_string());
-                        }
-                    }
-                    _ = &mut timeout => return WebSocketRead::Timeout,
-                    _ = &mut send_timeout => {
-                        return WebSocketRead::KeepaliveError(format!(
-                            "send timed out after {}ms",
-                            WEBSOCKET_KEEPALIVE_SEND_TIMEOUT.as_millis(),
-                        ));
-                    }
+            result = send => {
+                if let Err(error) = result {
+                    return WebSocketRead::KeepaliveError(error.to_string());
                 }
+            }
+            _ = &mut timeout => return WebSocketRead::Timeout,
+            _ = &mut send_timeout => {
+                return WebSocketRead::KeepaliveError(format!(
+                    "send timed out after {}ms",
+                    WEBSOCKET_KEEPALIVE_SEND_TIMEOUT.as_millis(),
+                ));
             }
         }
     }
@@ -2227,15 +2230,7 @@ where
                     origin: CodexErrorOrigin::WebSocket,
                 });
             }
-            Some(Ok(Message::Ping(data))) => {
-                // Respond to ping automatically, continue
-                let _ = ws.send(Message::Pong(data)).await;
-                continue;
-            }
-            Some(Ok(Message::Pong(_))) => {
-                continue;
-            }
-            Some(Ok(Message::Frame(_))) => {
+            Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => {
                 continue;
             }
             Some(Ok(Message::Close(_))) => {
@@ -2411,10 +2406,7 @@ where
                 }));
                 break;
             }
-            Some(Ok(Message::Ping(data))) => {
-                let _ = ws.send(Message::Pong(data)).await;
-            }
-            Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => {}
+            Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => {}
             Some(Ok(Message::Close(_))) | None => {
                 terminal_item = Some(Err(missing_terminal_error()));
                 break;
