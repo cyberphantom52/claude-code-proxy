@@ -526,12 +526,11 @@ pub(crate) fn resolve_effort_override(
     Ok(effort)
 }
 
-/// Whether the resolved effort asks the upstream for reasoning output.
-/// `Effort::None` still names the effort so the wire request overrides the
-/// upstream default, but it must not request a summary or encrypted
-/// continuation content, which are reasoning artifacts.
+/// Whether the resolved effort permits reasoning artifacts.
+/// An absent effort leaves the upstream default in control; explicit no-reasoning
+/// efforts must not request summaries or encrypted continuation content.
 pub(crate) fn reasoning_requested(effort: Option<&Effort>) -> bool {
-    effort.is_some_and(|effort| {
+    effort.is_none_or(|effort| {
         !matches!(effort, Effort::None)
             && !matches!(effort, Effort::Other(value) if value == "disabled")
     })
@@ -1241,16 +1240,16 @@ pub fn translate_request(
         resolved_effort != Some(Effort::None),
         "no-reasoning effort has no verified authenticated Codex model/lane contract"
     );
-    if resolved_effort.is_some() || opts.use_responses_lite {
-        let summary = if wants_reasoning && !req.omit_reasoning_artifacts {
-            model_reasoning_summary(
-                &out.model,
-                config::codex_reasoning_summary().as_deref(),
-                Some("auto"),
-            )?
-        } else {
-            None
-        };
+    let summary = if wants_reasoning && !req.omit_reasoning_artifacts {
+        model_reasoning_summary(
+            &out.model,
+            config::codex_reasoning_summary().as_deref(),
+            Some("auto"),
+        )?
+    } else {
+        None
+    };
+    if resolved_effort.is_some() || opts.use_responses_lite || summary.is_some() {
         out.reasoning = Some(ResponsesReasoning {
             effort: resolved_effort,
             summary,

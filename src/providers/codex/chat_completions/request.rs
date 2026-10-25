@@ -184,22 +184,22 @@ pub fn translate_request(mut body: Value) -> Result<TranslatedRequest, ChatError
     }
     if let Some(effort) = effort.as_ref() {
         reasoning.insert("effort".to_string(), json!(effort));
-        if reasoning_requested(Some(effort)) {
-            let summary = model_reasoning_summary(
-                &resolved.model,
-                config::codex_reasoning_summary().as_deref(),
-                None,
+    }
+    if reasoning_requested(effort.as_ref()) {
+        let summary = model_reasoning_summary(
+            &resolved.model,
+            config::codex_reasoning_summary().as_deref(),
+            None,
+        )
+        .map_err(|error| {
+            ChatError::invalid(
+                error.to_string(),
+                Some("reasoning_effort"),
+                Some("unsupported_value"),
             )
-            .map_err(|error| {
-                ChatError::invalid(
-                    error.to_string(),
-                    Some("reasoning_effort"),
-                    Some("unsupported_value"),
-                )
-            })?;
-            if let Some(summary) = summary {
-                reasoning.insert("summary".to_string(), json!(summary));
-            }
+        })?;
+        if let Some(summary) = summary {
+            reasoning.insert("summary".to_string(), json!(summary));
         }
     }
     upstream.insert("reasoning".to_string(), Value::Object(reasoning));
