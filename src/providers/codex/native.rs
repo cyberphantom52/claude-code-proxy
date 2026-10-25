@@ -470,6 +470,9 @@ fn native_response_header_allowed(name: &HeaderName) -> bool {
             | "x-codex-turn-state"
             | "openai-processing-ms"
             | "openai-version"
+            | "openai-model"
+            | "x-models-etag"
+            | "x-reasoning-included"
     ) || name.as_str().starts_with("x-ratelimit-")
 }
 
