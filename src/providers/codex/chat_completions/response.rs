@@ -1,8 +1,6 @@
 use http::StatusCode;
 use serde_json::{Value, json};
 
-use crate::anthropic::sse::sse_events;
-use crate::provider::RequestContext;
 use crate::providers::codex::events::{classify_event_failure, response_is_incomplete_terminal};
 use crate::providers::codex::translate::reducer::{CompletedOutputs, TextParts};
 
@@ -204,52 +202,7 @@ impl CompletionState {
     }
 }
 
-pub fn aggregate_sse(
-    body: &[u8],
-    requested_model: &str,
-    ctx: &RequestContext,
-    read_result: Result<(), ChatError>,
-) -> Result<Value, ChatError> {
-    if body.len() > crate::traffic::MAX_SSE_CAPTURE_BYTES {
-        return Err(ChatError::upstream(
-            "Codex response exceeded the response byte limit",
-        ));
-    }
-    let text = String::from_utf8_lossy(body);
-    let mut saw_event = false;
-    let mut error = None;
-    let mut state = CompletionState::new(requested_model, read_result.is_ok());
-    for event in sse_events(&text) {
-        saw_event = true;
-        if event.data == "[DONE]" {
-            continue;
-        }
-        match serde_json::from_str::<Value>(&event.data) {
-            Ok(value) => {
-                // Telemetry previously traversed the entire collected body before
-                // aggregation, including valid terminal usage after any error.
-                super::super::record_upstream_telemetry(ctx, &value);
-                if read_result.is_ok() && error.is_none() {
-                    error = state.observe(&value).err();
-                }
-            }
-            Err(_) if error.is_none() => {
-                error = Some(ChatError::upstream(
-                    "Codex returned malformed JSON in its event stream",
-                ));
-            }
-            Err(_) => {}
-        }
-    }
-    read_result?;
-    if let Some(error) = error {
-        return Err(error);
-    }
-    if !saw_event {
-        return Err(ChatError::upstream(
-            "Codex returned an empty or malformed event stream",
-        ));
-    }
+pub fn finish_completion(state: CompletionState) -> Result<Value, ChatError> {
     if !state.completed {
         return Err(ChatError::upstream(
             "Codex event stream ended before completion",

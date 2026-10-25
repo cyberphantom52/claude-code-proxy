@@ -63,14 +63,20 @@ impl ChatCompletionsBackend {
         }
 
         let headers = stream::response_headers(upstream.headers());
-        let (bytes, read_result) =
-            collect_body(upstream, self.client.body_idle_timeout_ms(), Some(&ctx)).await;
+        let mut completion = response::CompletionState::new(&request.model, true);
+        let (bytes, read_result) = collect_body(
+            upstream,
+            self.client.body_idle_timeout_ms(),
+            Some(&ctx),
+            Some(&mut completion),
+        )
+        .await;
         if read_result.is_ok()
             && let Some(traffic) = ctx.traffic.as_deref()
         {
             traffic.write_bytes("032-upstream-response-body.sse", &bytes);
         }
-        let completion = match response::aggregate_sse(&bytes, &request.model, &ctx, read_result) {
+        let completion = match read_result.and_then(|()| response::finish_completion(completion)) {
             Ok(completion) => completion,
             Err(error) => {
                 let mut response = error.response();
@@ -95,11 +101,14 @@ async fn collect_body(
     upstream: reqwest::Response,
     idle_timeout_ms: u64,
     ctx: Option<&RequestContext>,
+    mut completion: Option<&mut response::CompletionState>,
 ) -> (Vec<u8>, Result<(), ChatError>) {
     let mut stream = upstream.bytes_stream();
     let mut bytes = Vec::new();
+    let mut frame_start = 0;
+    let mut scan_start = 0;
     let mut started = false;
-    let result = loop {
+    let result = 'read: loop {
         match tokio::time::timeout(Duration::from_millis(idle_timeout_ms), stream.next()).await {
             Ok(Some(Ok(chunk))) => {
                 if !started {
@@ -125,6 +134,46 @@ async fn collect_body(
                         0,
                         TokenUsage::default(),
                     );
+                }
+                if let Some(completion) = completion.as_deref_mut() {
+                    while let Some((end, separator_len)) =
+                        super::native::find_sse_boundary_from(&bytes, scan_start)
+                    {
+                        let frame_end = end + separator_len;
+                        for event in
+                            crate::anthropic::sse::parse_sse_events(&bytes[frame_start..frame_end])
+                        {
+                            if event.data == "[DONE]" {
+                                continue;
+                            }
+                            let mut value: Value = match serde_json::from_str(&event.data) {
+                                Ok(value) => value,
+                                Err(_) => {
+                                    break 'read Err(ChatError::upstream(
+                                        "Codex returned malformed JSON in its event stream",
+                                    ));
+                                }
+                            };
+                            if let Some(event) = event.event
+                                && let Some(object) = value.as_object_mut()
+                            {
+                                object.entry("type").or_insert(Value::String(event));
+                            }
+                            if let Some(ctx) = ctx {
+                                super::record_upstream_telemetry(ctx, &value);
+                            }
+                            if let Err(error) = completion.observe(&value) {
+                                break 'read Err(error);
+                            }
+                            if completion.completed {
+                                bytes.truncate(frame_end);
+                                break 'read Ok(());
+                            }
+                        }
+                        frame_start = frame_end;
+                        scan_start = frame_end;
+                    }
+                    scan_start = bytes.len().saturating_sub(3).max(frame_start);
                 }
             }
             Ok(Some(Err(error))) => {
@@ -159,7 +208,7 @@ fn codex_error_response(mut error: CodexError) -> Response {
 async fn upstream_error_response(upstream: reqwest::Response, idle_timeout_ms: u64) -> Response {
     let status = upstream.status();
     let headers = stream::response_headers(upstream.headers());
-    let (bytes, read_result) = collect_body(upstream, idle_timeout_ms, None).await;
+    let (bytes, read_result) = collect_body(upstream, idle_timeout_ms, None, None).await;
     if let Err(error) = read_result {
         let mut response = error.response();
         response.headers_mut().extend(headers);
