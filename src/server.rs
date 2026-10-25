@@ -1954,7 +1954,7 @@ fn write_error_capture(req_id: &str, document: &Value) -> Option<PathBuf> {
     let path = dir.join(format!(
         "{}-{}.json",
         current_millis(),
-        sanitize_path_part(req_id)
+        crate::traffic::sanitize_path_part(req_id)
     ));
     let file = File::create(&path).ok()?;
     set_mode(&path, 0o600);
@@ -1963,24 +1963,6 @@ fn write_error_capture(req_id: &str, document: &Value) -> Option<PathBuf> {
     writer.write_all(b"\n").ok()?;
     writer.flush().ok()?;
     Some(path)
-}
-
-fn sanitize_path_part(raw: &str) -> String {
-    let sanitized: String = raw
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if sanitized.is_empty() {
-        "unknown".to_string()
-    } else {
-        sanitized
-    }
 }
 
 fn redact_error_value(value: Value) -> Value {
