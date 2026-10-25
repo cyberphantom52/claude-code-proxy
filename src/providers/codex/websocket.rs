@@ -374,16 +374,6 @@ fn invalidate_pool_entry(owner: &ConversationIdentity, entry: &Arc<PoolEntry>) {
     }
 }
 
-fn invalidate_pool_owner(owner: Option<&ConversationIdentity>, entry: Option<&Arc<PoolEntry>>) {
-    let Some(owner) = owner else {
-        return;
-    };
-    match entry {
-        Some(entry) => invalidate_pool_entry(owner, entry),
-        None => invalidate_codex_websocket_pool_owner(owner),
-    }
-}
-
 fn reservation_pool_owner(
     reservation: Option<&ContinuationReservation>,
 ) -> Option<&ConversationIdentity> {
@@ -903,15 +893,8 @@ pub(super) async fn codex_websocket_request(
             }
         })?;
 
-    let collected = collect_ws_events(
-        &mut guard,
-        idle_timeout_ms,
-        pool_owner,
-        Some(&entry),
-        traffic,
-        safe_http_fallback,
-    )
-    .await;
+    let collected =
+        collect_ws_events(&mut guard, idle_timeout_ms, traffic, safe_http_fallback).await;
     drop(guard);
     let (sse_body, terminal_event) = match collected {
         Ok(result) => result,
@@ -2131,8 +2114,6 @@ struct WsEvent {
 async fn collect_ws_events<S>(
     ws: &mut WebSocketStream<S>,
     idle_timeout_ms: u64,
-    pool_owner: Option<&ConversationIdentity>,
-    pool_entry: Option<&Arc<PoolEntry>>,
     traffic: Option<&TrafficCapture>,
     safe_http_fallback: &mut bool,
 ) -> Result<(Vec<u8>, Option<WsEvent>), CodexError>
@@ -2142,21 +2123,14 @@ where
     let mut sse_body: Vec<u8> = Vec::new();
     let mut terminal_event: Option<WsEvent> = None;
     let response_event_budget = Duration::from_millis(idle_timeout_ms);
-    let response_wait_started = Instant::now();
-    let mut last_response_event_at = response_wait_started;
+    let mut last_response_event_at = Instant::now();
     let mut response_started = false;
 
     loop {
-        let response_deadline_started = if response_started {
-            last_response_event_at
-        } else {
-            response_wait_started
-        };
         let read_timeout = if response_started {
-            match response_event_budget.checked_sub(response_deadline_started.elapsed()) {
+            match response_event_budget.checked_sub(last_response_event_at.elapsed()) {
                 Some(remaining) if !remaining.is_zero() => remaining,
                 _ => {
-                    invalidate_pool_owner(pool_owner, pool_entry);
                     return Err(CodexError {
                         status: 0,
                         message: format!("WebSocket idle timeout after {idle_timeout_ms}ms"),
@@ -2168,10 +2142,9 @@ where
                 }
             }
         } else {
-            match response_event_budget.checked_sub(response_deadline_started.elapsed()) {
+            match response_event_budget.checked_sub(last_response_event_at.elapsed()) {
                 Some(remaining) if !remaining.is_zero() => remaining,
                 _ => {
-                    invalidate_pool_owner(pool_owner, pool_entry);
                     return Err(response_start_timeout_error(idle_timeout_ms));
                 }
             }
@@ -2180,7 +2153,6 @@ where
         let frame = match read_ws_frame_with_keepalive(ws, read_timeout).await {
             WebSocketRead::Frame(frame) => frame,
             WebSocketRead::Timeout => {
-                invalidate_pool_owner(pool_owner, pool_entry);
                 return Err(if response_started {
                     CodexError {
                         status: 0,
@@ -2195,7 +2167,6 @@ where
                 });
             }
             WebSocketRead::KeepaliveError(error) => {
-                invalidate_pool_owner(pool_owner, pool_entry);
                 return Err(CodexError {
                     status: 0,
                     message: format!("WebSocket keepalive error: {error}"),
@@ -2268,7 +2239,6 @@ where
             }
             Some(Ok(Message::Binary(_))) => {
                 // Reject binary frames
-                invalidate_pool_owner(pool_owner, pool_entry);
                 return Err(CodexError {
                     status: 0,
                     message: "WebSocket binary frames not supported".to_string(),
@@ -2282,13 +2252,11 @@ where
                 continue;
             }
             Some(Ok(Message::Close(_))) => {
-                // Connection closed - invalidate pool
-                invalidate_pool_owner(pool_owner, pool_entry);
+                // Connection closed
                 break;
             }
             Some(Err(e)) => {
-                // Stream error - invalidate pool
-                invalidate_pool_owner(pool_owner, pool_entry);
+                // Stream error
                 return Err(CodexError {
                     status: 0,
                     message: format!("WebSocket stream error: {e}"),
@@ -2299,8 +2267,7 @@ where
                 });
             }
             None => {
-                // Stream ended - invalidate pool
-                invalidate_pool_owner(pool_owner, pool_entry);
+                // Stream ended
                 break;
             }
         }
@@ -2321,38 +2288,32 @@ where
     let started_at = Instant::now();
     let mut sse_body = traffic.as_ref().map(|_| Vec::new());
     let response_event_budget = Duration::from_millis(idle_timeout_ms);
-    let response_wait_started = Instant::now();
-    let mut last_response_event_at = response_wait_started;
+    let mut last_response_event_at = Instant::now();
     let mut response_started = false;
     let mut status = 200u16;
     let mut reusable = false;
     let mut terminal_item = None;
 
     loop {
-        let response_deadline_started = if response_started {
-            last_response_event_at
-        } else {
-            response_wait_started
+        let read_timeout = match response_event_budget.checked_sub(last_response_event_at.elapsed())
+        {
+            Some(remaining) if !remaining.is_zero() => remaining,
+            _ => {
+                terminal_item = Some(Err(if response_started {
+                    CodexError {
+                        status: 0,
+                        message: format!("WebSocket idle timeout after {idle_timeout_ms}ms"),
+                        detail: None,
+                        retry_after: None,
+                        usage_limit: None,
+                        origin: CodexErrorOrigin::WebSocket,
+                    }
+                } else {
+                    response_start_timeout_error(idle_timeout_ms)
+                }));
+                break;
+            }
         };
-        let read_timeout =
-            match response_event_budget.checked_sub(response_deadline_started.elapsed()) {
-                Some(remaining) if !remaining.is_zero() => remaining,
-                _ => {
-                    terminal_item = Some(Err(if response_started {
-                        CodexError {
-                            status: 0,
-                            message: format!("WebSocket idle timeout after {idle_timeout_ms}ms"),
-                            detail: None,
-                            retry_after: None,
-                            usage_limit: None,
-                            origin: CodexErrorOrigin::WebSocket,
-                        }
-                    } else {
-                        response_start_timeout_error(idle_timeout_ms)
-                    }));
-                    break;
-                }
-            };
 
         let frame = tokio::select! {
             biased;
