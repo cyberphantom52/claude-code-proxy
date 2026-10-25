@@ -1346,34 +1346,10 @@ async fn live_stream_response_once(
                 empty_live_completion_error(),
             );
         }
-        if translator.has_semantic_output() && !pending_chunk.is_empty() {
+        let ready = translator.has_semantic_output() && !pending_chunk.is_empty();
+        if ready {
             record_live_stream_downstream_capture(&ctx, &pending_chunk);
             record_live_stream_progress(&ctx, &pending_chunk);
-            if terminal {
-                log_live_stream_completion(&ctx, &upstream_events, &request_continuation);
-                update_continuation_from_upstream(
-                    compaction_scope(&request_continuation).as_ref(),
-                    &request_continuation,
-                    compaction.attempt,
-                    &request_body,
-                    upstream_sse_body.as_deref().unwrap_or_default(),
-                    upstream_events.socket_id(),
-                    upstream_events.provenance().as_ref(),
-                    compaction.compact_boundary,
-                );
-                return LiveStreamStart::Response(single_live_stream_response(pending_chunk));
-            }
-            return LiveStreamStart::Response(remaining_live_stream_response(
-                reconnect,
-                upstream_events,
-                translator,
-                pending_chunk,
-                ctx,
-                request_continuation,
-                request_body,
-                upstream_sse_body,
-                compaction,
-            ));
         }
         if terminal {
             log_live_stream_completion(&ctx, &upstream_events, &request_continuation);
@@ -1390,9 +1366,24 @@ async fn live_stream_response_once(
             if pending_chunk.is_empty() {
                 return LiveStreamStart::Response(empty_live_stream_response());
             }
-            record_live_stream_downstream_capture(&ctx, &pending_chunk);
-            record_live_stream_progress(&ctx, &pending_chunk);
+            if !ready {
+                record_live_stream_downstream_capture(&ctx, &pending_chunk);
+                record_live_stream_progress(&ctx, &pending_chunk);
+            }
             return LiveStreamStart::Response(single_live_stream_response(pending_chunk));
+        }
+        if ready {
+            return LiveStreamStart::Response(remaining_live_stream_response(
+                reconnect,
+                upstream_events,
+                translator,
+                pending_chunk,
+                ctx,
+                request_continuation,
+                request_body,
+                upstream_sse_body,
+                compaction,
+            ));
         }
     }
 
