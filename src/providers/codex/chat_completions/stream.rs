@@ -29,6 +29,7 @@ pub fn streaming_response(
         upstream: Box::pin(upstream.bytes_stream()),
         pending: BytesMut::new(),
         pending_scan: 0,
+        sse_at_start: true,
         received_bytes: 0,
         output: VecDeque::new(),
         completion: CompletionState::new(&model, false),
@@ -130,6 +131,7 @@ struct StreamState {
     upstream: UpstreamStream,
     pending: BytesMut,
     pending_scan: usize,
+    sse_at_start: bool,
     received_bytes: usize,
     output: VecDeque<Bytes>,
     completion: CompletionState,
@@ -183,7 +185,10 @@ impl StreamState {
         self.pending_scan = 0;
         let mut event_count = 0;
         let text = String::from_utf8_lossy(&frame);
-        for event in crate::anthropic::sse::sse_events(&text) {
+        for event in crate::anthropic::sse::sse_events_from(
+            &text,
+            std::mem::replace(&mut self.sse_at_start, false),
+        ) {
             event_count += 1;
             self.observe_event(&event.data);
             if self.ended {

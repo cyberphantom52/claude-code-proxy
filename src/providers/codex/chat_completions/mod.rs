@@ -149,9 +149,10 @@ async fn collect_body(
                         super::native::find_sse_boundary_from(&bytes, scan_start)
                     {
                         let frame_end = end + separator_len;
-                        for event in
-                            crate::anthropic::sse::parse_sse_events(&bytes[frame_start..frame_end])
-                        {
+                        for event in crate::anthropic::sse::parse_sse_events_from(
+                            &bytes[frame_start..frame_end],
+                            frame_start == 0,
+                        ) {
                             if event.data == "[DONE]" {
                                 continue;
                             }

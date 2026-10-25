@@ -9,8 +9,12 @@ pub struct SseEvent {
 }
 
 pub fn parse_sse_events(input: &[u8]) -> Vec<SseEvent> {
+    parse_sse_events_from(input, true)
+}
+
+pub(crate) fn parse_sse_events_from(input: &[u8], stream_start: bool) -> Vec<SseEvent> {
     let text = String::from_utf8_lossy(input);
-    sse_events(&text)
+    sse_events_from(&text, stream_start)
         .map(|event| SseEvent {
             event: event.event.map(str::to_owned),
             data: event.data.into_owned(),
@@ -23,7 +27,17 @@ pub(crate) struct BorrowedSseEvent<'a> {
     pub data: Cow<'a, str>,
 }
 
-pub(crate) fn sse_events(mut text: &str) -> impl Iterator<Item = BorrowedSseEvent<'_>> {
+pub(crate) fn sse_events(text: &str) -> impl Iterator<Item = BorrowedSseEvent<'_>> {
+    sse_events_from(text, true)
+}
+
+pub(crate) fn sse_events_from(
+    mut text: &str,
+    stream_start: bool,
+) -> impl Iterator<Item = BorrowedSseEvent<'_>> {
+    if stream_start {
+        text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    }
     let mut event = None;
     let mut data: Option<Cow<'_, str>> = None;
     std::iter::from_fn(move || {

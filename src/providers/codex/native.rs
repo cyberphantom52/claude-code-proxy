@@ -12,7 +12,7 @@ use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use crate::anthropic::sse::parse_sse_events;
+use crate::anthropic::sse::parse_sse_events_from;
 use crate::monitor::TokenUsage;
 use crate::provider::RequestContext;
 use crate::traffic::{
@@ -962,6 +962,7 @@ struct NativeResponseObserver {
     raw_truncated: u64,
     pending: Vec<u8>,
     pending_scan: usize,
+    sse_at_start: bool,
     discarding_oversized_frame: bool,
     pending_truncated: bool,
     captured_events: Vec<Value>,
@@ -993,6 +994,7 @@ impl NativeResponseObserver {
             raw_truncated: 0,
             pending: Vec::new(),
             pending_scan: 0,
+            sse_at_start: true,
             discarding_oversized_frame: false,
             pending_truncated: false,
             captured_events: Vec::new(),
@@ -1021,10 +1023,11 @@ impl NativeResponseObserver {
             // keep their normal inspection rather than being mistaken for SSE.
             let bom = b"\xef\xbb\xbf";
             let partial_bom = !self.pending.is_empty() && bom.starts_with(&self.pending);
-            if self.pending.starts_with(bom) {
-                self.pending.drain(..bom.len());
-            }
-            let prefix = self.pending.trim_ascii_start();
+            let prefix = self
+                .pending
+                .strip_prefix(bom)
+                .unwrap_or(&self.pending)
+                .trim_ascii_start();
             let fields: [&[u8]; 5] = [b"data:", b"event:", b":", b"id:", b"retry:"];
             if fields.iter().any(|field| prefix.starts_with(field)) {
                 self.is_sse = true;
@@ -1078,7 +1081,10 @@ impl NativeResponseObserver {
             find_sse_boundary_from(&self.pending, self.pending_scan)
         {
             let end = relative_end + separator_len;
-            parsed.extend(parse_sse_events(&self.pending[consumed..end]));
+            parsed.extend(parse_sse_events_from(
+                &self.pending[consumed..end],
+                std::mem::replace(&mut self.sse_at_start, false),
+            ));
             consumed = end;
             self.pending_scan = consumed;
         }
@@ -1118,6 +1124,7 @@ impl NativeResponseObserver {
 
         if !self.buffer_terminal && self.pending.len() > MAX_STREAM_CAPTURE_FRAME_BYTES {
             self.pending_truncated = true;
+            self.sse_at_start = false;
             self.discarding_oversized_frame = true;
             retain_boundary_prefix(&mut self.pending);
             self.pending_scan = 0;
