@@ -257,9 +257,13 @@ static WEBSOCKET_TLS_CONFIG: LazyLock<Arc<rustls::ClientConfig>> = LazyLock::new
     }
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     Arc::new(
-        rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
+        rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("ring supports the default TLS protocol versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth(),
     )
 });
 
@@ -885,7 +889,7 @@ pub(super) async fn codex_websocket_request(
         used_pooled = false;
     }
 
-    send_ws_message(&mut guard, Message::Text(body_json), idle_timeout_ms)
+    send_ws_message(&mut guard, Message::Text(body_json.into()), idle_timeout_ms)
         .await
         .inspect_err(|_| {
             if let Some(owner) = pool_owner {
@@ -988,7 +992,7 @@ where
         .to_vec();
     tokio::time::timeout(Duration::from_millis(timeout_ms), async {
         websocket
-            .send(Message::Ping(nonce.clone()))
+            .send(Message::Ping(nonce.clone().into()))
             .await
             .map_err(|error| error.to_string())?;
         loop {
@@ -1138,7 +1142,7 @@ pub(super) fn start_codex_websocket_events(
         let sent = tokio::select! {
             biased;
             _ = tx.closed() => None,
-            result = send_ws_message(&mut guard, Message::Text(body_json), idle_timeout_ms) => Some(result),
+            result = send_ws_message(&mut guard, Message::Text(body_json.into()), idle_timeout_ms) => Some(result),
         };
         if !matches!(sent, Some(Ok(()))) {
             drop(guard);
@@ -1878,11 +1882,9 @@ async fn connect_via_http_proxy_tunnel(
 }
 
 fn websocket_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
-    tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
-        max_message_size: Some(super::client::MAX_HTTP_SSE_FRAME_BYTES),
-        max_frame_size: Some(super::client::MAX_HTTP_SSE_FRAME_BYTES),
-        ..Default::default()
-    }
+    tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(super::client::MAX_HTTP_SSE_FRAME_BYTES))
+        .max_frame_size(Some(super::client::MAX_HTTP_SSE_FRAME_BYTES))
 }
 
 async fn connect_via_http_upgrade(
@@ -2053,7 +2055,7 @@ where
                 frame => return WebSocketRead::Frame(frame),
             },
             _ = &mut timeout => return WebSocketRead::Timeout,
-            _ = keepalive.tick() => Message::Ping(Vec::new()),
+            _ = keepalive.tick() => Message::Ping(bytes::Bytes::new()),
         };
         let control_frame = if matches!(&message, Message::Pong(_)) {
             "pong"
@@ -2191,7 +2193,7 @@ where
                                 "040-upstream-event",
                                 &serde_json::json!({
                                     "unparseable": true,
-                                    "data": text,
+                                    "data": text.as_str(),
                                 }),
                             );
                         }
@@ -2369,7 +2371,7 @@ where
                                 "040-upstream-event",
                                 &serde_json::json!({
                                     "unparseable": true,
-                                    "data": text,
+                                    "data": text.as_str(),
                                 }),
                             );
                         }

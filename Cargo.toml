@@ -8,32 +8,32 @@ license = "MIT"
 publish = false
 
 [dependencies]
-clap = { version = "4.5", features = ["derive"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-anyhow = "1.0"
-axum = { version = "0.8", features = ["multipart"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time", "fs"] }
-http = "1"
-http-body-util = "0.1"
-bytes = "1"
-futures-util = "0.3"
-async-trait = "0.1"
-uuid = { version = "1", features = ["v4"] }
-time = { version = "0.3", features = ["formatting", "parsing"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "multipart", "rustls-tls", "rustls-tls-native-roots", "blocking", "http2", "socks"] }
-base64 = "0.22"
-rand = "0.8"
-sha2 = "0.10"
-regex-lite = "0.1"
-tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-rustls-native-certs = "0.8"
-webpki-roots = "1"
-hyper-util = { version = "0.1", features = ["client-proxy"] }
-url = "2"
-ratatui = "0.29"
-crossterm = "0.28"
-jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
-tiktoken-rs = { version = "0.12", default-features = false }
+clap = { version = "4.6.7", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+anyhow = "1.0.104"
+axum = { version = "0.8.9", features = ["multipart"] }
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "net", "signal", "time", "fs"] }
+http = "1.5.0"
+http-body-util = "0.1.5"
+bytes = "1.12.1"
+futures-util = "0.3.34"
+async-trait = "0.1.92"
+uuid = { version = "1.29.0", features = ["v4"] }
+time = { version = "0.3.55", features = ["formatting", "parsing"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "stream", "multipart", "form", "rustls-no-provider", "blocking", "http2", "socks"] }
+base64 = "0.23.1"
+rand = "0.10.3"
+sha2 = "0.11.1"
+regex-lite = "0.1.9"
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
+rustls-native-certs = "0.8.5"
+webpki-roots = "1.0.11"
+hyper-util = { version = "0.1.21", features = ["client-proxy"] }
+url = "2.5.8"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29", "layout-cache", "underline-color"] }
+crossterm = "0.29.0"
+jiff = { version = "0.2.38", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
+tiktoken-rs = { version = "0.12.1", default-features = false }

@@ -663,10 +663,17 @@ impl ProxyEnvironment {
     }
 }
 
+pub fn http_tls_config() -> rustls::ClientConfig {
+    let mut config = (*super::websocket::websocket_tls_config()).clone();
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    config
+}
+
 fn native_http_client(proxy_environment: &ProxyEnvironment) -> reqwest::Client {
     proxy_environment
         .apply(
             reqwest::Client::builder()
+                .tls_backend_preconfigured(http_tls_config())
                 .connect_timeout(Duration::from_secs(15))
                 .redirect(reqwest::redirect::Policy::none()),
         )
@@ -715,7 +722,7 @@ fn websocket_http_client(proxy_environment: &ProxyEnvironment) -> reqwest::Clien
             reqwest::Client::builder()
                 .http1_only()
                 .redirect(reqwest::redirect::Policy::none())
-                .use_preconfigured_tls((*tls_config).clone()),
+                .tls_backend_preconfigured((*tls_config).clone()),
         )
         .build()
         .expect("failed to create Codex WebSocket HTTP client")
@@ -745,7 +752,11 @@ impl CodexHttpClient {
         let proxy_environment = ProxyEnvironment::from_env();
         Self {
             client: proxy_environment
-                .apply(reqwest::Client::builder().connect_timeout(Duration::from_secs(15)))
+                .apply(
+                    reqwest::Client::builder()
+                        .tls_backend_preconfigured(http_tls_config())
+                        .connect_timeout(Duration::from_secs(15)),
+                )
                 .build()
                 .expect("failed to create HTTP client"),
             native_client: native_http_client(&proxy_environment),

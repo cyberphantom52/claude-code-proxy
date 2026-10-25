@@ -46,6 +46,7 @@ impl DeviceAuthClient {
         Self {
             issuer: issuer.into(),
             client: reqwest::blocking::Client::builder()
+                .tls_backend_preconfigured(super::super::client::http_tls_config())
                 .timeout(Duration::from_secs(30))
                 .build()
                 .expect("failed to create device OAuth client"),

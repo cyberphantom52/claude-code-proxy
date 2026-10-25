@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
+use std::fmt::Write as _;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -256,7 +257,12 @@ impl SearchPolicy {
                 digest.update((value.len() as u64).to_be_bytes());
                 digest.update(value.as_bytes());
             }
-            format!("search-{:x}", digest.finalize())
+            let mut id = String::with_capacity(71);
+            id.push_str("search-");
+            for byte in digest.finalize() {
+                write!(&mut id, "{byte:02x}").expect("writing to String cannot fail");
+            }
+            id
         } else {
             base
         };

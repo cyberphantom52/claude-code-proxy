@@ -1,4 +1,3 @@
-use rand::Rng;
 use std::time::Duration;
 use time::{OffsetDateTime, PrimitiveDateTime, parsing::Parsed};
 
@@ -40,7 +39,7 @@ pub fn compute_backoff_delay(attempt: u32, retry_after: Option<&str>) -> Backoff
         .saturating_mul(RETRY_BACKOFF_FACTOR.saturating_pow(attempt))
         .min(RETRY_MAX_DELAY_MS);
     BackoffOutcome {
-        wait_ms: rand::thread_rng().gen_range(exp / 2..=exp),
+        wait_ms: rand::random_range(exp / 2..=exp),
         exceeds_budget: false,
     }
 }

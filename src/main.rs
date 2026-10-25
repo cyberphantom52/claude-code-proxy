@@ -156,6 +156,9 @@ fn main() -> Result<()> {
                 .enable_all()
                 .build()?;
             let client = reqwest::Client::builder()
+                .tls_backend_preconfigured(
+                    claude_code_proxy::providers::codex::client::http_tls_config(),
+                )
                 .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(std::time::Duration::from_secs(2))

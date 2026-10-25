@@ -23,7 +23,7 @@ fn base64_url_encode(bytes: &[u8]) -> String {
 
 pub fn generate_pkce() -> PkceCodes {
     let mut verifier_bytes = [0u8; 32];
-    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut verifier_bytes);
+    rand::fill(&mut verifier_bytes);
     let verifier = base64_url_encode(&verifier_bytes);
 
     let hash = Sha256::digest(verifier.as_bytes());
@@ -37,7 +37,7 @@ pub fn generate_pkce() -> PkceCodes {
 
 pub fn generate_state() -> String {
     let mut state_bytes = [0u8; 32];
-    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut state_bytes);
+    rand::fill(&mut state_bytes);
     base64_url_encode(&state_bytes)
 }
 
@@ -82,6 +82,7 @@ pub(super) fn exchange_code_for_tokens_until(
         .filter(|duration| !duration.is_zero())
         .ok_or_else(|| anyhow::anyhow!("OAuth timeout"))?;
     let client = reqwest::blocking::Client::builder()
+        .tls_backend_preconfigured(super::super::client::http_tls_config())
         .timeout(remaining.min(std::time::Duration::from_secs(30)))
         .build()?;
     let form = [

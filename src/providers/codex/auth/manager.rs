@@ -19,6 +19,7 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
         Self {
             store,
             refresh_client: reqwest::Client::builder()
+                .tls_backend_preconfigured(super::super::client::http_tls_config())
                 .connect_timeout(Duration::from_secs(15))
                 .timeout(Duration::from_secs(30))
                 .build()
