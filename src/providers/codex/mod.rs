@@ -1019,6 +1019,10 @@ async fn live_stream_response(
                 safe_http_fallback: retry_safe,
             } => {
                 safe_http_fallback &= retry_safe;
+                if !safe_http_fallback {
+                    cleanup.abort();
+                    return exhausted_recovery_response(&ctx, attempt, &error);
+                }
                 if error.detail.as_deref() == Some("operation_provenance_changed")
                     && compaction.portable_request.is_some()
                     && !threads::replaying()
@@ -1242,7 +1246,7 @@ async fn live_stream_response_once(
                 return LiveStreamStart::Response(map_codex_error_to_response(&err));
             }
         };
-        reconnect.safe_http_fallback &= !hosted_search_progress(&payload);
+        reconnect.safe_http_fallback &= !codex_event_blocks_replay(&payload);
         if !generation_started && codex_generation_event(&payload) {
             if let Some(monitor) = ctx.monitor.as_ref() {
                 monitor.generation_started(&ctx.req_id);
@@ -1336,7 +1340,11 @@ async fn live_stream_response_once(
                     ),
                 ])),
             );
-            return provider_retry(&upstream_events, false, empty_live_completion_error());
+            return provider_retry(
+                &upstream_events,
+                reconnect.safe_http_fallback,
+                empty_live_completion_error(),
+            );
         }
         if translator.has_semantic_output() && !pending_chunk.is_empty() {
             record_live_stream_downstream_capture(&ctx, &pending_chunk);
@@ -1413,15 +1421,33 @@ fn empty_live_completion_error() -> client::CodexError {
     }
 }
 
-fn hosted_search_progress(payload: &serde_json::Value) -> bool {
+fn codex_event_blocks_replay(payload: &serde_json::Value) -> bool {
+    let event_type = payload.get("type").and_then(serde_json::Value::as_str);
     matches!(
-        payload.get("type").and_then(serde_json::Value::as_str),
+        event_type,
         Some(
             "response.web_search_call.in_progress"
                 | "response.web_search_call.searching"
                 | "response.web_search_call.completed"
         )
-    )
+    ) || (matches!(
+        event_type,
+        Some("response.output_item.added" | "response.output_item.done")
+    ) && payload
+        .get("item")
+        .and_then(|item| item.get("type"))
+        .and_then(serde_json::Value::as_str)
+        != Some("reasoning"))
+        || [payload.pointer("/response/output"), payload.get("output")]
+            .into_iter()
+            .flatten()
+            .any(|output| {
+                output.as_array().is_none_or(|items| {
+                    items.iter().any(|item| {
+                        item.get("type").and_then(serde_json::Value::as_str) != Some("reasoning")
+                    })
+                })
+            })
 }
 
 fn codex_generation_event(payload: &serde_json::Value) -> bool {
@@ -1602,6 +1628,9 @@ fn remaining_live_stream_response(
                     "WebSocket connection closed before terminal response",
                 ))
             });
+            if let Ok(payload) = &item {
+                safe_http_fallback &= !codex_event_blocks_replay(payload);
+            }
             let item = match item {
                 Ok(payload)
                     if transport != config::CodexTransport::Http && translator.can_reconnect() =>
@@ -1620,7 +1649,6 @@ fn remaining_live_stream_response(
             };
             match item {
                 Ok(payload) => {
-                    safe_http_fallback &= !hosted_search_progress(&payload);
                     if restored_pending {
                         recovery::notify(
                             &ctx,
@@ -1700,6 +1728,7 @@ fn remaining_live_stream_response(
                     if transport != config::CodexTransport::Http
                         && err.origin == client::CodexErrorOrigin::WebSocket
                         && retryable_live_start_codex_error(&err)
+                        && safe_http_fallback
                         && translator.can_reconnect()
                     {
                         let fallback_allowed =

@@ -2400,6 +2400,17 @@ impl CodexHttpClient {
                     super::record_upstream_telemetry(&ctx, payload);
                 }
 
+                // Preserve real native-output evidence before any recovery decision
+                // or terminal failure can discard pending structural events.
+                if item.as_ref().is_ok_and(super::codex_event_blocks_replay) {
+                    for pending in pending_events.take() {
+                        if tx.send(Ok(pending)).await.is_err() {
+                            return;
+                        }
+                    }
+                    forwarded_any = true;
+                }
+
                 let unauthorized = match &item {
                     Err(err) => err.status == 401,
                     Ok(payload) => super::websocket::event_error_status(payload) == Some(401),
