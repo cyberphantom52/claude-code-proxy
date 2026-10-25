@@ -19,13 +19,18 @@ use http::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::Value;
 
 /// Header suffixes that carry a window's numbers.
-const WINDOW_SUFFIXES: [&str; 6] = [
+const WINDOW_SUFFIXES: [&str; 5] = [
     "-used-percent",
     "-window-minutes",
     "-reset-at",
     "-reset-after-seconds",
-    "-limit-name",
     "-over-secondary-limit-percent",
+];
+
+const CREDIT_HEADERS: [&str; 3] = [
+    "x-codex-credits-has-credits",
+    "x-codex-credits-unlimited",
+    "x-codex-credits-balance",
 ];
 
 /// Whole header names that describe the subscription rather than a window.
@@ -66,10 +71,8 @@ fn is_quota_header(name: &str) -> bool {
         return false;
     }
     PLAN_HEADERS.contains(&name)
-        || matches!(
-            name,
-            "x-codex-credits-has-credits" | "x-codex-credits-unlimited" | "x-codex-credits-balance"
-        )
+        || CREDIT_HEADERS.contains(&name)
+        || name.ends_with("-limit-name")
         || WINDOW_SUFFIXES.iter().any(|suffix| name.ends_with(suffix))
 }
 
@@ -202,17 +205,20 @@ pub fn record(update: impl Into<Update>) {
                 } => {
                     let has_credits = headers
                         .iter()
-                        .any(|(name, _)| name.as_str().starts_with("x-codex-credits-"));
+                        .any(|(name, _)| CREDIT_HEADERS.contains(&name.as_str()));
                     let has_plan = headers.iter().any(|(name, _)| name == "x-codex-plan-type");
                     snapshot.retain(|(name, _)| {
                         let name = name.as_str();
                         let family_window = name.strip_prefix(&prefix).is_some_and(|suffix| {
-                            suffix.starts_with("-primary-")
-                                || suffix.starts_with("-secondary-")
-                                || suffix == "-limit-name"
+                            suffix == "-limit-name"
+                                || ["-primary", "-secondary"].iter().any(|window| {
+                                    suffix
+                                        .strip_prefix(window)
+                                        .is_some_and(|suffix| WINDOW_SUFFIXES.contains(&suffix))
+                                })
                         });
                         !family_window
-                            && !(has_credits && name.starts_with("x-codex-credits-"))
+                            && !(has_credits && CREDIT_HEADERS.contains(&name))
                             && !(has_plan && name == "x-codex-plan-type")
                     });
                     snapshot.extend(headers);
