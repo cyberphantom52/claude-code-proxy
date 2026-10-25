@@ -423,6 +423,7 @@ pub(crate) fn settle(
         role: "assistant".into(),
         content: content.clone(),
         output_config: None,
+        clear_at: None,
     });
     let bytes = size(&portable)
         .saturating_add(size(&request.input))

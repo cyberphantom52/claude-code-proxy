@@ -30,14 +30,20 @@ pub struct Message {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_present_output_config"
+        deserialize_with = "deserialize_present_value"
     )]
     pub output_config: Option<serde_json::Value>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_value"
+    )]
+    pub clear_at: Option<serde_json::Value>,
 }
 
 // Retain explicit null too: every supplied per-message control must reach the
 // capability validator instead of silently becoming an absent field.
-fn deserialize_present_output_config<'de, D>(
+fn deserialize_present_value<'de, D>(
     deserializer: D,
 ) -> Result<Option<serde_json::Value>, D::Error>
 where

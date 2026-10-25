@@ -780,6 +780,12 @@ pub fn validate_messages_capabilities(req: &MessagesRequest) -> anyhow::Result<(
         }
     }
     for (message_index, message) in req.messages.iter().enumerate() {
+        // Retire the client's unsupported kept-reminder representation instead
+        // of turning an expiring reminder into a persistent developer message.
+        anyhow::ensure!(
+            message.clear_at.is_none(),
+            "messages.{message_index}.clear_at: Extra inputs are not permitted"
+        );
         // Claude Code recognizes this rejection and retries without per-turn
         // effort/timing; never silently reinterpret them as request controls.
         anyhow::ensure!(
@@ -895,6 +901,10 @@ pub fn validate_messages_capabilities(req: &MessagesRequest) -> anyhow::Result<(
     }
     if let Some(output) = req.extra.get("output_config") {
         anyhow::ensure!(output.is_object(), "output_config must be an object");
+        anyhow::ensure!(
+            output.get("task_budget").is_none(),
+            "output_config.task_budget enforcement has no verified Codex contract; omit this control"
+        );
         if let Some(effort) = output.get("effort") {
             let effort = effort
                 .as_str()
