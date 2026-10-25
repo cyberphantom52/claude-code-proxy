@@ -126,24 +126,60 @@ impl SystemKeychain {
     }
 }
 
-struct FileAuthStore<T>
+#[derive(serde::Serialize, serde::Deserialize)]
+struct AuthRevision {
+    revision: String,
+    cleared: bool,
+}
+
+impl AuthRevision {
+    fn next() -> Self {
+        Self {
+            revision: uuid::Uuid::new_v4().to_string(),
+            cleared: true,
+        }
+    }
+}
+
+fn snapshot_matches<T: Serialize>(
+    snapshot: &AuthSnapshot<T>,
+    revision: &str,
+    value: &Option<T>,
+) -> Result<bool> {
+    Ok(snapshot.revision == revision
+        && serde_json::to_value(&snapshot.value)? == serde_json::to_value(value)?)
+}
+
+pub struct KeychainFileAuthStore<T>
 where
     T: Serialize + DeserializeOwned + Send + Sync + Clone,
 {
     file: String,
     legacy_file: String,
     _marker: std::marker::PhantomData<T>,
+    service: String,
+    account: String,
+    use_keychain: bool,
 }
 
-impl<T> FileAuthStore<T>
+impl<T> KeychainFileAuthStore<T>
 where
     T: Serialize + DeserializeOwned + Send + Sync + Clone,
 {
-    pub fn new(file: String, legacy_file: String) -> Self {
+    pub fn new(
+        file: String,
+        legacy_file: String,
+        service: impl Into<String>,
+        account: impl Into<String>,
+        use_keychain: bool,
+    ) -> Self {
         Self {
             file,
             legacy_file,
             _marker: Default::default(),
+            service: service.into(),
+            account: account.into(),
+            use_keychain,
         }
     }
 
@@ -188,76 +224,9 @@ where
         if self.revision()?.cleared {
             return Ok(None);
         }
-        Ok(load_auth_file::<T>(&self.file).or_else(|| load_auth_file::<T>(&self.legacy_file)))
-    }
-
-    fn clear_unlocked(&self) -> Result<()> {
-        delete_auth_file(
-            std::path::Path::new(&self.file),
-            std::path::Path::new(&self.legacy_file),
-        )?;
-        Ok(())
-    }
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct AuthRevision {
-    revision: String,
-    cleared: bool,
-}
-
-impl AuthRevision {
-    fn next() -> Self {
-        Self {
-            revision: uuid::Uuid::new_v4().to_string(),
-            cleared: true,
-        }
-    }
-}
-
-fn snapshot_matches<T: Serialize>(
-    snapshot: &AuthSnapshot<T>,
-    revision: &str,
-    value: &Option<T>,
-) -> Result<bool> {
-    Ok(snapshot.revision == revision
-        && serde_json::to_value(&snapshot.value)? == serde_json::to_value(value)?)
-}
-
-pub struct KeychainFileAuthStore<T>
-where
-    T: Serialize + DeserializeOwned + Send + Sync + Clone,
-{
-    file_store: FileAuthStore<T>,
-    service: String,
-    account: String,
-    use_keychain: bool,
-}
-
-impl<T> KeychainFileAuthStore<T>
-where
-    T: Serialize + DeserializeOwned + Send + Sync + Clone,
-{
-    pub fn new(
-        file: String,
-        legacy_file: String,
-        service: impl Into<String>,
-        account: impl Into<String>,
-        use_keychain: bool,
-    ) -> Self {
-        Self {
-            file_store: FileAuthStore::new(file, legacy_file),
-            service: service.into(),
-            account: account.into(),
-            use_keychain,
-        }
-    }
-
-    fn load_unlocked(&self) -> Result<Option<T>> {
-        if self.file_store.revision()?.cleared {
-            return Ok(None);
-        }
-        if let Some(parsed) = self.file_store.load_unlocked()? {
+        if let Some(parsed) =
+            load_auth_file::<T>(&self.file).or_else(|| load_auth_file::<T>(&self.legacy_file))
+        {
             return Ok(Some(parsed));
         }
         if self.use_keychain
@@ -274,16 +243,19 @@ where
         let mut revision = AuthRevision::next();
         // Publish invalidation before touching credentials. Interrupted writes
         // fail closed, including stale keychain/legacy fallback after logout.
-        self.file_store.set_revision(&revision)?;
+        self.set_revision(&revision)?;
         if let Some(value) = value {
-            write_atomically(&self.file_store.file, &value)?;
+            write_atomically(&self.file, &value)?;
             revision.cleared = false;
-            self.file_store.set_revision(&revision)?;
+            self.set_revision(&revision)?;
         } else {
             if self.use_keychain {
                 SystemKeychain.delete(&self.service, &self.account)?;
             }
-            self.file_store.clear_unlocked()?;
+            delete_auth_file(
+                std::path::Path::new(&self.file),
+                std::path::Path::new(&self.legacy_file),
+            )?;
         }
         Ok(())
     }
@@ -294,35 +266,31 @@ where
     T: Serialize + DeserializeOwned + Send + Sync + Clone,
 {
     fn load(&self) -> Result<Option<T>> {
-        let _lock = self.file_store.lock()?;
+        let _lock = self.lock()?;
         self.load_unlocked()
     }
 
     fn save(&self, value: T) -> Result<()> {
-        let _lock = self.file_store.lock()?;
+        let _lock = self.lock()?;
         self.update_unlocked(Some(value))
     }
 
     fn clear(&self) -> Result<()> {
-        let _lock = self.file_store.lock()?;
+        let _lock = self.lock()?;
         self.update_unlocked(None)
     }
 
     fn load_snapshot(&self) -> Result<AuthSnapshot<T>> {
-        let _lock = self.file_store.lock()?;
+        let _lock = self.lock()?;
         Ok(AuthSnapshot {
             value: self.load_unlocked()?,
-            revision: self.file_store.revision()?.revision,
+            revision: self.revision()?.revision,
         })
     }
 
     fn replace_if_unchanged(&self, expected: &AuthSnapshot<T>, value: Option<T>) -> Result<bool> {
-        let _lock = self.file_store.lock()?;
-        if !snapshot_matches(
-            expected,
-            &self.file_store.revision()?.revision,
-            &self.load_unlocked()?,
-        )? {
+        let _lock = self.lock()?;
+        if !snapshot_matches(expected, &self.revision()?.revision, &self.load_unlocked()?)? {
             return Ok(false);
         }
         self.update_unlocked(value)?;
@@ -333,7 +301,7 @@ where
         if self.use_keychain {
             "macOS Keychain".to_string()
         } else {
-            self.file_store.file.clone()
+            self.file.clone()
         }
     }
 }
