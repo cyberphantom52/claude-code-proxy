@@ -78,7 +78,12 @@ impl CodexNativeBackend {
             Err(error) => return local_codex_error(error),
         };
 
-        passthrough_response(upstream, ctx, self.client.body_idle_timeout_ms())
+        passthrough_response(
+            upstream,
+            ctx,
+            self.client.body_idle_timeout_ms(),
+            resolved.stream,
+        )
     }
 }
 
@@ -393,16 +398,22 @@ fn passthrough_response(
     upstream: reqwest::Response,
     ctx: RequestContext,
     body_idle_timeout_ms: u64,
+    expect_sse: bool,
 ) -> Response {
     let status = upstream.status();
     let headers = passthrough_headers(upstream.headers());
-    let is_sse = upstream
-        .headers()
-        .get(http::header::CONTENT_TYPE)
+    let content_type = upstream.headers().get(http::header::CONTENT_TYPE);
+    let is_sse = content_type
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.starts_with("text/event-stream"));
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/event-stream"))
+        });
+    let inspect_sse = expect_sse && status.is_success() && content_type.is_none();
     let outcome = NativeResponseOutcome::default();
-    let observer = NativeResponseObserver::new(ctx, is_sse, outcome.clone());
+    let observer = NativeResponseObserver::new(ctx, is_sse, inspect_sse, outcome.clone());
     let state = Some(NativeBodyState {
         stream: Box::pin(upstream.bytes_stream()),
         observer,
@@ -488,6 +499,7 @@ struct NativeBodyState {
 struct NativeResponseObserver {
     ctx: RequestContext,
     is_sse: bool,
+    inspect_sse: bool,
     terminal_seen: bool,
     generation_started: bool,
     raw: Vec<u8>,
@@ -505,10 +517,16 @@ struct NativeResponseObserver {
 }
 
 impl NativeResponseObserver {
-    fn new(ctx: RequestContext, is_sse: bool, outcome: NativeResponseOutcome) -> Self {
+    fn new(
+        ctx: RequestContext,
+        is_sse: bool,
+        inspect_sse: bool,
+        outcome: NativeResponseOutcome,
+    ) -> Self {
         Self {
             ctx,
             is_sse,
+            inspect_sse,
             terminal_seen: false,
             generation_started: false,
             raw: Vec::new(),
@@ -535,8 +553,30 @@ impl NativeResponseObserver {
         }
         self.capture_raw(chunk);
 
-        let events = if self.is_sse {
+        if self.is_sse || self.inspect_sse {
             self.pending.extend_from_slice(chunk);
+        }
+        if self.inspect_sse {
+            // Only sniff a successful response to a streaming request with no
+            // Content-Type. JSON/error bodies must keep their normal inspection.
+            let bom = b"\xef\xbb\xbf";
+            let partial_bom = !self.pending.is_empty() && bom.starts_with(&self.pending);
+            if self.pending.starts_with(bom) {
+                self.pending.drain(..bom.len());
+            }
+            let prefix = self.pending.trim_ascii_start();
+            let fields: [&[u8]; 5] = [b"data:", b"event:", b":", b"id:", b"retry:"];
+            if fields.iter().any(|field| prefix.starts_with(field)) {
+                self.is_sse = true;
+                self.inspect_sse = false;
+            } else if (!partial_bom && !fields.iter().any(|field| field.starts_with(prefix)))
+                || self.pending.len() > MAX_STREAM_CAPTURE_FRAME_BYTES
+            {
+                self.inspect_sse = false;
+                self.pending.clear();
+            }
+        }
+        let events = if self.is_sse {
             self.drain_sse_events()
         } else {
             0
