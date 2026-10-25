@@ -2259,74 +2259,57 @@ fn map_codex_error_to_response(err: &client::CodexError) -> Response {
             .into_response();
     }
 
-    match err.status {
-        401 => json_error(
-            StatusCode::UNAUTHORIZED,
-            "authentication_error",
-            err.detail.as_deref().unwrap_or("Authentication failed"),
-        ),
-        403 => json_error(
-            StatusCode::FORBIDDEN,
-            "permission_error",
-            err.detail.as_deref().unwrap_or("Permission denied"),
-        ),
-        400 | 422 => {
-            let response = json_error(
-                StatusCode::from_u16(err.status).unwrap_or(StatusCode::BAD_REQUEST),
-                "invalid_request_error",
-                codex_error_message(err),
+    let response = match err.status {
+        401 => {
+            return json_error(
+                StatusCode::UNAUTHORIZED,
+                "authentication_error",
+                err.detail.as_deref().unwrap_or("Authentication failed"),
             );
-            if let Some(retry_after) = err.retry_after.as_deref() {
-                ([(http::header::RETRY_AFTER, retry_after)], response).into_response()
-            } else {
-                response
-            }
         }
-        413 => {
-            let response = json_error(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "request_too_large",
-                codex_error_message(err),
+        403 => {
+            return json_error(
+                StatusCode::FORBIDDEN,
+                "permission_error",
+                err.detail.as_deref().unwrap_or("Permission denied"),
             );
-            if let Some(retry_after) = err.retry_after.as_deref() {
-                ([(http::header::RETRY_AFTER, retry_after)], response).into_response()
-            } else {
-                response
-            }
         }
-        429 => {
-            let response = json_error(
-                StatusCode::TOO_MANY_REQUESTS,
-                "rate_limit_error",
-                &err.message,
-            );
-            if let Some(retry_after) = err.retry_after.as_deref() {
-                ([(http::header::RETRY_AFTER, retry_after)], response).into_response()
-            } else {
-                response
-            }
-        }
-        status @ (400..=599) => {
-            let response = json_error(
-                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
-                if status == 529 {
-                    "overloaded_error"
-                } else {
-                    "api_error"
-                },
-                codex_error_message(err),
-            );
-            if let Some(retry_after) = err.retry_after.as_deref() {
-                ([(http::header::RETRY_AFTER, retry_after)], response).into_response()
-            } else {
-                response
-            }
-        }
-        _ => json_error(
-            StatusCode::BAD_GATEWAY,
-            "api_error",
+        400 | 422 => json_error(
+            StatusCode::from_u16(err.status).unwrap_or(StatusCode::BAD_REQUEST),
+            "invalid_request_error",
             codex_error_message(err),
         ),
+        413 => json_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request_too_large",
+            codex_error_message(err),
+        ),
+        429 => json_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limit_error",
+            &err.message,
+        ),
+        status @ (400..=599) => json_error(
+            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+            if status == 529 {
+                "overloaded_error"
+            } else {
+                "api_error"
+            },
+            codex_error_message(err),
+        ),
+        _ => {
+            return json_error(
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                codex_error_message(err),
+            );
+        }
+    };
+    if let Some(retry_after) = err.retry_after.as_deref() {
+        ([(http::header::RETRY_AFTER, retry_after)], response).into_response()
+    } else {
+        response
     }
 }
 
