@@ -119,12 +119,15 @@ async fn collect_body(
                     }
                     started = true;
                 }
-                if bytes.len().saturating_add(chunk.len()) > crate::traffic::MAX_SSE_CAPTURE_BYTES {
+                let remaining = crate::traffic::MAX_SSE_CAPTURE_BYTES.saturating_sub(bytes.len());
+                let inspected = remaining.min(chunk.len());
+                let exceeded_limit = inspected < chunk.len();
+                if exceeded_limit && completion.is_none() {
                     break Err(ChatError::upstream(
                         "Codex response exceeded the response byte limit",
                     ));
                 }
-                bytes.extend_from_slice(&chunk);
+                bytes.extend_from_slice(&chunk[..inspected]);
                 if let Some(ctx) = ctx
                     && let Some(monitor) = ctx.monitor.as_ref()
                 {
@@ -174,6 +177,11 @@ async fn collect_body(
                         scan_start = frame_end;
                     }
                     scan_start = bytes.len().saturating_sub(3).max(frame_start);
+                }
+                if exceeded_limit {
+                    break Err(ChatError::upstream(
+                        "Codex response exceeded the response byte limit",
+                    ));
                 }
             }
             Ok(Some(Err(error))) => {

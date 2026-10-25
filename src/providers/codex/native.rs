@@ -421,18 +421,10 @@ async fn buffered_response(
         match tokio::time::timeout(Duration::from_millis(body_idle_timeout_ms), stream.next()).await
         {
             Ok(Some(Ok(chunk))) => {
-                received_bytes = received_bytes.saturating_add(chunk.len());
-                if received_bytes > MAX_SSE_CAPTURE_BYTES {
-                    observer.finish("response_byte_limit");
-                    break openai_error(
-                        StatusCode::BAD_GATEWAY,
-                        "api_error",
-                        "Native Responses body exceeded the response byte limit",
-                        None,
-                        None,
-                    );
-                }
-                observer.observe(&chunk);
+                let remaining = MAX_SSE_CAPTURE_BYTES.saturating_sub(received_bytes);
+                let inspected = remaining.min(chunk.len());
+                received_bytes += inspected;
+                observer.observe(&chunk[..inspected]);
                 if let Some(terminal) = observer.buffered_terminal.take() {
                     observer.finish("complete");
                     break match terminal {
@@ -441,6 +433,16 @@ async fn buffered_response(
                             openai_error(StatusCode::BAD_GATEWAY, "api_error", message, None, None)
                         }
                     };
+                }
+                if inspected < chunk.len() {
+                    observer.finish("response_byte_limit");
+                    break openai_error(
+                        StatusCode::BAD_GATEWAY,
+                        "api_error",
+                        "Native Responses body exceeded the response byte limit",
+                        None,
+                        None,
+                    );
                 }
             }
             Ok(Some(Err(error))) => {
@@ -912,8 +914,12 @@ impl NativeResponseObserver {
         }
         self.finished = true;
         if outcome == "complete" && self.is_sse && !self.terminal_seen {
-            self.outcome
-                .fail("Native Responses stream ended before a terminal event".to_string());
+            let message = if self.pending_truncated || self.discarding_oversized_frame {
+                "Native Responses terminal outcome could not be validated within the SSE frame inspection limit"
+            } else {
+                "Native Responses stream ended before a terminal event"
+            };
+            self.outcome.fail(message.to_string());
         }
         if !self.is_sse {
             match serde_json::from_slice::<Value>(&self.raw) {
