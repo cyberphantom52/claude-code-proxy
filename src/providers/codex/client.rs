@@ -421,7 +421,7 @@ struct HttpEventStreamState {
 }
 
 impl HttpSseDecoder {
-    fn push(&mut self, input: &[u8]) -> Result<Vec<DecodedHttpSseEvent>, CodexError> {
+    fn push(&mut self, input: &[u8]) -> Vec<Result<DecodedHttpSseEvent, CodexError>> {
         let mut events = Vec::new();
         for &byte in input {
             if self.skip_lf {
@@ -430,16 +430,22 @@ impl HttpSseDecoder {
                     continue;
                 }
             }
-            match byte {
-                b'\n' => self.end_line(&mut events)?,
+            let result = match byte {
+                b'\n' => self.end_line(&mut events),
                 b'\r' => {
-                    self.end_line(&mut events)?;
+                    let result = self.end_line(&mut events);
                     self.skip_lf = true;
+                    result
                 }
-                _ => self.push_byte(byte)?,
+                _ => self.push_byte(byte),
+            };
+            if let Err(error) = result {
+                // Keep earlier frames ordered before the failure, regardless of chunking.
+                events.push(Err(error));
+                break;
             }
         }
-        Ok(events)
+        events
     }
 
     fn finish(&self) -> Result<(), CodexError> {
@@ -460,12 +466,15 @@ impl HttpSseDecoder {
         Ok(())
     }
 
-    fn end_line(&mut self, events: &mut Vec<DecodedHttpSseEvent>) -> Result<(), CodexError> {
+    fn end_line(
+        &mut self,
+        events: &mut Vec<Result<DecodedHttpSseEvent, CodexError>>,
+    ) -> Result<(), CodexError> {
         if self.frame.len() == self.line_start {
             if !self.frame.is_empty()
                 && let Some(event) = decode_http_sse_frame(&self.frame)?
             {
-                events.push(event);
+                events.push(Ok(event));
             }
             self.frame.clear();
             self.line_start = 0;
@@ -1483,28 +1492,27 @@ impl CodexHttpClient {
 
                     body_bytes = body_bytes.saturating_add(chunk.len() as u64);
                     body_chunks = body_chunks.saturating_add(1);
-                    let events = match decoder.push(&chunk) {
-                        Ok(events) => events,
-                        Err(error) => {
-                            log_http_stream_end(
-                                &log,
-                                "codex_http_stream_failed",
-                                &req_id,
-                                started_at,
-                                body_bytes,
-                                body_chunks,
-                                event_count,
-                                Some(&error.message),
-                            );
-                            if !replay_committed && retryable_http_stream_error(&error) {
-                                break 'read_attempt error;
+                    for event in decoder.push(&chunk) {
+                        let event = match event {
+                            Ok(event) => event,
+                            Err(error) => {
+                                log_http_stream_end(
+                                    &log,
+                                    "codex_http_stream_failed",
+                                    &req_id,
+                                    started_at,
+                                    body_bytes,
+                                    body_chunks,
+                                    event_count,
+                                    Some(&error.message),
+                                );
+                                if !replay_committed && retryable_http_stream_error(&error) {
+                                    break 'read_attempt error;
+                                }
+                                let _ = tx.send(Err(error)).await;
+                                return;
                             }
-                            let _ = tx.send(Err(error)).await;
-                            return;
-                        }
-                    };
-
-                    for event in events {
+                        };
                         let Some(mut payload) = event.payload else {
                             continue;
                         };
