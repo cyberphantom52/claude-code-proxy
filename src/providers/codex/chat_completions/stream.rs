@@ -190,7 +190,7 @@ impl StreamState {
             std::mem::replace(&mut self.sse_at_start, false),
         ) {
             event_count += 1;
-            self.observe_event(&event.data);
+            self.observe_event(event.event, &event.data);
             if self.ended {
                 break;
             }
@@ -201,11 +201,11 @@ impl StreamState {
         true
     }
 
-    fn observe_event(&mut self, data: &str) {
+    fn observe_event(&mut self, event_name: Option<&str>, data: &str) {
         if data == "[DONE]" {
             return;
         }
-        let event: Value = match serde_json::from_str(data) {
+        let mut event: Value = match serde_json::from_str(data) {
             Ok(event) => event,
             Err(_) => {
                 self.fail(ChatError::upstream(
@@ -214,6 +214,13 @@ impl StreamState {
                 return;
             }
         };
+        if let Some(event_name) = event_name
+            && let Some(object) = event.as_object_mut()
+        {
+            object
+                .entry("type")
+                .or_insert_with(|| Value::String(event_name.to_string()));
+        }
         if let Some(traffic) = self.ctx.traffic.as_deref() {
             traffic.write_json_event("040-upstream-event", &event);
         }
