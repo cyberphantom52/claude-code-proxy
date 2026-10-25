@@ -1641,7 +1641,7 @@ fn remaining_live_stream_response(
                         return;
                     }
                 }
-                Err(err) => {
+                Err(mut err) => {
                     if reconnect.websocket
                         && err.origin == client::CodexErrorOrigin::WebSocket
                         && retryable_live_start_codex_error(&err)
@@ -1662,6 +1662,14 @@ fn remaining_live_stream_response(
                         while reconnects < MAX_RETRYABLE_LIVE_STREAM_RETRIES
                             && Instant::now() < deadline
                         {
+                            let delay =
+                                compute_backoff_delay(reconnects, err.retry_after.as_deref());
+                            if delay.exceeds_budget
+                                || Duration::from_millis(delay.wait_ms)
+                                    >= deadline.saturating_duration_since(Instant::now())
+                            {
+                                break;
+                            }
                             reconnects += 1;
                             recovery::notify(
                                 &ctx,
@@ -1672,7 +1680,7 @@ fn remaining_live_stream_response(
                             let retry_continuation = request_continuation.full_context_retry();
                             rate_limits::record(Vec::new());
                             let open_connection = async {
-                                sleep(compute_backoff_delay(reconnects - 1, None).wait_ms).await;
+                                sleep(delay.wait_ms).await;
                                 reconnect
                                     .client
                                     .stream_codex_websocket_events_for_owner(
@@ -1699,8 +1707,14 @@ fn remaining_live_stream_response(
                                     restored_pending = true;
                                     continue 'events;
                                 }
-                                Ok(Err(error)) if retryable_live_start_codex_error(&error) => {}
-                                _ => break,
+                                Ok(Err(error)) => {
+                                    let retryable = retryable_live_start_codex_error(&error);
+                                    err = error;
+                                    if !retryable {
+                                        break;
+                                    }
+                                }
+                                Err(_) => break,
                             }
                         }
                     }
