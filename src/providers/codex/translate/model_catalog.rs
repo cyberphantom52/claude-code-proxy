@@ -9,7 +9,7 @@ use std::{
     fs,
     future::Future,
     path::PathBuf,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, LazyLock, Mutex},
     time::SystemTime,
 };
 
@@ -171,47 +171,45 @@ struct ImportCache {
     snapshot: Option<Arc<CatalogSnapshot>>,
 }
 
-static IMPORT: OnceLock<Mutex<ImportCache>> = OnceLock::new();
+static IMPORT: LazyLock<Mutex<ImportCache>> = LazyLock::new(Default::default);
 
 fn builtin_snapshot() -> Arc<CatalogSnapshot> {
     use super::model_allowlist::FALLBACK_MODELS;
 
-    static BUILTIN: OnceLock<Arc<CatalogSnapshot>> = OnceLock::new();
-    BUILTIN
-        .get_or_init(|| {
-            let models = FALLBACK_MODELS
-                .iter()
-                .map(|slug| {
-                    let lite = matches!(
-                        *slug,
-                        "gpt-5.6-luna"
-                            | "gpt-5.6-sol"
-                            | "gpt-5.6-terra"
-                            | "gpt-6-astra"
-                            | "gpt-6-luna"
-                            | "gpt-6-sol"
-                            | "gpt-6.1-sol"
-                    );
-                    // Context-only offline fallback, verified in OpenAI Codex models.json
-                    // at 61f34c35af77777db4d77d0ea2aeb8547a6b4523. Other capabilities
-                    // remain unknown until discovery; do not guess limits for older IDs.
-                    let known_context = lite || *slug == "gpt-5.5";
-                    CatalogModel {
-                        slug: (*slug).to_string(),
-                        use_responses_lite: Some(lite),
-                        context_window: known_context.then_some(272_000),
-                        max_context_window: known_context.then_some(if lite {
-                            872_000
-                        } else {
-                            272_000
-                        }),
-                        ..Default::default()
-                    }
-                })
-                .collect();
-            Arc::new(CatalogSnapshot::new(models, false))
-        })
-        .clone()
+    static BUILTIN: LazyLock<Arc<CatalogSnapshot>> = LazyLock::new(|| {
+        let models = FALLBACK_MODELS
+            .iter()
+            .map(|slug| {
+                let lite = matches!(
+                    *slug,
+                    "gpt-5.6-luna"
+                        | "gpt-5.6-sol"
+                        | "gpt-5.6-terra"
+                        | "gpt-6-astra"
+                        | "gpt-6-luna"
+                        | "gpt-6-sol"
+                        | "gpt-6.1-sol"
+                );
+                // Context-only offline fallback, verified in OpenAI Codex models.json
+                // at 61f34c35af77777db4d77d0ea2aeb8547a6b4523. Other capabilities
+                // remain unknown until discovery; do not guess limits for older IDs.
+                let known_context = lite || *slug == "gpt-5.5";
+                CatalogModel {
+                    slug: (*slug).to_string(),
+                    use_responses_lite: Some(lite),
+                    context_window: known_context.then_some(272_000),
+                    max_context_window: known_context.then_some(if lite {
+                        872_000
+                    } else {
+                        272_000
+                    }),
+                    ..Default::default()
+                }
+            })
+            .collect();
+        Arc::new(CatalogSnapshot::new(models, false))
+    });
+    BUILTIN.clone()
 }
 
 pub fn fallback_snapshot() -> Arc<CatalogSnapshot> {
@@ -219,7 +217,6 @@ pub fn fallback_snapshot() -> Arc<CatalogSnapshot> {
         return builtin_snapshot();
     };
     let mut cache = IMPORT
-        .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let Some((modified, len)) = fs::metadata(&path)

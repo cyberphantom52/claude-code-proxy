@@ -64,7 +64,7 @@ pub(super) async fn response(
             Err(error) => super::map_codex_error_to_response(&error),
         };
     }
-    let (tx, rx) = mpsc::channel(8);
+    let (tx, mut rx) = mpsc::channel(8);
     let outcome = NativeResponseOutcome::default();
     let response_outcome = outcome.clone();
     let model_context = models::current_model_context();
@@ -101,9 +101,7 @@ pub(super) async fn response(
         }),
     ));
     super::event_stream_response(
-        futures_util::stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|item| (item, rx))
-        }),
+        futures_util::stream::poll_fn(move |cx| rx.poll_recv(cx)),
         response_outcome,
     )
 }

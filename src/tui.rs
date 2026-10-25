@@ -15,19 +15,19 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use crossterm::{
+use jiff::Zoned;
+use ratatui::crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use jiff::{Timestamp, Zoned, tz::TimeZone};
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    layout::{Alignment, Constraint, Layout, Rect},
+    style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
+    widgets::{Block, BorderType, Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
 };
 use tokio::sync::oneshot;
 
@@ -436,17 +436,15 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut MonitorApp, state: &MonitorS
     let area = frame.area();
     frame.render_widget(Block::default().style(Style::default().bg(BG)), area);
 
-    let root = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Percentage(30),
-            Constraint::Percentage(20),
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
-            Constraint::Length(1),
-        ])
-        .split(area);
+    let root = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Percentage(30),
+        Constraint::Percentage(20),
+        Constraint::Percentage(25),
+        Constraint::Percentage(25),
+        Constraint::Length(1),
+    ])
+    .split(area);
 
     render_header(frame, root[0], app, state);
     match app.detail {
@@ -494,53 +492,28 @@ fn render_header(
     state: &MonitorSnapshot,
 ) {
     let text = Line::from(vec![
-        Span::styled(
-            " claude-code-proxy",
-            Style::default()
-                .fg(BG)
-                .bg(TEAL)
-                .add_modifier(Modifier::BOLD),
-        ),
+        " claude-code-proxy".fg(BG).bg(TEAL).bold(),
         Span::styled("  ", Style::default().fg(BG).bg(TEAL)),
-        Span::styled(&app.listen_url, Style::default().fg(BG).bg(TEAL)),
+        app.listen_url.as_str().fg(BG).bg(TEAL),
         Span::styled("  uptime ", Style::default().fg(BG).bg(TEAL)),
-        Span::styled(
-            format_duration(state.uptime),
-            Style::default()
-                .fg(BG)
-                .bg(TEAL)
-                .add_modifier(Modifier::BOLD),
-        ),
+        format_duration(state.uptime).fg(BG).bg(TEAL).bold(),
         Span::styled("  sessions ", Style::default().fg(BG).bg(TEAL)),
-        Span::styled(
-            state.sessions.len().to_string(),
-            Style::default()
-                .fg(BG)
-                .bg(TEAL)
-                .add_modifier(Modifier::BOLD),
-        ),
+        state.sessions.len().to_string().fg(BG).bg(TEAL).bold(),
         Span::styled("  active ", Style::default().fg(BG).bg(TEAL)),
-        Span::styled(
-            state.active.len().to_string(),
-            Style::default()
-                .fg(BG)
-                .bg(TEAL)
-                .add_modifier(Modifier::BOLD),
-        ),
+        state.active.len().to_string().fg(BG).bg(TEAL).bold(),
     ]);
     frame.render_widget(Paragraph::new(text).style(Style::default().bg(TEAL)), area);
 }
 
 fn panel(title: &'static str, focused: bool) -> Block<'static> {
     let color = if focused { TEAL } else { SEPARATOR };
-    Block::default()
+    Block::bordered()
         .title(Span::styled(
             format!(" {title} "),
             Style::default()
                 .fg(if focused { TEAL } else { DIM_WHITE })
                 .add_modifier(Modifier::BOLD),
         ))
-        .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(color))
         .style(Style::default().bg(PANEL_BG))
@@ -562,13 +535,9 @@ fn render_empty_table_state(
     focused: bool,
     message: &str,
 ) {
-    frame.render_widget(panel(title, focused), area);
-    let content = Rect {
-        x: area.x.saturating_add(1),
-        y: area.y.saturating_add(1),
-        width: area.width.saturating_sub(2),
-        height: area.height.saturating_sub(2),
-    };
+    let block = panel(title, focused);
+    let content = block.inner(area);
+    frame.render_widget(block, area);
     if content.width == 0 || content.height == 0 {
         return;
     }
@@ -1518,10 +1487,7 @@ fn render_session_detail(
             ),
         ]
     } else {
-        vec![Line::from(Span::styled(
-            "No session selected",
-            Style::default().fg(DIM),
-        ))]
+        vec![Line::from("No session selected".fg(DIM))]
     };
     frame.render_widget(
         Paragraph::new(lines)
@@ -1612,10 +1578,7 @@ fn render_request_detail(
         }
         lines
     } else {
-        vec![Line::from(Span::styled(
-            "No request selected",
-            Style::default().fg(DIM),
-        ))]
+        vec![Line::from("No request selected".fg(DIM))]
     };
     frame.render_widget(
         Paragraph::new(lines)
@@ -1677,10 +1640,7 @@ fn render_shutdown_confirmation(frame: &mut ratatui::Frame<'_>, area: Rect) {
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from(Span::styled(
-                "Shut down proxy?",
-                Style::default().fg(WHITE).add_modifier(Modifier::BOLD),
-            )),
+            Line::from("Shut down proxy?".fg(WHITE).bold()),
             Line::from(vec![
                 Span::styled("y", Style::default().fg(TEAL)),
                 Span::styled(" confirm   ", Style::default().fg(DIM_WHITE)),
@@ -1690,8 +1650,7 @@ fn render_shutdown_confirmation(frame: &mut ratatui::Frame<'_>, area: Rect) {
         ])
         .alignment(Alignment::Center)
         .block(
-            Block::default()
-                .borders(Borders::ALL)
+            Block::bordered()
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(YELLOW))
                 .style(Style::default().bg(BG)),
@@ -1715,20 +1674,13 @@ fn render_shutdown_overlay(frame: &mut ratatui::Frame<'_>, area: Rect, tick: usi
         Paragraph::new(vec![
             Line::from(vec![
                 Span::styled(format!("{} ", spinner(tick)), Style::default().fg(TEAL)),
-                Span::styled(
-                    "Shutting down...",
-                    Style::default().fg(WHITE).add_modifier(Modifier::BOLD),
-                ),
+                "Shutting down...".fg(WHITE).bold(),
             ]),
-            Line::from(Span::styled(
-                "Press Ctrl-C to force quit",
-                Style::default().fg(DIM_WHITE),
-            )),
+            Line::from("Press Ctrl-C to force quit".fg(DIM_WHITE)),
         ])
         .alignment(Alignment::Center)
         .block(
-            Block::default()
-                .borders(Borders::ALL)
+            Block::bordered()
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(TEAL))
                 .style(Style::default().bg(BG)),
@@ -1748,9 +1700,8 @@ fn render_help_overlay(frame: &mut ratatui::Frame<'_>, area: Rect, attached: boo
         height,
     };
     frame.render_widget(Clear, popup);
-    let block = Block::default()
+    let block = Block::bordered()
         .title(Span::styled(" Shortcuts ", Style::default().fg(TEAL)))
-        .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(TEAL))
         .style(Style::default().bg(BG));
@@ -1802,9 +1753,8 @@ fn render_setup_overlay(frame: &mut ratatui::Frame<'_>, area: Rect, setup_text: 
         height,
     };
     frame.render_widget(Clear, popup);
-    let block = Block::default()
+    let block = Block::bordered()
         .title(Span::styled(" Setup ", Style::default().fg(TEAL)))
-        .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(TEAL))
         .style(Style::default().bg(BG));
@@ -1879,10 +1829,8 @@ fn format_duration(duration: Duration) -> String {
 }
 
 fn format_system_time(time: SystemTime) -> String {
-    let Ok(timestamp) = Timestamp::try_from(time) else {
+    let Ok(zoned) = Zoned::try_from(time) else {
         return "-".to_string();
     };
-    Zoned::new(timestamp, TimeZone::system())
-        .strftime("%H:%M:%S")
-        .to_string()
+    zoned.strftime("%H:%M:%S").to_string()
 }

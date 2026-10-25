@@ -916,12 +916,7 @@ impl LiveStreamTranslator {
         if payload["_ccp_output_already_done"] == true {
             return Ok(());
         }
-        if payload
-            .get("item")
-            .and_then(|value| value.get("type"))
-            .and_then(serde_json::Value::as_str)
-            == Some("message")
-        {
+        if payload["item"]["type"] == "message" {
             if payload["item"]["status"] != "incomplete" {
                 self.close_text_parts(Some(output_index), traffic, out);
             }
@@ -929,10 +924,7 @@ impl LiveStreamTranslator {
         }
         if let Some(item) = payload
             .get("item")
-            .and_then(|item| item.get("type"))
-            .and_then(|v| v.as_str())
-            .filter(|item_type| *item_type == "reasoning")
-            .and_then(|_| payload.get("item"))
+            .filter(|item| item["type"] == "reasoning")
         {
             if self.stops.matched().is_some() {
                 return Ok(());
@@ -951,12 +943,7 @@ impl LiveStreamTranslator {
             return Ok(());
         }
 
-        if payload
-            .get("item")
-            .and_then(|item| item.get("type"))
-            .and_then(|v| v.as_str())
-            == Some("web_search_call")
-        {
+        if payload["item"]["type"] == "web_search_call" {
             self.web_search_requests += 1;
             if self.stops.matched().is_some() {
                 return Ok(());
@@ -979,12 +966,7 @@ impl LiveStreamTranslator {
             return Ok(());
         }
 
-        let completed_function_call = if payload
-            .get("item")
-            .and_then(|value| value.get("type"))
-            .and_then(|value| value.as_str())
-            == Some("function_call")
-        {
+        let completed_function_call = if payload["item"]["type"] == "function_call" {
             let completed = validate_completed_function_call(&payload["item"])
                 .map_err(|error| error.to_string())?;
             let Some(resolved_output_index) = self.open_tool_output_index_for_done(payload) else {

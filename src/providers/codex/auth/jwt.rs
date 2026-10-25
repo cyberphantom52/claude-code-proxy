@@ -58,14 +58,9 @@ fn parse_jwt_claims(token: &str) -> Option<IdTokenClaims> {
         return None;
     }
     let payload_b64 = parts[1].replace('-', "+").replace('_', "/");
-    let padded = match payload_b64.len() % 4 {
-        2 => format!("{payload_b64}=="),
-        3 => format!("{payload_b64}="),
-        _ => payload_b64,
-    };
     use base64::Engine;
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(&padded)
+    let decoded = base64::engine::general_purpose::STANDARD_PAD_INDIFFERENT
+        .decode(&payload_b64)
         .ok()?;
     serde_json::from_slice(&decoded).ok()
 }

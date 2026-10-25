@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
 
 use super::models::{OperationProvenance, current_operation_provenance};
 use crate::request_identity::ConversationIdentity;
@@ -36,7 +36,7 @@ struct ContinuationRegistry {
     total_retained_bytes: u64,
 }
 
-static REGISTRY: Mutex<Option<ContinuationRegistry>> = Mutex::new(None);
+static REGISTRY: LazyLock<Mutex<ContinuationRegistry>> = LazyLock::new(Default::default);
 static NEXT_TURN_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
@@ -120,9 +120,7 @@ impl ContinuationReservation {
 
 pub(super) fn prune_idle_state() {
     let mut guard = REGISTRY.lock().unwrap();
-    let Some(registry) = guard.as_mut() else {
-        return;
-    };
+    let registry = &mut *guard;
     let now = now_ms();
     registry.owners.retain(|_, owner| {
         // A pending turn is an invalidation guard, not expired history.
@@ -199,8 +197,7 @@ fn continuation_candidate_inner(
     let turn_id = NEXT_TURN_ID.fetch_add(1, Ordering::Relaxed);
     let now = now_ms();
     let (state, superseded_turn, provenance_changed) = {
-        let mut guard = REGISTRY.lock().unwrap();
-        let registry = guard.get_or_insert_with(ContinuationRegistry::default);
+        let mut registry = REGISTRY.lock().unwrap();
         let existing = registry.owners.remove(owner);
         let superseded_turn = existing.is_some();
         let provenance_changed = existing
@@ -221,7 +218,7 @@ fn continuation_candidate_inner(
                 updated_at: now,
             },
         );
-        evict_oldest(registry);
+        evict_oldest(&mut registry);
         (
             if provenance_changed { None } else { state },
             superseded_turn,
@@ -395,10 +392,7 @@ pub(crate) fn record_continuation_for_owner(
         updated_at: now_ms(),
     };
 
-    let mut guard = REGISTRY.lock().unwrap();
-    let Some(registry) = guard.as_mut() else {
-        return;
-    };
+    let mut registry = REGISTRY.lock().unwrap();
     let Some(owner_state) = registry.owners.get_mut(owner) else {
         return;
     };
@@ -411,7 +405,7 @@ pub(crate) fn record_continuation_for_owner(
             .saturating_sub(existing.retained_bytes);
     }
     registry.total_retained_bytes += retained_bytes;
-    evict_oldest(registry);
+    evict_oldest(&mut registry);
 }
 
 pub(crate) fn abort_continuation_for_owner(reservation: &ContinuationReservation) {
@@ -422,10 +416,7 @@ fn abort_continuation_inner(owner: Option<&ConversationIdentity>, turn_id: Optio
     let (Some(owner), Some(turn_id)) = (owner, turn_id) else {
         return;
     };
-    let mut guard = REGISTRY.lock().unwrap();
-    let Some(registry) = guard.as_mut() else {
-        return;
-    };
+    let mut registry = REGISTRY.lock().unwrap();
     if registry
         .owners
         .get(owner)
@@ -448,8 +439,8 @@ pub(crate) fn if_current_turn_for_owner<T>(
     };
     let guard = REGISTRY.lock().unwrap();
     let current = guard
-        .as_ref()
-        .and_then(|registry| registry.owners.get(owner))
+        .owners
+        .get(owner)
         .is_some_and(|state| state.current_turn == turn_id);
     current.then(action)
 }

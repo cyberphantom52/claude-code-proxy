@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::models::OperationProvenance;
@@ -81,7 +81,7 @@ pub struct CompactionReplay {
 
 type CompactionKey = (ConversationIdentity, Option<String>);
 type CompactionRegistry = HashMap<CompactionKey, CompactionState>;
-static REGISTRY: Mutex<Option<CompactionRegistry>> = Mutex::new(None);
+static REGISTRY: LazyLock<Mutex<CompactionRegistry>> = LazyLock::new(Default::default);
 static NEXT_ATTEMPT_ID: AtomicU64 = AtomicU64::new(1);
 
 pub async fn request_compaction(
@@ -196,11 +196,10 @@ pub(crate) fn begin_compaction_scoped(scope: &CompactionScope, model: &str) -> C
         updated_at: now_ms(),
     };
     let now = state.updated_at;
-    let mut guard = REGISTRY.lock().unwrap();
-    let registry = guard.get_or_insert_with(HashMap::new);
-    evict_states(registry, now);
+    let mut registry = REGISTRY.lock().unwrap();
+    evict_states(&mut registry, now);
     registry.insert(scope.key(), state);
-    evict_states(registry, now);
+    evict_states(&mut registry, now);
     attempt
 }
 
@@ -210,11 +209,8 @@ pub(crate) fn store_compaction_scoped(
     native_history: Vec<ResponsesInputItem>,
 ) -> bool {
     let now = now_ms();
-    let mut guard = REGISTRY.lock().unwrap();
-    let Some(registry) = guard.as_mut() else {
-        return false;
-    };
-    evict_states(registry, now);
+    let mut registry = REGISTRY.lock().unwrap();
+    evict_states(&mut registry, now);
     let Some(state) = registry.get_mut(&scope.key()) else {
         return false;
     };
@@ -231,7 +227,7 @@ pub(crate) fn store_compaction_scoped(
         registry.remove(&scope.key());
         return false;
     }
-    evict_states(registry, now);
+    evict_states(&mut registry, now);
     registry
         .get(&scope.key())
         .is_some_and(|state| state.scope == *scope && state.attempt == attempt)
@@ -252,11 +248,8 @@ pub(crate) fn activate_compaction_scoped(
     };
 
     let now = now_ms();
-    let mut guard = REGISTRY.lock().unwrap();
-    let Some(registry) = guard.as_mut() else {
-        return false;
-    };
-    evict_states(registry, now);
+    let mut registry = REGISTRY.lock().unwrap();
+    evict_states(&mut registry, now);
     let Some(state) = registry.get_mut(&scope.key()) else {
         return false;
     };
@@ -273,7 +266,7 @@ pub(crate) fn activate_compaction_scoped(
         registry.remove(&scope.key());
         return false;
     }
-    evict_states(registry, now);
+    evict_states(&mut registry, now);
     registry.contains_key(&scope.key())
 }
 
@@ -283,9 +276,8 @@ pub(crate) fn apply_compaction_replay_scoped(
 ) -> Option<CompactionReplay> {
     let scope = scope?;
     let now = now_ms();
-    let mut guard = REGISTRY.lock().unwrap();
-    let registry = guard.as_mut()?;
-    evict_states(registry, now);
+    let mut registry = REGISTRY.lock().unwrap();
+    evict_states(&mut registry, now);
     let state = registry.get_mut(&scope.key())?;
     if state.scope != *scope || !matches!(state.phase, CompactionPhase::Anchored { .. }) {
         return None;
@@ -342,10 +334,7 @@ pub(crate) fn abort_compaction_attempt_scoped(
     let (Some(scope), Some(attempt)) = (scope, attempt) else {
         return;
     };
-    let mut guard = REGISTRY.lock().unwrap();
-    let Some(registry) = guard.as_mut() else {
-        return;
-    };
+    let mut registry = REGISTRY.lock().unwrap();
     if registry
         .get(&scope.key())
         .is_some_and(|state| state.scope == *scope && state.attempt == attempt)
@@ -355,11 +344,10 @@ pub(crate) fn abort_compaction_attempt_scoped(
 }
 
 pub(crate) fn clear_compaction_scoped(scope: &CompactionScope) {
-    let mut guard = REGISTRY.lock().unwrap();
-    if let Some(registry) = guard.as_mut()
-        && registry
-            .get(&scope.key())
-            .is_some_and(|state| state.scope == *scope)
+    let mut registry = REGISTRY.lock().unwrap();
+    if registry
+        .get(&scope.key())
+        .is_some_and(|state| state.scope == *scope)
     {
         registry.remove(&scope.key());
     }
@@ -599,13 +587,7 @@ fn truncate_text(mut text: String, remaining_tokens: &mut u64) -> String {
         return String::new();
     }
     let remaining_bytes = remaining_tokens.saturating_mul(4).min(usize::MAX as u64) as usize;
-    if text.len() > remaining_bytes {
-        let mut boundary = remaining_bytes;
-        while !text.is_char_boundary(boundary) {
-            boundary -= 1;
-        }
-        text.truncate(boundary);
-    }
+    text.truncate(text.floor_char_boundary(remaining_bytes));
     *remaining_tokens -= text.len().div_ceil(4) as u64;
     text
 }
@@ -632,11 +614,9 @@ fn state_size(key: &CompactionKey, state: &CompactionState) -> usize {
 }
 
 pub(super) fn prune_idle_state() {
-    let mut guard = REGISTRY.lock().unwrap();
-    if let Some(registry) = guard.as_mut() {
-        evict_states(registry, now_ms());
-        registry.shrink_to_fit();
-    }
+    let mut registry = REGISTRY.lock().unwrap();
+    evict_states(&mut registry, now_ms());
+    registry.shrink_to_fit();
 }
 
 fn now_ms() -> u64 {

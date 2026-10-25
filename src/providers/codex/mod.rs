@@ -123,7 +123,7 @@ impl CodexProvider {
                 error.to_string(),
             );
         }
-        let message_id = format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
+        let message_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
         threads::set_message_id(&message_id);
         let want_stream = incoming.stream;
         let lite_search =
@@ -1541,7 +1541,7 @@ fn remaining_live_stream_response(
     mut upstream_sse_body: Option<Vec<u8>>,
     compaction: LiveStreamCompaction,
 ) -> Response {
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     let model_context = models::current_model_context();
     let thread_attempt = threads::current();
     let telemetry = rate_limits::current();
@@ -1861,9 +1861,7 @@ fn remaining_live_stream_response(
         }),
     ));
 
-    let stream = futures_util::stream::unfold(rx, |mut rx| async {
-        rx.recv().await.map(|item| (item, rx))
-    });
+    let stream = futures_util::stream::poll_fn(move |cx| rx.poll_recv(cx));
     event_stream_response(stream, response_outcome)
 }
 

@@ -622,9 +622,7 @@ impl MonitorStore {
             completed.output_history_at = Some(timestamp);
         }
         self.recent.push_front(completed);
-        while self.recent.len() > DEFAULT_RECENT_LIMIT {
-            self.recent.pop_back();
-        }
+        self.recent.truncate(DEFAULT_RECENT_LIMIT);
     }
 
     fn update_usage(&mut self, request_id: &str, usage: TokenUsage) {

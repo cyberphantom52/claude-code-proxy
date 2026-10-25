@@ -1,7 +1,7 @@
 //! Bounded proxy-managed Messages threads, independent of socket continuation.
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::{
@@ -75,7 +75,7 @@ struct Entry {
 struct Registry {
     entries: HashMap<String, Entry>,
 }
-static REGISTRY: Mutex<Option<Registry>> = Mutex::new(None);
+static REGISTRY: LazyLock<Mutex<Registry>> = LazyLock::new(Default::default);
 
 impl Registry {
     fn prune(&mut self, now: Instant) {
@@ -229,8 +229,7 @@ pub(crate) fn prepare(
     };
     let now = Instant::now();
     let id = uuid::Uuid::new_v4().to_string();
-    let mut guard = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-    let registry = guard.get_or_insert_with(Registry::default);
+    let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
     registry.prune(now);
     let mut replay = None;
     let mut branch = id.clone();
@@ -458,10 +457,7 @@ impl ThreadAttempt {
         state.request = None;
         state.replay = None;
         let pending = state.pending.take();
-        let mut guard = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(registry) = guard.as_mut() else {
-            return;
-        };
+        let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         let Some(mut reservation) = registry.entries.remove(&self.id) else {
             return;
         };
@@ -539,7 +535,8 @@ pub(crate) fn response_body(response: Response, attempt: Option<Arc<ThreadAttemp
     Response::from_parts(parts, Body::new(StreamBody::new(stream)))
 }
 pub(super) fn prune_idle_state() {
-    if let Some(registry) = REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-        registry.prune(Instant::now());
-    }
+    REGISTRY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .prune(Instant::now());
 }

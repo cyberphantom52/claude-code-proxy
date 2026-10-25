@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use http::HeaderValue;
 
 use crate::anthropic::sse::sse_events;
 use crate::config;
@@ -95,11 +96,11 @@ pub fn build_codex_headers(
     let mut headers = http::HeaderMap::new();
     headers.insert(
         http::header::CONTENT_TYPE,
-        header_value("content-type", "application/json")?,
+        HeaderValue::from_static("application/json"),
     );
     headers.insert(
         http::header::ACCEPT,
-        header_value("accept", "text/event-stream")?,
+        HeaderValue::from_static("text/event-stream"),
     );
     let bearer = format!("Bearer {}", auth.access);
     headers.insert(
@@ -114,11 +115,11 @@ pub fn build_codex_headers(
     headers.insert("originator", header_value("originator", &originator)?);
     headers.insert(
         "openai-beta",
-        header_value("openai-beta", "responses=experimental")?,
+        HeaderValue::from_static("responses=experimental"),
     );
     headers.insert(
         "x-codex-beta-features",
-        header_value("x-codex-beta-features", "remote_compaction_v2")?,
+        HeaderValue::from_static("remote_compaction_v2"),
     );
     if use_responses_lite {
         headers.insert(
@@ -227,7 +228,7 @@ pub fn build_codex_search_headers(
     );
     headers.insert(
         http::header::ACCEPT,
-        header_value("accept", "application/json")?,
+        HeaderValue::from_static("application/json"),
     );
     let originator = config::codex_originator(RESPONSES_LITE_ORIGINATOR);
     headers.insert("originator", header_value("originator", &originator)?);
@@ -248,11 +249,11 @@ pub fn build_codex_image_headers(
     let mut headers = http::HeaderMap::new();
     headers.insert(
         http::header::CONTENT_TYPE,
-        header_value("content-type", "application/json")?,
+        HeaderValue::from_static("application/json"),
     );
     headers.insert(
         http::header::ACCEPT,
-        header_value("accept", "application/json")?,
+        HeaderValue::from_static("application/json"),
     );
     headers.insert(
         http::header::AUTHORIZATION,
@@ -291,7 +292,7 @@ pub fn build_codex_transcription_headers(
     let mut headers = http::HeaderMap::new();
     headers.insert(
         http::header::ACCEPT,
-        header_value("accept", "application/json")?,
+        HeaderValue::from_static("application/json"),
     );
     headers.insert(
         http::header::AUTHORIZATION,
@@ -828,10 +829,11 @@ impl CodexHttpClient {
         if let Some(language) = input.language.as_deref() {
             form = form.text("language", language.to_string());
         }
-        let mut request = self.native_client.post(url).multipart(form);
-        for (key, value) in headers {
-            request = request.header(key.as_str(), value.as_bytes());
-        }
+        let request = self
+            .native_client
+            .post(url)
+            .multipart(form)
+            .headers(headers.clone());
         tokio::time::timeout(
             Duration::from_millis(IMAGE_HEADER_TIMEOUT_MS),
             request.send(),
@@ -914,10 +916,7 @@ impl CodexHttpClient {
         headers: &http::HeaderMap,
         body_json: Bytes,
     ) -> Result<reqwest::Response, CodexError> {
-        let mut request = self.native_client.post(url);
-        for (key, value) in headers {
-            request = request.header(key.as_str(), value.as_bytes());
-        }
+        let request = self.native_client.post(url).headers(headers.clone());
         tokio::time::timeout(
             Duration::from_millis(IMAGE_HEADER_TIMEOUT_MS),
             request.body(body_json).send(),

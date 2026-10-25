@@ -26,7 +26,7 @@ base64 = "0.23.1"
 rand = "0.10.3"
 sha2 = "0.11.1"
 regex-lite = "0.1.9"
-tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
 rustls-native-certs = "0.8.5"
@@ -34,6 +34,5 @@ webpki-roots = "1.0.11"
 hyper-util = { version = "0.1.21", features = ["client-proxy"] }
 url = "2.5.8"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29", "layout-cache", "underline-color"] }
-crossterm = "0.29.0"
 jiff = { version = "0.2.38", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 tiktoken-rs = { version = "0.12.1", default-features = false }
