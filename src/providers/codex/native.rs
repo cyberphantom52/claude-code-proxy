@@ -69,7 +69,7 @@ impl CodexNativeBackend {
                 &body,
                 &ctx,
                 resolved.use_responses_lite,
-                resolved.stream,
+                true,
                 turn_state,
             )
             .await
@@ -78,12 +78,10 @@ impl CodexNativeBackend {
             Err(error) => return local_codex_error(error),
         };
 
-        passthrough_response(
-            upstream,
-            ctx,
-            self.client.body_idle_timeout_ms(),
-            resolved.stream,
-        )
+        if !resolved.stream && upstream.status().is_success() {
+            return buffered_response(upstream, ctx, self.client.body_idle_timeout_ms()).await;
+        }
+        passthrough_response(upstream, ctx, self.client.body_idle_timeout_ms(), true)
     }
 }
 
@@ -153,13 +151,26 @@ fn shape_native_request(body: &mut Value) -> Result<NativeResolved, Response> {
     }
     apply_native_capabilities(object, &model, use_responses_lite)?;
 
+    let stream = match object.get("stream") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(stream)) => *stream,
+        Some(_) => return Err(invalid_capability("stream", "stream must be a boolean")),
+    };
+    match object.get("store") {
+        None | Some(Value::Null | Value::Bool(false)) => {}
+        Some(Value::Bool(true)) => {
+            return Err(invalid_capability("store", "Codex requires store=false"));
+        }
+        Some(_) => return Err(invalid_capability("store", "store must be a boolean")),
+    }
+    // Codex only accepts streamed, unstored upstream responses. Buffering is a
+    // downstream presentation mode, not a different upstream request mode.
+    object.insert("stream".to_string(), Value::Bool(true));
+    object.insert("store".to_string(), Value::Bool(false));
     Ok(NativeResolved {
         use_responses_lite,
         model,
-        stream: object
-            .get("stream")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
+        stream,
     })
 }
 
@@ -394,6 +405,134 @@ impl NativeResponseOutcome {
     }
 }
 
+async fn buffered_response(
+    upstream: reqwest::Response,
+    ctx: RequestContext,
+    body_idle_timeout_ms: u64,
+) -> Response {
+    let status = upstream.status();
+    let headers = passthrough_headers(upstream.headers());
+    let outcome = NativeResponseOutcome::default();
+    let mut observer = NativeResponseObserver::new(ctx, false, true, outcome.clone());
+    observer.buffer_terminal = true;
+    let mut stream = upstream.bytes_stream();
+    let mut received_bytes = 0_usize;
+    let mut response = loop {
+        match tokio::time::timeout(Duration::from_millis(body_idle_timeout_ms), stream.next()).await
+        {
+            Ok(Some(Ok(chunk))) => {
+                received_bytes = received_bytes.saturating_add(chunk.len());
+                if received_bytes > MAX_SSE_CAPTURE_BYTES {
+                    observer.finish("response_byte_limit");
+                    break openai_error(
+                        StatusCode::BAD_GATEWAY,
+                        "api_error",
+                        "Native Responses body exceeded the response byte limit",
+                        None,
+                        None,
+                    );
+                }
+                observer.observe(&chunk);
+                if let Some(terminal) = observer.buffered_terminal.take() {
+                    observer.finish("complete");
+                    break match terminal {
+                        Ok(event) => buffered_terminal_response(event, status),
+                        Err(message) => {
+                            openai_error(StatusCode::BAD_GATEWAY, "api_error", message, None, None)
+                        }
+                    };
+                }
+            }
+            Ok(Some(Err(error))) => {
+                observer.finish("read_error");
+                break openai_error(
+                    StatusCode::BAD_GATEWAY,
+                    "api_error",
+                    format!("Native Responses body read failed: {error}"),
+                    None,
+                    None,
+                );
+            }
+            Ok(None) => {
+                observer.finish("complete");
+                break openai_error(
+                    StatusCode::BAD_GATEWAY,
+                    "api_error",
+                    "Native Responses stream ended before a terminal event",
+                    None,
+                    None,
+                );
+            }
+            Err(_) => {
+                observer.finish("idle_timeout");
+                break openai_error(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "api_error",
+                    format!(
+                        "Timed out waiting {body_idle_timeout_ms}ms for the next Codex response body chunk"
+                    ),
+                    None,
+                    None,
+                );
+            }
+        }
+    };
+    if !response.status().is_success() {
+        outcome.fail(format!(
+            "Native Responses buffering failed: HTTP {}",
+            response.status()
+        ));
+    }
+    response.headers_mut().extend(headers);
+    response.headers_mut().insert(
+        http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    response.extensions_mut().insert(outcome);
+    response
+}
+
+fn buffered_terminal_response(mut event: Value, status: StatusCode) -> Response {
+    // Validate the real envelope before treating any payload as a final Response.
+    let failure = super::events::classify_event_failure(&event);
+    let response = event.get_mut("response").filter(|response| {
+        response.is_object() && response.get("id").is_some_and(Value::is_string)
+    });
+    if let Some(response) = response
+        && (response.get("output").is_some_and(Value::is_array)
+            || (failure.is_some()
+                && response.get("status").and_then(Value::as_str) == Some("failed")))
+    {
+        // Keep the native object, including unknown/opaque output and usage
+        // fields. Do not project it through Anthropic/Chat output types.
+        return (status, axum::Json(response.take())).into_response();
+    }
+    if let Some(failure) = failure {
+        let mut response = openai_error(
+            StatusCode::from_u16(failure.client_status()).unwrap_or(StatusCode::BAD_GATEWAY),
+            failure.client_error_type(),
+            failure.message,
+            None,
+            None,
+        );
+        if let Some(retry_after) = failure.retry_after
+            && let Ok(value) = HeaderValue::from_str(&retry_after)
+        {
+            response
+                .headers_mut()
+                .insert(http::header::RETRY_AFTER, value);
+        }
+        return response;
+    }
+    openai_error(
+        StatusCode::BAD_GATEWAY,
+        "api_error",
+        "Native Responses terminal response did not contain a complete output array",
+        None,
+        None,
+    )
+}
+
 fn passthrough_response(
     upstream: reqwest::Response,
     ctx: RequestContext,
@@ -501,6 +640,8 @@ struct NativeResponseObserver {
     is_sse: bool,
     inspect_sse: bool,
     terminal_seen: bool,
+    buffer_terminal: bool,
+    buffered_terminal: Option<Result<Value, String>>,
     generation_started: bool,
     raw: Vec<u8>,
     raw_truncated: u64,
@@ -528,6 +669,8 @@ impl NativeResponseObserver {
             is_sse,
             inspect_sse,
             terminal_seen: false,
+            buffer_terminal: false,
+            buffered_terminal: None,
             generation_started: false,
             raw: Vec::new(),
             raw_truncated: 0,
@@ -557,8 +700,8 @@ impl NativeResponseObserver {
             self.pending.extend_from_slice(chunk);
         }
         if self.inspect_sse {
-            // Only sniff a successful response to a streaming request with no
-            // Content-Type. JSON/error bodies must keep their normal inspection.
+            // Inspect the prefix, not embedded strings, so JSON/error bodies
+            // keep their normal inspection rather than being mistaken for SSE.
             let bom = b"\xef\xbb\xbf";
             let partial_bom = !self.pending.is_empty() && bom.starts_with(&self.pending);
             if self.pending.starts_with(bom) {
@@ -637,15 +780,26 @@ impl NativeResponseObserver {
             }
             match serde_json::from_str::<Value>(&event.data) {
                 Ok(value) => self.record_event(event.event.as_deref(), value),
-                Err(_) => self.capture_event(json!({
-                    "event": event.event,
-                    "unparseable": true,
-                    "bytes": event.data.len(),
-                })),
+                Err(_) => {
+                    if self.buffer_terminal {
+                        self.buffered_terminal = Some(Err(
+                            "Native Responses returned malformed JSON in its event stream"
+                                .to_string(),
+                        ));
+                    }
+                    self.capture_event(json!({
+                        "event": event.event,
+                        "unparseable": true,
+                        "bytes": event.data.len(),
+                    }));
+                }
+            }
+            if self.buffered_terminal.is_some() {
+                break;
             }
         }
 
-        if self.pending.len() > MAX_STREAM_CAPTURE_FRAME_BYTES {
+        if !self.buffer_terminal && self.pending.len() > MAX_STREAM_CAPTURE_FRAME_BYTES {
             self.pending_truncated = true;
             self.discarding_oversized_frame = true;
             retain_boundary_prefix(&mut self.pending);
@@ -665,6 +819,9 @@ impl NativeResponseObserver {
         self.update_usage(&value);
         value = self.update_outcome(value);
         self.terminal_seen |= super::events::event_is_terminal(&value);
+        if self.buffer_terminal && self.terminal_seen {
+            self.buffered_terminal = Some(Ok(value.clone()));
+        }
         if self.ctx.traffic.is_none() {
             return;
         }
