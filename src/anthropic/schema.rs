@@ -17,6 +17,8 @@ pub struct MessagesRequest {
     pub omit_reasoning_artifacts: bool,
     #[serde(skip)]
     pub auto_review: bool,
+    #[serde(skip)]
+    pub compaction_request: bool,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }

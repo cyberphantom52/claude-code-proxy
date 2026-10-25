@@ -1290,6 +1290,28 @@ fn log_native_request_completed(
     log_routed_openai_request_completed(log, req_id, endpoint, "codex", model, status, started_at);
 }
 
+/// Claude Code 2.1.304 marks summary generation separately from context already
+/// compacted. Only the request markers select our existing compaction path.
+fn claude_compaction_request(headers: &http::HeaderMap) -> anyhow::Result<bool> {
+    let mut kind = None;
+    for value in ["x-claude-code-compaction", "x-cc-compaction-request"]
+        .into_iter()
+        .flat_map(|name| headers.get_all(name))
+    {
+        let value = value.to_str()?;
+        anyhow::ensure!(
+            matches!(value, "manual" | "auto" | "reactive"),
+            "invalid Claude Code compaction request marker"
+        );
+        anyhow::ensure!(
+            kind.is_none_or(|kind| kind == value),
+            "conflicting Claude Code compaction request markers"
+        );
+        kind = Some(value);
+    }
+    Ok(kind.is_some())
+}
+
 async fn dispatch_request(
     state: Arc<AppState>,
     req: Request<Body>,
@@ -1376,9 +1398,10 @@ async fn dispatch_request(
         }
     };
 
-    if let Err(error) =
+    if let Err(error) = claude_compaction_request(&headers).and_then(|compact| {
+        body.compaction_request = compact;
         crate::providers::codex::translate::request::validate_messages_capabilities(&body)
-    {
+    }) {
         return failed_request_response(
             &log,
             FailedResponseLogContext {

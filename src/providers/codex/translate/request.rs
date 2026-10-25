@@ -570,7 +570,8 @@ fn is_compact_message_content(content: &Value) -> bool {
 }
 
 pub(crate) fn is_compact_messages_request(request: &MessagesRequest) -> bool {
-    is_compact_request(flatten_system_text(request.extra.get("system")).as_deref())
+    request.compaction_request
+        || is_compact_request(flatten_system_text(request.extra.get("system")).as_deref())
         || request
             .messages
             .iter()

@@ -388,7 +388,13 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
         kind,
         explicit_status,
         status,
-        message,
+        // Claude Code recognizes this text even when an SSE error has no HTTP
+        // status. Do not confuse ordinary payload-size failures with overflow.
+        message: if context_window && !lower.contains("prompt is too long") {
+            format!("Prompt is too long: {message}")
+        } else {
+            message
+        },
         retry_after,
     })
 }
