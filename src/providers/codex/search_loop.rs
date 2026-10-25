@@ -333,9 +333,17 @@ async fn run(
             && (!calls.is_empty() || (!external && events::response_needs_follow_up(&terminal)))
             && !finish.continuation_eligible
         {
-            return Err(error(
-                "internal model round cannot be replayed without losing native state",
-            ));
+            let interrupted_messages = (calls.is_empty() && !external)
+                .then(|| {
+                    super::translate::reducer::interrupted_message_follow_up(&native_body, &finish)
+                })
+                .flatten()
+                .ok_or_else(|| {
+                    error("internal model round cannot be replayed without losing native state")
+                })?;
+            // Only this full-input round may use the attested partial messages.
+            // Do not promote them to a cache/socket continuation.
+            finish.output_items = interrupted_messages;
         }
         if executable && !calls.is_empty() && !policy.allow_search {
             return Err(error(

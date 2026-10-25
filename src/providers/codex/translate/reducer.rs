@@ -1313,6 +1313,105 @@ pub fn finish_metadata_from_upstream_with_stops(
     }))
 }
 
+// A sampler interruption can retain authoritative partial messages for the next
+// full-input round without certifying a cache/socket continuation. Keep this
+// exception message-only: tools, reasoning and opaque snapshots need their own
+// replay attestation rather than borrowing the partial-text exception.
+pub(crate) fn interrupted_message_follow_up(
+    input: &[u8],
+    finish: &FinishMetadata,
+) -> Option<Vec<ResponsesInputItem>> {
+    let response_id = finish.response_id.as_deref()?;
+    let text = String::from_utf8_lossy(input);
+    let mut completed = CompletedOutputs::default();
+    let mut finalized = std::collections::BTreeSet::new();
+    let mut interrupted = false;
+    for event in sse_events(&text) {
+        let payload: serde_json::Value = serde_json::from_str(&event.data).ok()?;
+        let kind = payload["type"].as_str()?;
+        if interrupted && kind != "ping" {
+            return None;
+        }
+        match kind {
+            "response.incomplete"
+                if crate::providers::codex::events::response_is_interrupted_terminal(&payload)
+                    && classify_event_failure(&payload).is_none()
+                    && payload["response"]["id"] == response_id =>
+            {
+                interrupted = true;
+            }
+            "response.output_item.added" | "response.output_item.done"
+                if payload["item"]["type"] == "message" => {}
+            "response.content_part.added" | "response.content_part.done"
+                if payload["part"]["type"] == "output_text" => {}
+            "response.output_text.delta"
+            | "response.output_text.done"
+            | "response.output_text.annotation.added"
+            | "response.created"
+            | "response.in_progress"
+            | "codex.rate_limits"
+            | "keepalive"
+            | "ping" => {}
+            _ => return None,
+        }
+        for event in completed.accept(Cow::Owned(payload)).ok()? {
+            if event["type"] == "response.output_item.done" {
+                finalized.insert(event["output_index"].as_u64()? as usize);
+            }
+        }
+    }
+    if !interrupted
+        || completed.refused
+        || completed.items.is_empty()
+        || completed.items.len() != finish.output_items.len()
+        || !completed
+            .reserved
+            .iter()
+            .all(|(index, kind)| *kind == "message" && completed.items.contains_key(index))
+        || !completed
+            .items
+            .values()
+            .any(|(item, _)| item["status"] == "incomplete")
+    {
+        return None;
+    }
+    let mut native = Vec::new();
+    for ((index, (item, _)), projected) in completed.items.iter().zip(&finish.output_items) {
+        if !finalized.contains(index) || validate_output_message(item).is_err() {
+            return None;
+        }
+        let message: ResponsesInputItem = serde_json::from_value(item.clone()).ok()?;
+        let ResponsesInputItem::Message {
+            metadata, content, ..
+        } = &message
+        else {
+            return None;
+        };
+        if !content.iter().any(|part| {
+            matches!(part, super::request::ResponsesContentPart::OutputText { text, .. } if !text.is_empty())
+        }) || metadata.encrypted_content.is_some()
+            || metadata.internal_chat_message_metadata_passthrough.is_some()
+            || metadata.phase.as_deref().is_some_and(|phase| {
+                !matches!(phase, "commentary" | "partial_answer" | "final_answer")
+            })
+        {
+            return None;
+        }
+        let mut value = serde_json::to_value(&message).ok()?;
+        if value != *item {
+            return None;
+        }
+        if value["status"] == "incomplete" {
+            value.as_object_mut()?.remove("status");
+        }
+        if value != serde_json::to_value(projected).ok()? {
+            return None;
+        }
+        native.push(message);
+    }
+    Some(native)
+}
+
 pub fn reduce_upstream_bytes(input: &[u8]) -> Result<Vec<ReducerEvent>, UpstreamStreamError> {
     reduce_upstream_bytes_with_stops(input, &[])
 }
