@@ -4,8 +4,6 @@ use serde::Deserialize;
 struct IdTokenClaims {
     #[serde(default)]
     chatgpt_account_id: Option<String>,
-    #[serde(default)]
-    organizations: Option<Vec<OrgClaim>>,
     #[allow(dead_code)]
     #[serde(default)]
     email: Option<String>,
@@ -15,11 +13,6 @@ struct IdTokenClaims {
     #[serde(default)]
     #[serde(rename = "https://api.openai.com/auth.chatgpt_account_id")]
     openai_chatgpt_account_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OrgClaim {
-    id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,15 +70,6 @@ fn parse_jwt_claims(token: &str) -> Option<IdTokenClaims> {
     serde_json::from_slice(&decoded).ok()
 }
 
-fn extract_account_id_from_claims(claims: &IdTokenClaims) -> Option<String> {
-    claims
-        .chatgpt_account_id
-        .clone()
-        .or_else(|| claims.openai_auth.as_ref()?.chatgpt_account_id.clone())
-        .or_else(|| claims.openai_chatgpt_account_id.clone())
-        .or_else(|| claims.organizations.as_ref()?.first()?.id.clone().into())
-}
-
 pub fn validate_token_response(tokens: &TokenResponse) -> anyhow::Result<()> {
     if tokens.access_token.trim().is_empty() {
         anyhow::bail!("token response missing access token");
@@ -100,12 +84,36 @@ pub fn validate_token_response(tokens: &TokenResponse) -> anyhow::Result<()> {
 }
 
 pub fn extract_account_id(tokens: &TokenResponse) -> Option<String> {
-    if let Some(ref id_token) = tokens.id_token
-        && let Some(claims) = parse_jwt_claims(id_token)
-        && let Some(account_id) = extract_account_id_from_claims(&claims)
-    {
-        return Some(account_id);
-    }
-    let claims = parse_jwt_claims(&tokens.access_token)?;
-    extract_account_id_from_claims(&claims)
+    let id = tokens.id_token.as_deref().and_then(parse_jwt_claims);
+    let access = parse_jwt_claims(&tokens.access_token);
+    let claims = [id.as_ref(), access.as_ref()];
+    // Codex derives workspace identity from the namespaced auth claim, never
+    // organization membership. Keep flat aliases only for legacy compatibility,
+    // after checking the authoritative claim in both tokens (ID token first).
+    claims
+        .iter()
+        .flatten()
+        .find_map(|claims| {
+            claims
+                .openai_auth
+                .as_ref()?
+                .chatgpt_account_id
+                .as_deref()
+                .filter(|id| !id.trim().is_empty())
+        })
+        .or_else(|| {
+            claims.iter().flatten().find_map(|claims| {
+                claims
+                    .chatgpt_account_id
+                    .as_deref()
+                    .filter(|id| !id.trim().is_empty())
+                    .or_else(|| {
+                        claims
+                            .openai_chatgpt_account_id
+                            .as_deref()
+                            .filter(|id| !id.trim().is_empty())
+                    })
+            })
+        })
+        .map(str::to_owned)
 }
