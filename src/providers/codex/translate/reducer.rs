@@ -1229,15 +1229,16 @@ fn reasoning_input_item(replay: ReasoningReplay) -> ResponsesInputItem {
     }
 }
 
-fn finalize_active_thinking(
-    active: ActiveThinking,
+fn close_thinking(
     out: &mut Vec<ReducerEvent>,
+    active_thinking: &mut Option<ActiveThinking>,
     reasoning_by_output_index: &mut std::collections::HashMap<usize, PendingReasoning>,
     output_items_by_index: &mut std::collections::BTreeMap<usize, ResponsesInputItem>,
 ) {
-    if let Some(replay) = reasoning_by_output_index
-        .remove(&active.output_index)
-        .and_then(|pending| pending.replay())
+    if let Some(active) = active_thinking.take()
+        && let Some(replay) = reasoning_by_output_index
+            .remove(&active.output_index)
+            .and_then(|pending| pending.replay())
         && let Some(signature) = encode_reasoning_signature(&replay)
     {
         out.push(ReducerEvent::ThinkingSignature {
@@ -1245,22 +1246,6 @@ fn finalize_active_thinking(
             signature,
         });
         output_items_by_index.insert(active.output_index, reasoning_input_item(replay));
-    }
-}
-
-fn close_thinking(
-    out: &mut Vec<ReducerEvent>,
-    active_thinking: &mut Option<ActiveThinking>,
-    reasoning_by_output_index: &mut std::collections::HashMap<usize, PendingReasoning>,
-    output_items_by_index: &mut std::collections::BTreeMap<usize, ResponsesInputItem>,
-) {
-    if let Some(active) = active_thinking.take() {
-        finalize_active_thinking(
-            active,
-            out,
-            reasoning_by_output_index,
-            output_items_by_index,
-        );
     }
 }
 
