@@ -1329,13 +1329,12 @@ pub(crate) fn interrupted_message_follow_up(
     for event in sse_events(&text) {
         let payload: serde_json::Value = serde_json::from_str(&event.data).ok()?;
         let kind = payload["type"].as_str()?;
-        if interrupted && kind != "ping" {
+        if classify_event_failure(&payload).is_some() || (interrupted && kind != "ping") {
             return None;
         }
         match kind {
             "response.incomplete"
                 if crate::providers::codex::events::response_is_interrupted_terminal(&payload)
-                    && classify_event_failure(&payload).is_none()
                     && payload["response"]["id"] == response_id =>
             {
                 interrupted = true;
@@ -1347,6 +1346,7 @@ pub(crate) fn interrupted_message_follow_up(
             "response.output_text.delta"
             | "response.output_text.done"
             | "response.output_text.annotation.added"
+            | "response.metadata"
             | "response.created"
             | "response.in_progress"
             | "codex.rate_limits"
