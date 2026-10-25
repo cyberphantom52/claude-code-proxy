@@ -101,70 +101,6 @@ impl TokenUsage {
 }
 
 #[derive(Debug, Clone)]
-enum MonitorEvent {
-    RequestStarted {
-        request_id: String,
-        session_id: Option<String>,
-        session_seq: Option<u64>,
-        endpoint: EndpointKind,
-    },
-    ProjectResolved {
-        request_id: String,
-        project: String,
-    },
-    SessionSequenceResolved {
-        request_id: String,
-        session_seq: u64,
-    },
-    ProviderSelected {
-        request_id: String,
-        provider: String,
-        model: String,
-        effort: Option<String>,
-    },
-    ModelResolved {
-        request_id: String,
-        model: String,
-    },
-    CompactionStarted {
-        request_id: String,
-    },
-    UpstreamStarted {
-        request_id: String,
-    },
-    GenerationStarted {
-        request_id: String,
-    },
-    TrafficCapturePath {
-        request_id: String,
-        path: PathBuf,
-    },
-    StreamProgress {
-        request_id: String,
-        bytes: u64,
-        chunks: u64,
-        usage: TokenUsage,
-    },
-    UsageUpdated {
-        request_id: String,
-        usage: TokenUsage,
-    },
-    RequestCompleted {
-        request_id: String,
-        http_status: u16,
-    },
-    RequestFailed {
-        request_id: String,
-        http_status: Option<u16>,
-        error: String,
-    },
-    RequestAbandoned {
-        request_id: String,
-        error: String,
-    },
-}
-
-#[derive(Debug, Clone)]
 pub struct ActiveRequest {
     pub request_id: String,
     pub session_id: Option<String>,
@@ -368,9 +304,10 @@ impl Default for MonitorHandle {
 }
 
 impl MonitorHandle {
-    fn publish(&self, event: MonitorEvent) {
+    fn mutate(&self, mutation: impl FnOnce(&mut MonitorStore)) {
         if let Ok(mut store) = self.store.lock() {
-            store.apply(event);
+            mutation(&mut store);
+            store.prune_session_history_if_due(SystemTime::now());
         }
     }
 
@@ -394,25 +331,55 @@ impl MonitorHandle {
         session_seq: Option<u64>,
         endpoint: EndpointKind,
     ) {
-        self.publish(MonitorEvent::RequestStarted {
-            request_id: request_id.into(),
-            session_id,
-            session_seq,
-            endpoint,
+        let request_id = request_id.into();
+        self.mutate(|store| {
+            store.active.insert(
+                request_id.clone(),
+                ActiveRequest {
+                    request_id,
+                    session_id,
+                    session_seq,
+                    project: None,
+                    provider: None,
+                    model: None,
+                    effort: None,
+                    endpoint,
+                    started_at: SystemTime::now(),
+                    started_instant: Instant::now(),
+                    generation_started_at: None,
+                    generation_started_instant: None,
+                    generation_initial_output_tokens: 0,
+                    generation_finished_at: None,
+                    generation_duration: None,
+                    status: RequestStatus::Started,
+                    streamed_bytes: 0,
+                    stream_chunks: 0,
+                    input_tokens: None,
+                    cached_input_tokens: None,
+                    output_tokens: None,
+                    error: None,
+                    traffic_capture_path: None,
+                },
+            );
         });
     }
 
     pub fn project_resolved(&self, request_id: impl Into<String>, project: impl Into<String>) {
-        self.publish(MonitorEvent::ProjectResolved {
-            request_id: request_id.into(),
-            project: project.into(),
+        let request_id = request_id.into();
+        let project = project.into();
+        self.mutate(|store| {
+            if let Some(active) = store.active.get_mut(&request_id) {
+                active.project = Some(project);
+            }
         });
     }
 
     pub fn session_sequence_resolved(&self, request_id: impl Into<String>, session_seq: u64) {
-        self.publish(MonitorEvent::SessionSequenceResolved {
-            request_id: request_id.into(),
-            session_seq,
+        let request_id = request_id.into();
+        self.mutate(|store| {
+            if let Some(active) = store.active.get_mut(&request_id) {
+                active.session_seq = Some(session_seq);
+            }
         });
     }
 
@@ -423,43 +390,70 @@ impl MonitorHandle {
         model: impl Into<String>,
         effort: Option<String>,
     ) {
-        self.publish(MonitorEvent::ProviderSelected {
-            request_id: request_id.into(),
-            provider: provider.into(),
-            model: model.into(),
-            effort,
+        let request_id = request_id.into();
+        let provider = provider.into();
+        let model = model.into();
+        self.mutate(|store| {
+            if let Some(active) = store.active.get_mut(&request_id) {
+                active.provider = Some(provider);
+                active.model = Some(model);
+                active.effort = effort;
+                active.status = RequestStatus::ProviderSelected;
+            }
         });
     }
 
     pub fn model_resolved(&self, request_id: impl Into<String>, model: impl Into<String>) {
-        self.publish(MonitorEvent::ModelResolved {
-            request_id: request_id.into(),
-            model: model.into(),
+        let request_id = request_id.into();
+        let model = model.into();
+        self.mutate(|store| {
+            if let Some(active) = store.active.get_mut(&request_id) {
+                active.model = Some(match active.model.take() {
+                    Some(incoming) if incoming != model => format!("{incoming} → {model}"),
+                    Some(incoming) => incoming,
+                    None => model,
+                });
+            }
         });
     }
 
     pub fn compaction_started(&self, request_id: impl Into<String>) {
-        self.publish(MonitorEvent::CompactionStarted {
-            request_id: request_id.into(),
+        let request_id = request_id.into();
+        self.mutate(|store| {
+            if let Some(active) = store.active.get_mut(&request_id) {
+                active.status = RequestStatus::Compacting;
+            }
         });
     }
 
     pub fn upstream_started(&self, request_id: impl Into<String>) {
-        self.publish(MonitorEvent::UpstreamStarted {
-            request_id: request_id.into(),
+        let request_id = request_id.into();
+        self.mutate(|store| {
+            if let Some(active) = store.active.get_mut(&request_id) {
+                active.status = RequestStatus::Upstream;
+            }
         });
     }
 
     pub fn generation_started(&self, request_id: impl Into<String>) {
-        self.publish(MonitorEvent::GenerationStarted {
-            request_id: request_id.into(),
+        let request_id = request_id.into();
+        self.mutate(|store| {
+            if let Some(active) = store.active.get_mut(&request_id) {
+                active.generation_started_at = Some(SystemTime::now());
+                active.generation_started_instant = Some(Instant::now());
+                active.generation_initial_output_tokens = active.output_tokens.unwrap_or(0);
+                active.generation_finished_at = None;
+                active.generation_duration = None;
+            }
         });
     }
 
     pub fn traffic_capture_path(&self, request_id: impl Into<String>, path: PathBuf) {
-        self.publish(MonitorEvent::TrafficCapturePath {
-            request_id: request_id.into(),
-            path,
+        let request_id = request_id.into();
+        self.mutate(|store| {
+            if let Some(active) = store.active.get_mut(&request_id) {
+                active.traffic_capture_path = Some(path);
+            }
         });
     }
 
@@ -470,25 +464,54 @@ impl MonitorHandle {
         chunks: u64,
         usage: TokenUsage,
     ) {
-        self.publish(MonitorEvent::StreamProgress {
-            request_id: request_id.into(),
-            bytes,
-            chunks,
-            usage,
+        let request_id = request_id.into();
+        self.mutate(|store| {
+            if let Some(active) = store.active.get_mut(&request_id) {
+                active.status = RequestStatus::Streaming;
+                if active.generation_started_instant.is_none() {
+                    active.generation_started_at = Some(SystemTime::now());
+                    active.generation_started_instant = Some(Instant::now());
+                    active.generation_initial_output_tokens = active.output_tokens.unwrap_or(0);
+                } else {
+                    active.generation_finished_at = Some(SystemTime::now());
+                    active.generation_duration = active
+                        .generation_started_instant
+                        .map(|started| started.elapsed());
+                }
+                active.streamed_bytes = active.streamed_bytes.saturating_add(bytes);
+                active.stream_chunks = active.stream_chunks.saturating_add(chunks);
+            } else if let Some(completed) = store
+                .recent
+                .iter_mut()
+                .find(|request| request.request_id == request_id)
+            {
+                if let Some(started) = completed.generation_started_instant {
+                    completed.generation_finished_at = Some(SystemTime::now());
+                    completed.generation_duration = Some(started.elapsed());
+                }
+                completed.streamed_bytes = completed.streamed_bytes.saturating_add(bytes);
+                completed.stream_chunks = completed.stream_chunks.saturating_add(chunks);
+            }
+            store.update_usage(&request_id, usage);
         });
     }
 
     pub fn usage_updated(&self, request_id: impl Into<String>, usage: TokenUsage) {
-        self.publish(MonitorEvent::UsageUpdated {
-            request_id: request_id.into(),
-            usage,
+        let request_id = request_id.into();
+        self.mutate(|store| {
+            store.update_usage(&request_id, usage);
         });
     }
 
     pub fn request_completed(&self, request_id: impl Into<String>, http_status: u16) {
-        self.publish(MonitorEvent::RequestCompleted {
-            request_id: request_id.into(),
-            http_status,
+        let request_id = request_id.into();
+        self.mutate(|store| {
+            store.finish(
+                &request_id,
+                RequestStatus::Completed,
+                Some(http_status),
+                None,
+            );
         });
     }
 
@@ -498,185 +521,25 @@ impl MonitorHandle {
         http_status: Option<u16>,
         error: impl Into<String>,
     ) {
-        self.publish(MonitorEvent::RequestFailed {
-            request_id: request_id.into(),
-            http_status,
-            error: error.into(),
+        let request_id = request_id.into();
+        let error = error.into();
+        self.mutate(|store| {
+            store.finish(&request_id, RequestStatus::Failed, http_status, Some(error));
         });
     }
 
     pub fn request_abandoned(&self, request_id: impl Into<String>, error: impl Into<String>) {
-        self.publish(MonitorEvent::RequestAbandoned {
-            request_id: request_id.into(),
-            error: error.into(),
+        let request_id = request_id.into();
+        let error = error.into();
+        self.mutate(|store| {
+            if store.active.contains_key(&request_id) {
+                store.finish(&request_id, RequestStatus::Failed, None, Some(error));
+            }
         });
     }
 }
 
 impl MonitorStore {
-    fn apply(&mut self, event: MonitorEvent) {
-        match event {
-            MonitorEvent::RequestStarted {
-                request_id,
-                session_id,
-                session_seq,
-                endpoint,
-            } => {
-                self.active.insert(
-                    request_id.clone(),
-                    ActiveRequest {
-                        request_id,
-                        session_id,
-                        session_seq,
-                        project: None,
-                        provider: None,
-                        model: None,
-                        effort: None,
-                        endpoint,
-                        started_at: SystemTime::now(),
-                        started_instant: Instant::now(),
-                        generation_started_at: None,
-                        generation_started_instant: None,
-                        generation_initial_output_tokens: 0,
-                        generation_finished_at: None,
-                        generation_duration: None,
-                        status: RequestStatus::Started,
-                        streamed_bytes: 0,
-                        stream_chunks: 0,
-                        input_tokens: None,
-                        cached_input_tokens: None,
-                        output_tokens: None,
-                        error: None,
-                        traffic_capture_path: None,
-                    },
-                );
-            }
-            MonitorEvent::ProjectResolved {
-                request_id,
-                project,
-            } => {
-                if let Some(active) = self.active.get_mut(&request_id) {
-                    active.project = Some(project);
-                }
-            }
-            MonitorEvent::SessionSequenceResolved {
-                request_id,
-                session_seq,
-            } => {
-                if let Some(active) = self.active.get_mut(&request_id) {
-                    active.session_seq = Some(session_seq);
-                }
-            }
-            MonitorEvent::ProviderSelected {
-                request_id,
-                provider,
-                model,
-                effort,
-            } => {
-                if let Some(active) = self.active.get_mut(&request_id) {
-                    active.provider = Some(provider);
-                    active.model = Some(model);
-                    active.effort = effort;
-                    active.status = RequestStatus::ProviderSelected;
-                }
-            }
-            MonitorEvent::ModelResolved { request_id, model } => {
-                if let Some(active) = self.active.get_mut(&request_id) {
-                    active.model = Some(match active.model.take() {
-                        Some(incoming) if incoming != model => format!("{incoming} → {model}"),
-                        Some(incoming) => incoming,
-                        None => model,
-                    });
-                }
-            }
-            MonitorEvent::CompactionStarted { request_id } => {
-                if let Some(active) = self.active.get_mut(&request_id) {
-                    active.status = RequestStatus::Compacting;
-                }
-            }
-            MonitorEvent::UpstreamStarted { request_id } => {
-                if let Some(active) = self.active.get_mut(&request_id) {
-                    active.status = RequestStatus::Upstream;
-                }
-            }
-            MonitorEvent::GenerationStarted { request_id } => {
-                if let Some(active) = self.active.get_mut(&request_id) {
-                    active.generation_started_at = Some(SystemTime::now());
-                    active.generation_started_instant = Some(Instant::now());
-                    active.generation_initial_output_tokens = active.output_tokens.unwrap_or(0);
-                    active.generation_finished_at = None;
-                    active.generation_duration = None;
-                }
-            }
-            MonitorEvent::TrafficCapturePath { request_id, path } => {
-                if let Some(active) = self.active.get_mut(&request_id) {
-                    active.traffic_capture_path = Some(path);
-                }
-            }
-            MonitorEvent::StreamProgress {
-                request_id,
-                bytes,
-                chunks,
-                usage,
-            } => {
-                if let Some(active) = self.active.get_mut(&request_id) {
-                    active.status = RequestStatus::Streaming;
-                    if active.generation_started_instant.is_none() {
-                        active.generation_started_at = Some(SystemTime::now());
-                        active.generation_started_instant = Some(Instant::now());
-                        active.generation_initial_output_tokens = active.output_tokens.unwrap_or(0);
-                    } else {
-                        active.generation_finished_at = Some(SystemTime::now());
-                        active.generation_duration = active
-                            .generation_started_instant
-                            .map(|started| started.elapsed());
-                    }
-                    active.streamed_bytes = active.streamed_bytes.saturating_add(bytes);
-                    active.stream_chunks = active.stream_chunks.saturating_add(chunks);
-                } else if let Some(completed) = self
-                    .recent
-                    .iter_mut()
-                    .find(|request| request.request_id == request_id)
-                {
-                    if let Some(started) = completed.generation_started_instant {
-                        completed.generation_finished_at = Some(SystemTime::now());
-                        completed.generation_duration = Some(started.elapsed());
-                    }
-                    completed.streamed_bytes = completed.streamed_bytes.saturating_add(bytes);
-                    completed.stream_chunks = completed.stream_chunks.saturating_add(chunks);
-                }
-                self.update_usage(&request_id, usage);
-            }
-            MonitorEvent::UsageUpdated { request_id, usage } => {
-                self.update_usage(&request_id, usage);
-            }
-            MonitorEvent::RequestCompleted {
-                request_id,
-                http_status,
-            } => {
-                self.finish(
-                    &request_id,
-                    RequestStatus::Completed,
-                    Some(http_status),
-                    None,
-                );
-            }
-            MonitorEvent::RequestFailed {
-                request_id,
-                http_status,
-                error,
-            } => {
-                self.finish(&request_id, RequestStatus::Failed, http_status, Some(error));
-            }
-            MonitorEvent::RequestAbandoned { request_id, error } => {
-                if self.active.contains_key(&request_id) {
-                    self.finish(&request_id, RequestStatus::Failed, None, Some(error));
-                }
-            }
-        }
-        self.prune_session_history_if_due(SystemTime::now());
-    }
-
     fn finish(
         &mut self,
         request_id: &str,
