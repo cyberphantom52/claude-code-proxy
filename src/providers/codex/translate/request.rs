@@ -184,6 +184,8 @@ pub struct ResponsesRequest<I = Vec<ResponsesInputItem>> {
     pub stop_sequences: Vec<String>,
     #[serde(skip)]
     pub codex_auto_review: bool,
+    #[serde(skip)]
+    pub(crate) turn_state: super::super::client::CodexTurnState,
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
@@ -214,6 +216,7 @@ impl ResponsesRequest {
         ResponsesRequest {
             stop_sequences: self.stop_sequences.clone(),
             codex_auto_review: self.codex_auto_review,
+            turn_state: self.turn_state.clone(),
             model: self.model.clone(),
             instructions: self.instructions.clone(),
             input,
@@ -777,6 +780,12 @@ pub fn validate_messages_capabilities(req: &MessagesRequest) -> anyhow::Result<(
         }
     }
     for (message_index, message) in req.messages.iter().enumerate() {
+        // Claude Code recognizes this rejection and retries without per-turn
+        // effort/timing; never silently reinterpret them as request controls.
+        anyhow::ensure!(
+            message.output_config.is_none(),
+            "messages.{message_index}.output_config: Extra inputs are not permitted"
+        );
         if message.role == "system"
             && (message_index == 0 || req.messages[message_index - 1].role != "system")
         {
@@ -1107,6 +1116,7 @@ pub fn translate_request(
     let mut out = ResponsesRequest {
         stop_sequences: parse_stop_sequences(req)?,
         codex_auto_review: req.auto_review && opts.model == "codex-auto-review",
+        turn_state: Default::default(),
         model: opts.model,
         instructions,
         input,

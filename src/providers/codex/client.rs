@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -332,12 +332,106 @@ fn search_endpoint(base_url: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Operation-owned routing state
+// ---------------------------------------------------------------------------
+
+const CODEX_TURN_STATE: &str = "x-codex-turn-state";
+
+#[derive(Clone, Default)]
+pub(crate) struct CodexTurnState(Arc<Mutex<Option<Arc<TurnStateGeneration>>>>);
+
+struct TurnStateGeneration {
+    provenance: super::models::OperationProvenance,
+    value: OnceLock<HeaderValue>,
+}
+
+#[derive(Clone)]
+pub(super) struct CodexTurnStateAttempt(Option<Arc<TurnStateGeneration>>);
+
+impl std::fmt::Debug for CodexTurnState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CodexTurnState([redacted])")
+    }
+}
+
+impl CodexTurnState {
+    fn bind(
+        &self,
+        provenance: Option<super::models::OperationProvenance>,
+    ) -> CodexTurnStateAttempt {
+        let mut current = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        let Some(provenance) = provenance else {
+            *current = None;
+            return CodexTurnStateAttempt(None);
+        };
+        if current
+            .as_ref()
+            .is_none_or(|state| state.provenance != provenance)
+        {
+            // Readers from an earlier credential/endpoint keep only their detached
+            // generation and cannot populate the replacement operation state.
+            *current = Some(Arc::new(TurnStateGeneration {
+                provenance,
+                value: OnceLock::new(),
+            }));
+        }
+        CodexTurnStateAttempt(current.clone())
+    }
+}
+
+impl CodexTurnStateAttempt {
+    fn value(&self) -> Option<HeaderValue> {
+        self.0.as_ref()?.value.get().cloned()
+    }
+
+    fn capture(&self, value: &str) {
+        let Some(state) = &self.0 else { return };
+        // Reuse the local event-frame budget, not an assumed provider token limit.
+        if state.value.get().is_some() || value.len() > MAX_HTTP_SSE_FRAME_BYTES {
+            return;
+        }
+        if let Ok(mut value) = HeaderValue::from_str(value)
+            && value.to_str().is_ok()
+        {
+            value.set_sensitive(true);
+            let _ = state.value.set(value);
+        }
+    }
+
+    pub(super) fn capture_event(&self, payload: &serde_json::Value) {
+        if payload["type"] != "response.metadata" {
+            return;
+        }
+        let Some(headers) = payload
+            .get("headers")
+            .and_then(serde_json::Value::as_object)
+        else {
+            return;
+        };
+        let value = headers.iter().find_map(|(name, value)| {
+            if !name.eq_ignore_ascii_case(CODEX_TURN_STATE) {
+                return None;
+            }
+            let mut value = value;
+            while let serde_json::Value::Array(values) = value {
+                value = values.first()?;
+            }
+            value.as_str()
+        });
+        if let Some(value) = value {
+            self.capture(value);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // WebSocket request shaping
 // ---------------------------------------------------------------------------
 
 fn build_websocket_request(
     body: &ResponsesRequest,
     continuation: Option<&super::continuation::ContinuationCandidate>,
+    turn_state: &CodexTurnStateAttempt,
 ) -> serde_json::Value {
     let input = continuation
         .and_then(|candidate| candidate.input_delta.as_deref())
@@ -348,6 +442,13 @@ fn build_websocket_request(
     // Omit the stream field for WebSocket transport
     obj.remove("stream");
     obj.insert("type".to_string(), serde_json::json!("response.create"));
+    if let Some(value) = turn_state.value() {
+        // Overlay only this wire payload: stored client_metadata still selects
+        // the original full/Lite lane and never retains the routing token.
+        obj.entry("client_metadata")
+            .or_insert_with(|| serde_json::json!({}))[CODEX_TURN_STATE] =
+            serde_json::json!(value.to_str().expect("validated routing state"));
+    }
 
     // Apply continuation if available
     if let Some(candidate) = continuation
@@ -405,6 +506,8 @@ struct HttpEventStreamState {
     started_at: Instant,
     body_json: Bytes,
     auth: Arc<OperationAuth>,
+    turn_state: CodexTurnState,
+    turn_state_attempt: CodexTurnStateAttempt,
     auth_refresh_attempted: bool,
     use_responses_lite: bool,
     codex_auto_review: bool,
@@ -1114,7 +1217,7 @@ impl CodexHttpClient {
                 stop_reason,
             );
         };
-        let (resp, response_headers, started_at) = loop {
+        let (resp, response_headers, started_at, turn_state_attempt) = loop {
             match self
                 .start_http_event_attempt(
                     &mut auth,
@@ -1123,6 +1226,7 @@ impl CodexHttpClient {
                     use_responses_lite,
                     codex_auto_review,
                     &mut auth_refresh_attempted,
+                    &body.turn_state,
                 )
                 .await
             {
@@ -1162,6 +1266,8 @@ impl CodexHttpClient {
                 started_at,
                 body_json,
                 auth,
+                turn_state: body.turn_state.clone(),
+                turn_state_attempt,
                 auth_refresh_attempted,
                 use_responses_lite,
                 codex_auto_review,
@@ -1188,6 +1294,7 @@ impl CodexHttpClient {
         Ok(stream)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn start_http_event_attempt(
         &self,
         auth: &mut Arc<OperationAuth>,
@@ -1196,10 +1303,26 @@ impl CodexHttpClient {
         use_responses_lite: bool,
         codex_auto_review: bool,
         auth_refresh_attempted: &mut bool,
-    ) -> Result<(reqwest::Response, Vec<(String, String)>, Instant), CodexError> {
+        turn_state: &CodexTurnState,
+    ) -> Result<
+        (
+            reqwest::Response,
+            Vec<(String, String)>,
+            Instant,
+            CodexTurnStateAttempt,
+        ),
+        CodexError,
+    > {
         loop {
-            let (resp, started_at) = self
-                .start_post_http(auth, body_json, ctx, use_responses_lite, codex_auto_review)
+            let (resp, started_at, turn_state_attempt) = self
+                .start_post_http(
+                    auth,
+                    body_json,
+                    ctx,
+                    use_responses_lite,
+                    codex_auto_review,
+                    turn_state,
+                )
                 .await?;
 
             if resp.status().as_u16() == 401 && !*auth_refresh_attempted {
@@ -1214,7 +1337,14 @@ impl CodexHttpClient {
             if !resp.status().is_success() {
                 super::rate_limits::record(super::rate_limits::telemetry_headers(resp.headers()));
                 let response = self
-                    .collect_http_response(resp, started_at, ctx, "buffered", "Codex response body")
+                    .collect_http_response_with_turn_state(
+                        resp,
+                        started_at,
+                        ctx,
+                        "buffered",
+                        "Codex response body",
+                        Some(&turn_state_attempt),
+                    )
                     .await?;
                 let mut error = codex_status_error(response);
                 error.origin = CodexErrorOrigin::Http;
@@ -1231,7 +1361,7 @@ impl CodexHttpClient {
                     &headers,
                 );
             }
-            return Ok((resp, headers, started_at));
+            return Ok((resp, headers, started_at, turn_state_attempt));
         }
     }
 
@@ -1282,6 +1412,8 @@ impl CodexHttpClient {
             mut started_at,
             body_json,
             mut auth,
+            turn_state,
+            mut turn_state_attempt,
             mut auth_refresh_attempted,
             use_responses_lite,
             codex_auto_review,
@@ -1461,6 +1593,7 @@ impl CodexHttpClient {
                             continue;
                         };
                         event_count = event_count.saturating_add(1);
+                        turn_state_attempt.capture_event(&payload);
                         if let Some(traffic) = traffic.as_deref() {
                             write_codex_http_sse_event_capture(
                                 traffic,
@@ -1636,15 +1769,22 @@ impl CodexHttpClient {
                             use_responses_lite,
                             codex_auto_review,
                             &mut auth_refresh_attempted,
+                            &turn_state,
                         ) => result
                     };
                     match next_attempt {
-                        Ok((next_resp, next_response_headers, next_started_at)) => {
+                        Ok((
+                            next_resp,
+                            next_response_headers,
+                            next_started_at,
+                            next_turn_state_attempt,
+                        )) => {
                             provenance_publisher
                                 .publish_provenance(auth.provenance(&client.base_url));
                             resp = next_resp;
                             response_headers = next_response_headers;
                             started_at = next_started_at;
+                            turn_state_attempt = next_turn_state_attempt;
                             continue 'attempts;
                         }
                         Err(error) if retryable_http_stream_error(&error) => {
@@ -1733,6 +1873,7 @@ impl CodexHttpClient {
                         ctx,
                         body.client_metadata.is_some(),
                         codex_auto_review,
+                        &body.turn_state,
                     );
                     let response = if http_fallback {
                         tokio::time::timeout_at(
@@ -1754,6 +1895,7 @@ impl CodexHttpClient {
                     response.map(|response| OwnerAwareCodexResponse::new(response, None))
                 }
                 CodexTransport::WebSocket | CodexTransport::Auto => {
+                    let turn_state = body.turn_state.bind(auth.provenance(&self.base_url));
                     let ws_headers = build_codex_response_headers(
                         &auth,
                         ctx,
@@ -1767,6 +1909,7 @@ impl CodexHttpClient {
                         active_continuation
                             .as_ref()
                             .map(super::continuation::ContinuationReservation::candidate),
+                        &turn_state,
                     );
 
                     // Try WebSocket first
@@ -1781,6 +1924,7 @@ impl CodexHttpClient {
                         super::websocket::WEBSOCKET_IDLE_TIMEOUT_MS,
                         active_continuation.as_ref(),
                         auth.provenance(&self.base_url),
+                        &turn_state,
                         &mut safe_http_fallback,
                     )
                     .await;
@@ -1809,6 +1953,7 @@ impl CodexHttpClient {
                                 ctx,
                                 body.client_metadata.is_some(),
                                 codex_auto_review,
+                                &body.turn_state,
                             )
                             .await
                             .map(|response| OwnerAwareCodexResponse::new(response, None))
@@ -2208,11 +2353,13 @@ impl CodexHttpClient {
                 }
             };
             let mut stream = {
+                let turn_state = body.turn_state.bind(auth.provenance(&self.base_url));
                 let ws_body = build_websocket_request(
                     &body,
                     continuation
                         .as_ref()
                         .map(super::continuation::ContinuationReservation::candidate),
+                    &turn_state,
                 );
                 let start = super::websocket::codex_websocket_event_stream(
                     &self.websocket_client,
@@ -2225,6 +2372,7 @@ impl CodexHttpClient {
                     super::websocket::WEBSOCKET_IDLE_TIMEOUT_MS,
                     continuation.as_ref(),
                     auth.provenance(&self.base_url),
+                    turn_state,
                 );
                 tokio::select! {
                     biased;
@@ -2504,31 +2652,51 @@ impl CodexHttpClient {
 
     async fn attempt_post_http(
         &self,
-        auth: &StoredAuth,
+        auth: &OperationAuth,
         body_json: &Bytes,
         ctx: &RequestContext,
         use_responses_lite: bool,
         codex_auto_review: bool,
+        turn_state: &CodexTurnState,
     ) -> Result<CodexResponse, CodexError> {
-        let (resp, started_at) = self
-            .start_post_http(auth, body_json, ctx, use_responses_lite, codex_auto_review)
+        let (resp, started_at, turn_state_attempt) = self
+            .start_post_http(
+                auth,
+                body_json,
+                ctx,
+                use_responses_lite,
+                codex_auto_review,
+                turn_state,
+            )
             .await?;
         super::rate_limits::record(super::rate_limits::telemetry_headers(resp.headers()));
-        self.collect_http_response(resp, started_at, ctx, "buffered", "Codex response body")
-            .await
+        self.collect_http_response_with_turn_state(
+            resp,
+            started_at,
+            ctx,
+            "buffered",
+            "Codex response body",
+            Some(&turn_state_attempt),
+        )
+        .await
     }
 
     async fn start_post_http(
         &self,
-        auth: &StoredAuth,
+        auth: &OperationAuth,
         body_json: &Bytes,
         ctx: &RequestContext,
         use_responses_lite: bool,
         codex_auto_review: bool,
-    ) -> Result<(reqwest::Response, Instant), CodexError> {
+        turn_state: &CodexTurnState,
+    ) -> Result<(reqwest::Response, Instant, CodexTurnStateAttempt), CodexError> {
         let url = &self.base_url;
-        let headers =
+        let turn_state_attempt = turn_state.bind(auth.provenance(url));
+        let mut headers =
             build_codex_response_headers(auth, ctx, use_responses_lite, codex_auto_review, url)?;
+        if let Some(value) = turn_state_attempt.value() {
+            headers.insert(CODEX_TURN_STATE, value);
+        }
 
         if let Some(traffic) = ctx.traffic.as_deref() {
             write_codex_http_request_capture(traffic, url, &headers, body_json);
@@ -2580,18 +2748,45 @@ impl CodexHttpClient {
                 }
             })?;
 
+        if let Some(value) = resp
+            .headers()
+            .get(CODEX_TURN_STATE)
+            .and_then(|value| value.to_str().ok())
+        {
+            turn_state_attempt.capture(value);
+        }
         super::rate_limits::record(super::rate_limits::telemetry_headers(resp.headers()));
 
-        Ok((resp, started_at))
+        Ok((resp, started_at, turn_state_attempt))
     }
 
     async fn collect_http_response(
+        &self,
+        resp: reqwest::Response,
+        started_at: Instant,
+        ctx: &RequestContext,
+        phase: &'static str,
+        body_error_label: &str,
+    ) -> Result<CodexResponse, CodexError> {
+        self.collect_http_response_with_turn_state(
+            resp,
+            started_at,
+            ctx,
+            phase,
+            body_error_label,
+            None,
+        )
+        .await
+    }
+
+    async fn collect_http_response_with_turn_state(
         &self,
         mut resp: reqwest::Response,
         started_at: Instant,
         ctx: &RequestContext,
         phase: &'static str,
         body_error_label: &str,
+        turn_state: Option<&CodexTurnStateAttempt>,
     ) -> Result<CodexResponse, CodexError> {
         let status = resp.status().as_u16();
         let headers: Vec<(String, String)> = resp
@@ -2601,6 +2796,9 @@ impl CodexHttpClient {
             .collect();
 
         let mut body_bytes = Vec::new();
+        let mut routing_decoder = turn_state
+            .filter(|state| state.0.is_some() && state.value().is_none())
+            .map(|state| (HttpSseDecoder::default(), state));
         let mut diagnostics = HttpBodyDiagnostics::new(&resp, started_at);
         let mut response_started = false;
         loop {
@@ -2643,6 +2841,28 @@ impl CodexHttpClient {
                     monitor.generation_started(&ctx.req_id);
                 }
                 response_started = true;
+            }
+            // Decode only the still-admissible prefix with the existing bounded
+            // frame parser. Capture metadata before a later read/budget failure;
+            // optional routing parsing must not reject a non-SSE error body.
+            let mut stop_routing_decode = false;
+            if let Some((decoder, state)) = routing_decoder.as_mut() {
+                let admissible = chunk
+                    .len()
+                    .min(MAX_PENDING_HTTP_EVENT_BYTES.saturating_sub(body_bytes.len()));
+                for event in decoder.push(&chunk[..admissible]) {
+                    let Ok(event) = event else {
+                        stop_routing_decode = true;
+                        break;
+                    };
+                    if let Some(payload) = event.payload {
+                        state.capture_event(&payload);
+                    }
+                }
+                stop_routing_decode |= state.value().is_some();
+            }
+            if stop_routing_decode {
+                routing_decoder = None;
             }
             ensure_transport_buffer_budget(
                 body_bytes.len(),
@@ -3579,12 +3799,17 @@ fn codex_status_error_message(body: &[u8]) -> Option<String> {
     serde_json::from_slice::<serde_json::Value>(body)
         .ok()
         .and_then(|value| {
-            value
+            let code = value
+                .pointer("/error/code")
+                .or_else(|| value.get("code"))
+                .and_then(serde_json::Value::as_str);
+            let message = value
                 .pointer("/error/message")
                 .or_else(|| value.get("message"))
                 .or_else(|| value.get("detail"))
-                .and_then(|value| value.as_str())
-                .map(str::to_string)
+                .and_then(serde_json::Value::as_str);
+            super::events::context_overflow_message(code, message.unwrap_or("Upstream error"))
+                .or_else(|| message.map(str::to_owned))
         })
         .or_else(|| {
             let text = String::from_utf8_lossy(body);

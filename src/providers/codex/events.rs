@@ -183,6 +183,24 @@ pub(crate) fn response_is_incomplete_terminal(payload: &Value) -> bool {
             || incomplete_details.is_some_and(|details| !details.is_null()))
 }
 
+/// Normalize genuine overflow before an adapter loses the upstream error code.
+/// Claude Code recognizes this signal even when an SSE error has no HTTP status.
+pub(crate) fn context_overflow_message(code: Option<&str>, message: &str) -> Option<String> {
+    let lower = message.to_ascii_lowercase();
+    let overflow = match code {
+        Some("context_length_exceeded") => true,
+        Some(_) => false,
+        None => lower.contains("context window") || lower.contains("context length exceeded"),
+    };
+    overflow.then(|| {
+        if lower.starts_with("prompt is too long") {
+            message.to_owned()
+        } else {
+            format!("Prompt is too long: {message}")
+        }
+    })
+}
+
 pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailure> {
     let event_type = payload.get("type").and_then(Value::as_str)?;
     let response_status = payload
@@ -285,9 +303,8 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
         _ => "Upstream error".to_string(),
     };
     let lower = message.to_ascii_lowercase();
-    let context_window = code == Some("context_length_exceeded")
-        || (code.is_none()
-            && (lower.contains("context window") || lower.contains("context length exceeded")));
+    let context_message = context_overflow_message(code, &message);
+    let context_window = context_message.is_some();
 
     let kind = if context_window
         || matches!(
@@ -388,13 +405,7 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
         kind,
         explicit_status,
         status,
-        // Claude Code recognizes this text even when an SSE error has no HTTP
-        // status. Do not confuse ordinary payload-size failures with overflow.
-        message: if context_window && !lower.contains("prompt is too long") {
-            format!("Prompt is too long: {message}")
-        } else {
-            message
-        },
+        message: context_message.unwrap_or(message),
         retry_after,
     })
 }

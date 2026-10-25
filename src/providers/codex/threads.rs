@@ -422,6 +422,7 @@ pub(crate) fn settle(
     portable.messages.push(Message {
         role: "assistant".into(),
         content: content.clone(),
+        output_config: None,
     });
     let bytes = size(&portable)
         .saturating_add(size(&request.input))

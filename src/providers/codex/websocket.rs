@@ -1,11 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt, stream::FuturesUnordered};
 use http::HeaderMap;
 use hyper_util::client::proxy::matcher::Matcher as ProxyMatcher;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -28,8 +28,8 @@ use crate::retry::sleep as retry_sleep;
 use crate::traffic::TrafficCapture;
 
 use super::client::{
-    ActualTransport, CodexError, CodexErrorOrigin, CodexResponse, OwnerAwareCodexResponse,
-    headers_to_json, summarize_json_request_size,
+    ActualTransport, CodexError, CodexErrorOrigin, CodexResponse, CodexTurnStateAttempt,
+    OwnerAwareCodexResponse, headers_to_json, summarize_json_request_size,
 };
 use super::continuation::ContinuationReservation;
 use super::events::event_is_terminal;
@@ -56,6 +56,7 @@ const MAX_POOL_ENTRIES: usize = 10_000;
 const POOL_CONNECT_CLEANUP_THRESHOLD: usize = 50;
 const POOL_CONNECT_CLEANUP_TARGET: usize = 40;
 const MAX_CONNECT_RESPONSE_HEADER_BYTES: usize = 8 * 1024;
+const PROXY_TCP_ATTEMPT_DELAY: Duration = Duration::from_millis(250);
 // Premier palier appliqué dès qu'une origine refuse un upgrade, puis doublement.
 const WEBSOCKET_CONNECT_BACKOFF_STEP: Duration = Duration::from_secs(1);
 const WEBSOCKET_CONNECT_MAX_SPACING: Duration = Duration::from_secs(8);
@@ -795,6 +796,7 @@ pub(super) async fn codex_websocket_request(
     idle_timeout_ms: u64,
     reservation: Option<&ContinuationReservation>,
     provenance: Option<super::models::OperationProvenance>,
+    turn_state: &CodexTurnStateAttempt,
     safe_http_fallback: &mut bool,
 ) -> Result<OwnerAwareCodexResponse, CodexError> {
     super::rate_limits::record(Vec::new());
@@ -891,8 +893,14 @@ pub(super) async fn codex_websocket_request(
             }
         })?;
 
-    let collected =
-        collect_ws_events(&mut guard, idle_timeout_ms, traffic, safe_http_fallback).await;
+    let collected = collect_ws_events(
+        &mut guard,
+        idle_timeout_ms,
+        traffic,
+        safe_http_fallback,
+        turn_state,
+    )
+    .await;
     drop(guard);
     let (sse_body, terminal_event) = match collected {
         Ok(result) => result,
@@ -1104,6 +1112,7 @@ pub(super) fn start_codex_websocket_events(
     body_json: String,
     headers: &HeaderMap,
     reservation: Option<&ContinuationReservation>,
+    turn_state: CodexTurnStateAttempt,
 ) -> CodexWebSocketEventStream {
     if let Some(tc) = ready.traffic.as_deref() {
         write_websocket_metadata_capture(tc, &ready.ws_url, reservation, ready.used_pooled);
@@ -1150,7 +1159,7 @@ pub(super) fn start_codex_websocket_events(
             return;
         }
         let (reusable, terminal_item) =
-            stream_ws_events(&mut guard, idle_timeout_ms, traffic, &tx).await;
+            stream_ws_events(&mut guard, idle_timeout_ms, traffic, &tx, &turn_state).await;
         drop(guard);
 
         let origin_reinserted = if reusable {
@@ -1187,6 +1196,7 @@ pub(super) async fn codex_websocket_event_stream(
     idle_timeout_ms: u64,
     reservation: Option<&ContinuationReservation>,
     provenance: Option<super::models::OperationProvenance>,
+    turn_state: CodexTurnStateAttempt,
 ) -> Result<CodexWebSocketEventStream, CodexError> {
     let body_json = serde_json::to_string(body_value).map_err(|error| CodexError {
         status: 500,
@@ -1214,6 +1224,7 @@ pub(super) async fn codex_websocket_event_stream(
         body_json,
         headers,
         reservation,
+        turn_state,
     ))
 }
 
@@ -1739,6 +1750,59 @@ async fn tls_connect(
     Ok(Box::new(stream))
 }
 
+// Race only proxy TCP addresses. The caller's existing deadline also covers
+// resolution and later TLS/tunnel stages; dropping this future drops all attempts.
+async fn connect_proxy_tcp(host: &str, port: u16) -> std::io::Result<TcpStream> {
+    let mut resolved = tokio::net::lookup_host((host, port)).await?;
+    let first = resolved.next().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "proxy resolved to no addresses",
+        )
+    })?;
+    let (mut preferred, mut alternate): (VecDeque<_>, VecDeque<_>) =
+        resolved.partition(|address| address.is_ipv4() == first.is_ipv4());
+    let mut addresses = VecDeque::new();
+    while !preferred.is_empty() || !alternate.is_empty() {
+        if let Some(address) = alternate.pop_front() {
+            addresses.push_back(address);
+        }
+        if let Some(address) = preferred.pop_front() {
+            addresses.push_back(address);
+        }
+    }
+
+    let mut attempts = FuturesUnordered::new();
+    attempts.push(TcpStream::connect(first));
+    let delay = tokio::time::sleep(PROXY_TCP_ATTEMPT_DELAY);
+    tokio::pin!(delay);
+    let mut last_error = None;
+    loop {
+        tokio::select! {
+            biased;
+            Some(result) = attempts.next(), if !attempts.is_empty() => match result {
+                Ok(stream) => return Ok(stream),
+                Err(error) => {
+                    last_error = Some(error);
+                    if let Some(address) = addresses.pop_front() {
+                        attempts.push(TcpStream::connect(address));
+                        delay.as_mut().reset(tokio::time::Instant::now() + PROXY_TCP_ATTEMPT_DELAY);
+                    }
+                }
+            },
+            _ = &mut delay, if !addresses.is_empty() => {
+                if let Some(address) = addresses.pop_front() {
+                    attempts.push(TcpStream::connect(address));
+                    delay.as_mut().reset(tokio::time::Instant::now() + PROXY_TCP_ATTEMPT_DELAY);
+                }
+            },
+            else => return Err(last_error.unwrap_or_else(|| {
+                std::io::Error::other("proxy connection attempts ended without an error")
+            })),
+        }
+    }
+}
+
 async fn connect_to_http_proxy(
     route: &WebSocketProxyRoute,
     tls_config: Arc<rustls::ClientConfig>,
@@ -1753,7 +1817,7 @@ async fn connect_to_http_proxy(
         .uri
         .port_u16()
         .unwrap_or(if scheme == "https" { 443 } else { 80 });
-    let stream = TcpStream::connect((host, port))
+    let stream = connect_proxy_tcp(host, port)
         .await
         .map_err(|_| CodexError {
             status: 0,
@@ -2116,6 +2180,7 @@ async fn collect_ws_events<S>(
     idle_timeout_ms: u64,
     traffic: Option<&TrafficCapture>,
     safe_http_fallback: &mut bool,
+    turn_state: &CodexTurnStateAttempt,
 ) -> Result<(Vec<u8>, Option<WsEvent>), CodexError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -2174,6 +2239,7 @@ where
                     }
                 };
 
+                turn_state.capture_event(&parsed);
                 // A discarded partial body must never hide text or tool replay risk.
                 *safe_http_fallback &= matches!(
                     parsed.get("type").and_then(serde_json::Value::as_str),
@@ -2253,6 +2319,7 @@ async fn stream_ws_events<S>(
     idle_timeout_ms: u64,
     traffic: Option<Arc<TrafficCapture>>,
     tx: &mpsc::Sender<Result<serde_json::Value, CodexError>>,
+    turn_state: &CodexTurnStateAttempt,
 ) -> (bool, Option<Result<serde_json::Value, CodexError>>)
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -2330,6 +2397,7 @@ where
                     }
                 };
 
+                turn_state.capture_event(&parsed);
                 if let Some(tc) = traffic.as_deref() {
                     tc.write_json_event("040-upstream-event", &parsed);
                 }

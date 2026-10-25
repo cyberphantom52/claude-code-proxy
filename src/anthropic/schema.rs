@@ -27,6 +27,23 @@ pub struct MessagesRequest {
 pub struct Message {
     pub role: String,
     pub content: serde_json::Value,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_output_config"
+    )]
+    pub output_config: Option<serde_json::Value>,
+}
+
+// Retain explicit null too: every supplied per-message control must reach the
+// capability validator instead of silently becoming an absent field.
+fn deserialize_present_output_config<'de, D>(
+    deserializer: D,
+) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde_json::Value::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

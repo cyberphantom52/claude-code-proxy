@@ -2194,10 +2194,6 @@ fn map_codex_error_to_response(err: &client::CodexError) -> Response {
     if let Some(limit) = err.usage_limit.as_ref() {
         return usage_limit_response(limit);
     }
-    let message = codex_error_message(err);
-    if is_context_window_overflow(message) {
-        return map_codex_failure_to_response(message);
-    }
     if err.detail.as_deref() == Some(EMPTY_CODEX_COMPLETION_DETAIL) {
         // The proxy has already spent its own retry budget on this request, so
         // a client retry only multiplies it: Claude Code resends a 503 up to
@@ -2267,7 +2263,12 @@ fn map_codex_error_to_response(err: &client::CodexError) -> Response {
 }
 
 fn map_codex_failure_to_response(message: &str) -> Response {
-    if is_context_window_overflow(message) {
+    let context_overflow = message
+        .strip_prefix("Accumulation error: ")
+        .unwrap_or(message)
+        .to_ascii_lowercase()
+        .starts_with("prompt is too long");
+    if context_overflow {
         json_error(StatusCode::PAYLOAD_TOO_LARGE, "request_too_large", message)
     } else {
         json_error(StatusCode::BAD_GATEWAY, "api_error", message)
@@ -2287,10 +2288,6 @@ fn map_codex_event_failure_to_response(failure: &events::CodexEventFailure) -> R
     } else {
         response
     }
-}
-
-fn is_context_window_overflow(message: &str) -> bool {
-    message.to_ascii_lowercase().contains("context window")
 }
 
 fn codex_error_message(err: &client::CodexError) -> &str {
