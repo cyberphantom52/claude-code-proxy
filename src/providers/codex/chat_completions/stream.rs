@@ -79,6 +79,12 @@ async fn next_frame(
         if state.process_pending_frame() {
             continue;
         }
+        if state.received_bytes > MAX_SSE_CAPTURE_BYTES {
+            state.fail(ChatError::upstream(
+                "Codex response exceeded the response byte limit",
+            ));
+            continue;
+        }
         match tokio::time::timeout(
             Duration::from_millis(state.body_idle_timeout_ms),
             state.upstream.next(),
@@ -146,17 +152,15 @@ impl StreamState {
             }
             self.generation_started = true;
         }
+        let inspected = MAX_SSE_CAPTURE_BYTES
+            .saturating_sub(self.received_bytes)
+            .min(chunk.len());
         self.received_bytes = self.received_bytes.saturating_add(chunk.len());
-        if self.received_bytes > MAX_SSE_CAPTURE_BYTES {
-            self.fail(ChatError::upstream(
-                "Codex response exceeded the response byte limit",
-            ));
-            return;
-        }
+        // Validate any terminal inside the bounded prefix before rejecting its tail.
         if self.ctx.traffic.is_some() {
-            self.raw.extend_from_slice(chunk);
+            self.raw.extend_from_slice(&chunk[..inspected]);
         }
-        self.pending.extend_from_slice(chunk);
+        self.pending.extend_from_slice(&chunk[..inspected]);
         if let Some(monitor) = self.ctx.monitor.as_ref() {
             monitor.stream_progress(
                 &self.ctx.req_id,
