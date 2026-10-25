@@ -39,18 +39,12 @@ impl LayoutTier {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ColumnWidth {
-    Fixed(u16),
-    Flex(u16),
-}
-
 #[derive(Clone, Copy, Debug)]
 pub struct ColumnSpec<K> {
     pub key: K,
     pub header: &'static str,
     pub alignment: Alignment,
-    pub width: ColumnWidth,
+    pub width: Constraint,
 }
 
 impl<K> ColumnSpec<K> {
@@ -59,7 +53,7 @@ impl<K> ColumnSpec<K> {
             key,
             header,
             alignment,
-            width: ColumnWidth::Fixed(width),
+            width: Constraint::Length(width),
         }
     }
 
@@ -68,14 +62,11 @@ impl<K> ColumnSpec<K> {
             key,
             header,
             alignment,
-            width: ColumnWidth::Flex(weight),
+            width: Constraint::Fill(weight),
         }
     }
 
     pub fn constraint(&self) -> Constraint {
-        match self.width {
-            ColumnWidth::Fixed(width) => Constraint::Length(width),
-            ColumnWidth::Flex(weight) => Constraint::Fill(weight),
-        }
+        self.width
     }
 }
