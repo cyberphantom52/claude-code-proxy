@@ -9,9 +9,13 @@ use crate::provider::RequestContext;
 use crate::providers::codex::client::{CodexError, CodexHttpClient};
 use crate::request_identity::ConversationIdentity;
 
+use super::count_tokens::{
+    approx_token_count, count_function_call_output_tokens, count_translated_tokens,
+};
+use super::translate::model_catalog::catalog_model;
 use super::translate::request::{
-    ResponsesContentPart, ResponsesInputItem, ResponsesRequest, ResponsesToolChoice,
-    ResponsesToolChoiceMode, is_compact_message_text,
+    ResponsesContentPart, ResponsesFunctionCallOutput, ResponsesInputItem, ResponsesRequest,
+    ResponsesToolChoice, ResponsesToolChoiceMode, is_compact_message_text,
 };
 
 const RETAINED_MESSAGE_TOKEN_BUDGET: u64 = 20_000;
@@ -20,6 +24,9 @@ const MAX_STATES: usize = 1_000;
 const MAX_STATE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TOTAL_STATE_BYTES: usize = 20_000_000;
 const MIN_PORTABLE_SUMMARY_BYTES: usize = 32;
+// Codex 970111f6 core/src/compact_remote_history.rs.
+const CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE: &str =
+    "Output exceeded the available model context and was truncated";
 
 #[derive(Debug)]
 pub enum CompactionError {
@@ -82,7 +89,8 @@ pub async fn request_compaction(
     request: &ResponsesRequest,
     ctx: &RequestContext,
 ) -> Result<Vec<ResponsesInputItem>, CompactionError> {
-    let compaction_request = build_compaction_request(request);
+    let mut compaction_request = build_compaction_request(request);
+    fit_compaction_history(&mut compaction_request)?;
     let response = client
         .post_codex_for_owner(&compaction_request, ctx, None)
         .await
@@ -120,6 +128,61 @@ fn build_compaction_request(request: &ResponsesRequest) -> ResponsesRequest {
     compaction_request.text.format = None;
     compaction_request.parallel_tool_calls = request.client_metadata.is_none();
     compaction_request
+}
+
+fn fit_compaction_history(request: &mut ResponsesRequest) -> Result<(), CompactionError> {
+    let Some(model) = catalog_model(&request.model) else {
+        return Ok(());
+    };
+    let Some(window) = model.context_window.or(model.max_context_window) else {
+        // Unknown model limits retain the existing upstream/fallback behavior.
+        return Ok(());
+    };
+    // Codex 970111f6 protocol/src/openai_models.rs defaults this metadata field
+    // to 95 and uses context_window before max_context_window (not auto-compact).
+    let percent = model.effective_context_window_percent.unwrap_or(95);
+    if window == 0 || !(1..=100).contains(&percent) {
+        return Err(CompactionError::InvalidResponse(
+            "invalid compaction model context-window metadata".into(),
+        ));
+    }
+    let usable_window = (u128::from(window) * u128::from(percent) / 100) as u64;
+    let mut estimated_tokens = count_translated_tokens(request);
+    let marker_tokens = approx_token_count(CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE);
+    let Some((ResponsesInputItem::CompactionTrigger, history)) = request.input.split_last_mut()
+    else {
+        return Err(CompactionError::InvalidResponse(
+            "compaction input is missing its final trigger".into(),
+        ));
+    };
+    // Match compact_remote_history.rs: only the contiguous output suffix is
+    // eligible. Never cross messages, calls, reasoning, or opaque compactions.
+    // ponytail: local token estimates, not provider admission guarantees; use
+    // provider token accounting if it becomes available for compaction inputs.
+    for item in history.iter_mut().rev() {
+        if estimated_tokens <= usable_window {
+            break;
+        }
+        let ResponsesInputItem::FunctionCallOutput { output, .. } = item else {
+            break;
+        };
+        let output_tokens = count_function_call_output_tokens(output);
+        if output_tokens > marker_tokens {
+            *output = ResponsesFunctionCallOutput::Text(
+                CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE.to_string(),
+            );
+            estimated_tokens = estimated_tokens
+                .saturating_sub(output_tokens)
+                .saturating_add(marker_tokens);
+        }
+    }
+    if estimated_tokens > usable_window {
+        return Err(CompactionError::InvalidResponse(
+            "compaction input exceeds known model context after eligible tool-output truncation"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn begin_compaction_scoped(scope: &CompactionScope, model: &str) -> CompactionAttempt {

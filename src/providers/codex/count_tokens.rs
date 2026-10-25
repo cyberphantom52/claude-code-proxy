@@ -88,7 +88,7 @@ fn count_input_item_tokens(item: &ResponsesInputItem, scratch: &mut Vec<u8>) -> 
     }
 }
 
-fn count_function_call_output_tokens(output: &ResponsesFunctionCallOutput) -> u64 {
+pub(super) fn count_function_call_output_tokens(output: &ResponsesFunctionCallOutput) -> u64 {
     match output {
         ResponsesFunctionCallOutput::Text(text) => approx_token_count(text),
         ResponsesFunctionCallOutput::ContentItems(content) => content
