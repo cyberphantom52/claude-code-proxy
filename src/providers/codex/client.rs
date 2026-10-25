@@ -254,50 +254,28 @@ pub fn build_codex_image_headers(
     auth: &StoredAuth,
     ctx: &RequestContext,
 ) -> Result<http::HeaderMap, CodexError> {
-    let mut headers = http::HeaderMap::new();
-    headers.insert(
-        http::header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
-    headers.insert(
-        http::header::ACCEPT,
-        HeaderValue::from_static("application/json"),
-    );
-    headers.insert(
-        http::header::AUTHORIZATION,
-        header_value("authorization", &format!("Bearer {}", auth.access))?,
-    );
-    headers.insert(
-        "originator",
-        header_value("originator", &config::codex_originator(ORIGINATOR))?,
-    );
-    if let Some(account_id) = auth.account_id.as_deref() {
-        headers.insert(
-            "ChatGPT-Account-Id",
-            header_value("ChatGPT-Account-Id", account_id)?,
-        );
-    }
-    if let Some(session_id) = ctx.session_id.as_deref() {
-        headers.insert(
-            "x-client-request-id",
-            header_value("x-client-request-id", session_id)?,
-        );
-    }
-    let user_agent = config::codex_user_agent(&default_user_agent(false));
-    if !user_agent.is_empty() {
-        headers.insert(
-            http::header::USER_AGENT,
-            header_value("user-agent", &user_agent)?,
-        );
-    }
-    Ok(headers)
+    build_codex_media_headers(auth, ctx, true)
 }
 
 pub fn build_codex_transcription_headers(
     auth: &StoredAuth,
     ctx: &RequestContext,
 ) -> Result<http::HeaderMap, CodexError> {
+    build_codex_media_headers(auth, ctx, false)
+}
+
+fn build_codex_media_headers(
+    auth: &StoredAuth,
+    ctx: &RequestContext,
+    image: bool,
+) -> Result<http::HeaderMap, CodexError> {
     let mut headers = http::HeaderMap::new();
+    if image {
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+    }
     headers.insert(
         http::header::ACCEPT,
         HeaderValue::from_static("application/json"),
@@ -306,7 +284,12 @@ pub fn build_codex_transcription_headers(
         http::header::AUTHORIZATION,
         header_value("authorization", &format!("Bearer {}", auth.access))?,
     );
-    headers.insert("originator", header_value("originator", "Codex Desktop")?);
+    let originator = if image {
+        Cow::Owned(config::codex_originator(ORIGINATOR))
+    } else {
+        Cow::Borrowed("Codex Desktop")
+    };
+    headers.insert("originator", header_value("originator", &originator)?);
     if let Some(account_id) = auth.account_id.as_deref() {
         headers.insert(
             "ChatGPT-Account-Id",
@@ -538,23 +521,18 @@ fn decode_http_sse_frame(frame: &[u8]) -> Result<Option<DecodedHttpSseEvent>, Co
 
 fn http_sse_error(message: &str) -> CodexError {
     CodexError {
-        status: 0,
-        message: message.to_string(),
         detail: Some("http_response_sse".to_string()),
-        retry_after: None,
-        usage_limit: None,
-        origin: CodexErrorOrigin::Http,
+        ..CodexError::new(0, message.to_string())
     }
 }
 
 fn http_sse_protocol_error(message: &str) -> CodexError {
     CodexError {
-        status: 0,
-        message: format!("Codex HTTP tool event protocol error: {message}"),
         detail: Some("http_response_sse_protocol".to_string()),
-        retry_after: None,
-        usage_limit: None,
-        origin: CodexErrorOrigin::Http,
+        ..CodexError::new(
+            0,
+            format!("Codex HTTP tool event protocol error: {message}"),
+        )
     }
 }
 
@@ -819,12 +797,8 @@ impl CodexHttpClient {
             .file_name(input.filename.clone())
             .mime_str(&input.content_type)
             .map_err(|error| CodexError {
-                status: 400,
-                message: "Invalid audio content type".to_string(),
                 detail: Some(error.to_string()),
-                retry_after: None,
-                usage_limit: None,
-                origin: CodexErrorOrigin::Http,
+                ..CodexError::new(400, "Invalid audio content type".to_string())
             })?;
         let mut form = reqwest::multipart::Form::new().part("file", part);
         if let Some(language) = input.language.as_deref() {
@@ -871,12 +845,8 @@ impl CodexHttpClient {
         let body_json = serde_json::to_vec(body)
             .map(|body| Bytes::from(body.into_boxed_slice()))
             .map_err(|error| CodexError {
-                status: 500,
-                message: "Failed to serialize image request".to_string(),
                 detail: Some(error.to_string()),
-                retry_after: None,
-                usage_limit: None,
-                origin: CodexErrorOrigin::Http,
+                ..CodexError::new(500, "Failed to serialize image request".to_string())
             })?;
         let url = format!(
             "{}/{}",
@@ -959,12 +929,11 @@ impl CodexHttpClient {
         let body_json = serde_json::to_vec(body)
             .map(|body| Bytes::from(body.into_boxed_slice()))
             .map_err(|err| CodexError {
-                status: 500,
-                message: "Failed to serialize native Responses request".to_string(),
                 detail: Some(err.to_string()),
-                retry_after: None,
-                usage_limit: None,
-                origin: CodexErrorOrigin::Http,
+                ..CodexError::new(
+                    500,
+                    "Failed to serialize native Responses request".to_string(),
+                )
             })?;
         let mut auth = self.operation_auth().await.map_err(initial_auth_error)?;
         if body
@@ -1065,12 +1034,8 @@ impl CodexHttpClient {
         let body_json = serde_json::to_vec(body)
             .map(|body| Bytes::from(body.into_boxed_slice()))
             .map_err(|e| CodexError {
-                status: 500,
-                message: "Failed to serialize search request".to_string(),
                 detail: Some(e.to_string()),
-                retry_after: None,
-                usage_limit: None,
-                origin: CodexErrorOrigin::Http,
+                ..CodexError::new(500, "Failed to serialize search request".to_string())
             })?;
         let mut auth_refresh_attempted = false;
         let mut retries = 0_u32;
@@ -1107,12 +1072,8 @@ impl CodexHttpClient {
                 return Err(codex_status_error(response));
             }
             return serde_json::from_slice(&response.body).map_err(|e| CodexError {
-                status: 502,
-                message: "Failed to decode Codex search response".to_string(),
                 detail: Some(e.to_string()),
-                retry_after: None,
-                usage_limit: None,
-                origin: CodexErrorOrigin::Http,
+                ..CodexError::new(502, "Failed to decode Codex search response".to_string())
             });
         }
     }
@@ -1133,12 +1094,8 @@ impl CodexHttpClient {
         let body_json = serde_json::to_vec(body)
             .map(|body| Bytes::from(body.into_boxed_slice()))
             .map_err(|e| CodexError {
-                status: 500,
-                message: "Failed to serialize request".to_string(),
                 detail: Some(e.to_string()),
-                retry_after: None,
-                usage_limit: None,
-                origin: CodexErrorOrigin::Http,
+                ..CodexError::new(500, "Failed to serialize request".to_string())
             })?;
         let mut auth_refresh_attempted = false;
         let use_responses_lite = body.client_metadata.is_some();
@@ -1425,14 +1382,11 @@ impl CodexHttpClient {
                         Ok(Err(err)) => {
                             diagnostics.log_failure(&ctx, "stream", "read_error", Some(&err));
                             let error = CodexError {
-                                status: 0,
-                                message: format!(
-                                    "Transport error reading Codex response body: {err}"
-                                ),
                                 detail: Some("http_response_body".to_string()),
-                                retry_after: None,
-                                usage_limit: None,
-                                origin: CodexErrorOrigin::Http,
+                                ..CodexError::new(
+                                    0,
+                                    format!("Transport error reading Codex response body: {err}"),
+                                )
                             };
                             log_http_stream_end(
                                 &log,
@@ -1453,14 +1407,13 @@ impl CodexHttpClient {
                         Err(_) => {
                             diagnostics.log_failure(&ctx, "stream", "idle_timeout", None);
                             let error = CodexError {
-                                status: 0,
-                                message: format!(
-                                    "Timed out waiting {body_idle_timeout_ms}ms for the next Codex response body chunk"
-                                ),
                                 detail: Some("http_response_body".to_string()),
-                                retry_after: None,
-                                usage_limit: None,
-                                origin: CodexErrorOrigin::Http,
+                                ..CodexError::new(
+                                    0,
+                                    format!(
+                                        "Timed out waiting {body_idle_timeout_ms}ms for the next Codex response body chunk"
+                                    ),
+                                )
                             };
                             log_http_stream_end(
                                 &log,
@@ -2596,15 +2549,14 @@ impl CodexHttpClient {
         let resp = tokio::time::timeout(header_timeout_dur, send_fut)
             .await
             .map_err(|_| CodexError {
-                status: 0,
-                message: format!(
-                    "Timed out waiting {}ms for Codex response headers",
-                    self.header_timeout_ms
-                ),
                 detail: Some(HTTP_RESPONSE_HEADERS_DETAIL.to_string()),
-                retry_after: None,
-                usage_limit: None,
-                origin: CodexErrorOrigin::Http,
+                ..CodexError::new(
+                    0,
+                    format!(
+                        "Timed out waiting {}ms for Codex response headers",
+                        self.header_timeout_ms
+                    ),
+                )
             })?
             .map_err(|e| {
                 if is_retryable_reqwest_error(&e) {
@@ -2660,15 +2612,14 @@ impl CodexHttpClient {
             .map_err(|_| {
                 diagnostics.log_failure(ctx, phase, "idle_timeout", None);
                 CodexError {
-                    status: 0,
-                    message: format!(
-                        "Timed out waiting {}ms for the next {body_error_label} chunk",
-                        self.body_idle_timeout_ms
-                    ),
                     detail: Some("http_response_body".to_string()),
-                    retry_after: None,
-                    usage_limit: None,
-                    origin: CodexErrorOrigin::Http,
+                    ..CodexError::new(
+                        0,
+                        format!(
+                            "Timed out waiting {}ms for the next {body_error_label} chunk",
+                            self.body_idle_timeout_ms
+                        ),
+                    )
                 }
             })?
             .map_err(|e| {

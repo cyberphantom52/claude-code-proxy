@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::models::OperationProvenance;
+use super::now_ms;
 use crate::anthropic::sse::parse_sse_events;
 use crate::provider::RequestContext;
 use crate::providers::codex::client::{CodexError, CodexHttpClient};
@@ -617,13 +617,6 @@ pub(super) fn prune_idle_state() {
     let mut registry = REGISTRY.lock().unwrap();
     evict_states(&mut registry, now_ms());
     registry.shrink_to_fit();
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 fn evict_states(registry: &mut CompactionRegistry, now: u64) {

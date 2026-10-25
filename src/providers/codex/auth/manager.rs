@@ -1,7 +1,8 @@
 use std::sync::LazyLock;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 
+use super::super::now_ms;
 use super::constants::{CLIENT_ID, ISSUER, REFRESH_MARGIN_MS};
 use super::jwt::{RefreshResponse, TokenResponse, extract_account_id, validate_token_response};
 use super::token_store::{CodexTokenStore, StoredAuth};
@@ -27,19 +28,12 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
         }
     }
 
-    fn now_ms() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64
-    }
-
     pub async fn get_auth_snapshot(&self) -> Result<AuthSnapshot<StoredAuth>, anyhow::Error> {
         let snapshot = self.store.load_snapshot()?;
         let stored = snapshot.value.as_ref().ok_or_else(|| {
             anyhow::anyhow!("Not authenticated. Run: claude-code-proxy codex auth login")
         })?;
-        if stored.expires > Self::now_ms().saturating_add(REFRESH_MARGIN_MS) {
+        if stored.expires > now_ms().saturating_add(REFRESH_MARGIN_MS) {
             return Ok(snapshot);
         }
         self.refresh(None).await
@@ -63,7 +57,7 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Not authenticated"))?;
         if (rejected_revision.is_none()
-            && current.expires > Self::now_ms().saturating_add(REFRESH_MARGIN_MS))
+            && current.expires > now_ms().saturating_add(REFRESH_MARGIN_MS))
             || rejected_revision.is_some_and(|revision| snapshot.revision != revision)
         {
             return Ok(snapshot);
@@ -126,7 +120,7 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
         let tokens = tokens.into_tokens(&current.refresh)?;
         let account_id = extract_account_id(&tokens).or_else(|| current.account_id.clone());
         let expires =
-            Self::now_ms().saturating_add(tokens.expires_in.unwrap_or(3600).saturating_mul(1000));
+            now_ms().saturating_add(tokens.expires_in.unwrap_or(3600).saturating_mul(1000));
         let next = StoredAuth {
             access: tokens.access_token,
             refresh: tokens.refresh_token,
@@ -153,7 +147,7 @@ impl<S: AuthStorage<StoredAuth>> CodexAuthManager<S> {
         validate_token_response(tokens)?;
         let account_id = extract_account_id(tokens);
         let expires =
-            Self::now_ms().saturating_add(tokens.expires_in.unwrap_or(3600).saturating_mul(1000));
+            now_ms().saturating_add(tokens.expires_in.unwrap_or(3600).saturating_mul(1000));
         let auth = StoredAuth {
             access: tokens.access_token.clone(),
             refresh: tokens.refresh_token.clone(),

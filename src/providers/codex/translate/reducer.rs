@@ -196,11 +196,7 @@ impl CompletedOutputs {
             .retained_bytes
             .saturating_sub(old_bytes)
             .saturating_add(bytes);
-        if retained.saturating_add(self.summary_parts.retained_bytes as u64)
-            > crate::providers::codex::client::MAX_PENDING_HTTP_EVENT_BYTES as u64
-        {
-            return Err("Codex output reconciliation exceeded its 16 MiB buffer limit".into());
-        }
+        check_output_reconciliation_budget(retained, &self.summary_parts)?;
         self.retained_bytes = retained;
         self.items.insert(index, (item, done));
         Ok(())
@@ -287,15 +283,7 @@ impl CompletedOutputs {
             }
             if self.reserved.insert(index, part_type).is_none() {
                 self.retained_bytes = self.retained_bytes.saturating_add(256);
-                if self
-                    .retained_bytes
-                    .saturating_add(self.summary_parts.retained_bytes as u64)
-                    > crate::providers::codex::client::MAX_PENDING_HTTP_EVENT_BYTES as u64
-                {
-                    return Err(
-                        "Codex output reconciliation exceeded its 16 MiB buffer limit".into(),
-                    );
-                }
+                check_output_reconciliation_budget(self.retained_bytes, &self.summary_parts)?;
             }
         }
         self.refused |= kind.starts_with("response.refusal.")
@@ -322,15 +310,7 @@ impl CompletedOutputs {
                     crate::providers::codex::request_summary::serialized_json_bytes(annotation)
                         .max(256),
                 );
-                if self
-                    .retained_bytes
-                    .saturating_add(self.summary_parts.retained_bytes as u64)
-                    > crate::providers::codex::client::MAX_PENDING_HTTP_EVENT_BYTES as u64
-                {
-                    return Err(
-                        "Codex output reconciliation exceeded its 16 MiB buffer limit".into(),
-                    );
-                }
+                check_output_reconciliation_budget(self.retained_bytes, &self.summary_parts)?;
                 annotations.push(annotation.clone());
             }
         }
@@ -350,13 +330,7 @@ impl CompletedOutputs {
                 .retained_bytes
                 .saturating_sub(old_bytes)
                 .saturating_add(bytes);
-            if self
-                .retained_bytes
-                .saturating_add(self.summary_parts.retained_bytes as u64)
-                > crate::providers::codex::client::MAX_PENDING_HTTP_EVENT_BYTES as u64
-            {
-                return Err("Codex output reconciliation exceeded its 16 MiB buffer limit".into());
-            }
+            check_output_reconciliation_budget(self.retained_bytes, &self.summary_parts)?;
             self.logprobs.insert(key, logprobs.clone());
         }
         if matches!(
@@ -568,13 +542,7 @@ impl CompletedOutputs {
         let mut next = self.summary_parts.parts.len();
         self.summary_parts.ordered = true;
         let deltas = self.summary_parts.accept(&event, &mut next, index)?;
-        if self
-            .retained_bytes
-            .saturating_add(self.summary_parts.retained_bytes as u64)
-            > crate::providers::codex::client::MAX_PENDING_HTTP_EVENT_BYTES as u64
-        {
-            return Err("Codex output reconciliation exceeded its 16 MiB buffer limit".into());
-        }
+        check_output_reconciliation_budget(self.retained_bytes, &self.summary_parts)?;
         let mut suffix = String::new();
         for delta in deltas {
             let ci = delta.content_index;
@@ -748,6 +716,18 @@ impl CompletedOutputs {
         }
         complete
     }
+}
+
+fn check_output_reconciliation_budget(
+    retained_bytes: u64,
+    summary_parts: &TextParts,
+) -> Result<(), String> {
+    if retained_bytes.saturating_add(summary_parts.retained_bytes as u64)
+        > crate::providers::codex::client::MAX_PENDING_HTTP_EVENT_BYTES as u64
+    {
+        return Err("Codex output reconciliation exceeded its 16 MiB buffer limit".into());
+    }
+    Ok(())
 }
 
 fn validate_output_message(item: &serde_json::Value) -> Result<(), String> {

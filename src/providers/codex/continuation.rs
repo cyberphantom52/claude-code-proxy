@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 use super::models::{OperationProvenance, current_operation_provenance};
+use super::now_ms;
 use crate::request_identity::ConversationIdentity;
 
 use super::translate::request::{
@@ -146,13 +147,6 @@ pub(super) fn prune_idle_state() {
         !expired
     });
     registry.owners.shrink_to_fit();
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 pub(crate) fn continuation_candidate_for_owner(

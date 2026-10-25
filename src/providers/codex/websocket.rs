@@ -33,6 +33,7 @@ use super::client::{
 };
 use super::continuation::ContinuationReservation;
 use super::events::event_is_terminal;
+use super::now_ms;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -344,13 +345,6 @@ fn next_monotonic_nonzero(sequence: &AtomicU64, label: &str) -> u64 {
 
 fn next_pool_activity() -> u64 {
     POOL_ACTIVITY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 pub fn invalidate_codex_websocket_pool_owner(owner: &ConversationIdentity) {
