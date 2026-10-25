@@ -2292,7 +2292,7 @@ where
                     terminal_item = Some(Err(CodexError {
                         status: 0,
                         message: format!("WebSocket keepalive error: {error}"),
-                        detail: None,
+                        detail: Some(WEBSOCKET_KEEPALIVE_FAILURE_DETAIL.to_string()),
                         retry_after: None,
                         usage_limit: None,
                         origin: CodexErrorOrigin::WebSocket,

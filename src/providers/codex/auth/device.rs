@@ -12,6 +12,7 @@ const MAX_DEVICE_POLL_WAIT: Duration = Duration::from_secs(300);
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct DeviceInit {
     pub device_auth_id: String,
+    #[serde(alias = "usercode")]
     pub user_code: String,
     #[serde(default)]
     pub interval: String,
