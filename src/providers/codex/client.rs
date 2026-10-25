@@ -1385,6 +1385,7 @@ impl CodexHttpClient {
                 let mut decoder = HttpSseDecoder::default();
                 let mut body_bytes = 0_u64;
                 let mut body_chunks = 0_u64;
+                let mut diagnostics = HttpBodyDiagnostics::new(&resp, started_at);
                 let mut event_count = 0_u64;
                 let mut pending_events = PendingHttpEvents::default();
                 let mut provisional_tools = PendingHttpProvisionalTools::default();
@@ -1436,6 +1437,7 @@ impl CodexHttpClient {
                             return;
                         }
                         Ok(Err(err)) => {
+                            diagnostics.log_failure(&ctx, "stream", "read_error", Some(&err));
                             let error = CodexError {
                                 status: 0,
                                 message: format!(
@@ -1463,6 +1465,7 @@ impl CodexHttpClient {
                             return;
                         }
                         Err(_) => {
+                            diagnostics.log_failure(&ctx, "stream", "idle_timeout", None);
                             let error = CodexError {
                                 status: 0,
                                 message: format!(
@@ -1491,6 +1494,7 @@ impl CodexHttpClient {
                         }
                     };
 
+                    diagnostics.record_chunk(chunk.len());
                     body_bytes = body_bytes.saturating_add(chunk.len() as u64);
                     body_chunks = body_chunks.saturating_add(1);
                     for event in decoder.push(&chunk) {
@@ -2659,6 +2663,7 @@ impl CodexHttpClient {
             .collect();
 
         let mut body_bytes = Vec::new();
+        let mut diagnostics = HttpBodyDiagnostics::new(&resp, started_at);
         let mut response_started = false;
         loop {
             let chunk = tokio::time::timeout(
@@ -2666,29 +2671,36 @@ impl CodexHttpClient {
                 resp.chunk(),
             )
             .await
-            .map_err(|_| CodexError {
-                status: 0,
-                message: format!(
-                    "Timed out waiting {}ms for the next Codex response body chunk",
-                    self.body_idle_timeout_ms
-                ),
-                detail: Some("http_response_body".to_string()),
-                retry_after: None,
-                usage_limit: None,
-                origin: CodexErrorOrigin::Http,
+            .map_err(|_| {
+                diagnostics.log_failure(ctx, "buffered", "idle_timeout", None);
+                CodexError {
+                    status: 0,
+                    message: format!(
+                        "Timed out waiting {}ms for the next Codex response body chunk",
+                        self.body_idle_timeout_ms
+                    ),
+                    detail: Some("http_response_body".to_string()),
+                    retry_after: None,
+                    usage_limit: None,
+                    origin: CodexErrorOrigin::Http,
+                }
             })?
-            .map_err(|e| CodexError {
-                status: 0,
-                message: format!("Transport error reading Codex response body: {e}"),
-                detail: Some("http_response_body".to_string()),
-                retry_after: None,
-                usage_limit: None,
-                origin: CodexErrorOrigin::Http,
+            .map_err(|e| {
+                diagnostics.log_failure(ctx, "buffered", "read_error", Some(&e));
+                CodexError {
+                    status: 0,
+                    message: format!("Transport error reading Codex response body: {e}"),
+                    detail: Some("http_response_body".to_string()),
+                    retry_after: None,
+                    usage_limit: None,
+                    origin: CodexErrorOrigin::Http,
+                }
             })?;
 
             let Some(chunk) = chunk else {
                 break;
             };
+            diagnostics.record_chunk(chunk.len());
             if !response_started {
                 if let Some(monitor) = ctx.monitor.as_ref() {
                     monitor.generation_started(&ctx.req_id);
@@ -2778,6 +2790,7 @@ impl CodexHttpClient {
             })
             .collect();
         let mut body = Vec::new();
+        let mut diagnostics = HttpBodyDiagnostics::new(&response, started_at);
         let mut response_started = false;
         loop {
             let chunk = tokio::time::timeout(
@@ -2785,28 +2798,35 @@ impl CodexHttpClient {
                 response.chunk(),
             )
             .await
-            .map_err(|_| CodexError {
-                status: 0,
-                message: format!(
-                    "Timed out waiting {}ms for the next Codex search response body chunk",
-                    self.body_idle_timeout_ms
-                ),
-                detail: Some("http_response_body".to_string()),
-                retry_after: None,
-                usage_limit: None,
-                origin: CodexErrorOrigin::Http,
+            .map_err(|_| {
+                diagnostics.log_failure(ctx, "search", "idle_timeout", None);
+                CodexError {
+                    status: 0,
+                    message: format!(
+                        "Timed out waiting {}ms for the next Codex search response body chunk",
+                        self.body_idle_timeout_ms
+                    ),
+                    detail: Some("http_response_body".to_string()),
+                    retry_after: None,
+                    usage_limit: None,
+                    origin: CodexErrorOrigin::Http,
+                }
             })?
-            .map_err(|e| CodexError {
-                status: 0,
-                message: format!("Transport error reading Codex search response body: {e}"),
-                detail: Some("http_response_body".to_string()),
-                retry_after: None,
-                usage_limit: None,
-                origin: CodexErrorOrigin::Http,
+            .map_err(|e| {
+                diagnostics.log_failure(ctx, "search", "read_error", Some(&e));
+                CodexError {
+                    status: 0,
+                    message: format!("Transport error reading Codex search response body: {e}"),
+                    detail: Some("http_response_body".to_string()),
+                    retry_after: None,
+                    usage_limit: None,
+                    origin: CodexErrorOrigin::Http,
+                }
             })?;
             let Some(chunk) = chunk else {
                 break;
             };
+            diagnostics.record_chunk(chunk.len());
             if !response_started {
                 if let Some(monitor) = ctx.monitor.as_ref() {
                     monitor.generation_started(&ctx.req_id);
@@ -2863,6 +2883,144 @@ async fn forward_codex_events(
             return;
         }
     }
+}
+
+pub(super) struct HttpBodyDiagnostics {
+    protocol: http::Version,
+    status: u16,
+    configured_transport: config::CodexTransport,
+    started_at: Instant,
+    last_chunk_at: Option<Instant>,
+    last_chunk_bytes: usize,
+    body_bytes: u64,
+    body_chunks: u64,
+}
+
+impl HttpBodyDiagnostics {
+    pub(super) fn new(response: &reqwest::Response, started_at: Instant) -> Self {
+        Self {
+            protocol: response.version(),
+            status: response.status().as_u16(),
+            configured_transport: config::codex_transport(),
+            started_at,
+            last_chunk_at: None,
+            last_chunk_bytes: 0,
+            body_bytes: 0,
+            body_chunks: 0,
+        }
+    }
+
+    pub(super) fn record_chunk(&mut self, bytes: usize) {
+        self.body_bytes = self.body_bytes.saturating_add(bytes as u64);
+        self.body_chunks = self.body_chunks.saturating_add(1);
+        self.last_chunk_bytes = bytes;
+        self.last_chunk_at = Some(Instant::now());
+    }
+
+    pub(super) fn log_failure(
+        &self,
+        ctx: &RequestContext,
+        phase: &'static str,
+        reason: &'static str,
+        error: Option<&(dyn std::error::Error + 'static)>,
+    ) {
+        create_logger("codex").warn(
+            "codex_http_body_diagnostic",
+            Some(serde_json::Map::from_iter([
+                ("reqId".into(), serde_json::json!(ctx.req_id)),
+                ("phase".into(), serde_json::json!(phase)),
+                ("reason".into(), serde_json::json!(reason)),
+                (
+                    "configuredTransport".into(),
+                    serde_json::json!(self.configured_transport.as_str()),
+                ),
+                ("effectiveTransport".into(), serde_json::json!("http")),
+                (
+                    "protocol".into(),
+                    serde_json::json!(format!("{:?}", self.protocol)),
+                ),
+                ("status".into(), serde_json::json!(self.status)),
+                ("bodyBytes".into(), serde_json::json!(self.body_bytes)),
+                ("bodyChunks".into(), serde_json::json!(self.body_chunks)),
+                (
+                    "lastChunkBytes".into(),
+                    serde_json::json!(self.last_chunk_bytes),
+                ),
+                (
+                    "lastChunkAgoMs".into(),
+                    serde_json::json!(self.last_chunk_at.map(|at| at.elapsed().as_millis())),
+                ),
+                (
+                    "ms".into(),
+                    serde_json::json!(self.started_at.elapsed().as_millis()),
+                ),
+                (
+                    "causes".into(),
+                    serde_json::json!(sanitized_transport_error_causes(error)),
+                ),
+            ])),
+        );
+    }
+}
+
+pub(super) fn sanitized_transport_error_causes(
+    mut error: Option<&(dyn std::error::Error + 'static)>,
+) -> Vec<serde_json::Value> {
+    let mut causes = Vec::new();
+    // Error displays may contain URLs, credentials or upstream text. Emit only
+    // typed facts and fixed transport labels; unknown details stay redacted.
+    for _ in 0..16 {
+        let Some(cause) = error else { break };
+        let mut fields = serde_json::Map::new();
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            fields.insert("kind".into(), serde_json::json!("io"));
+            fields.insert(
+                "ioKind".into(),
+                serde_json::json!(format!("{:?}", io.kind())),
+            );
+            fields.insert("osError".into(), serde_json::json!(io.raw_os_error()));
+        } else if let Some(http) = cause.downcast_ref::<reqwest::Error>() {
+            fields.insert("kind".into(), serde_json::json!("reqwest"));
+            fields.insert("body".into(), serde_json::json!(http.is_body()));
+            fields.insert("decode".into(), serde_json::json!(http.is_decode()));
+            fields.insert("timeout".into(), serde_json::json!(http.is_timeout()));
+            fields.insert("connect".into(), serde_json::json!(http.is_connect()));
+        } else {
+            fields.insert("kind".into(), serde_json::json!("other"));
+        }
+        let message = cause.to_string().to_ascii_lowercase();
+        let categories: Vec<_> = [
+            ("http/2", "http2"),
+            ("http2", "http2"),
+            ("incomplete message", "incomplete_message"),
+            ("invalid chunk size", "invalid_chunk_size"),
+            ("unexpected eof", "unexpected_eof"),
+            ("unexpected end of file", "unexpected_eof"),
+            ("connection reset", "connection_reset"),
+            ("broken pipe", "broken_pipe"),
+            ("connection closed", "connection_closed"),
+            ("error reading a body", "body_read"),
+            ("protocol error", "protocol_error"),
+            ("stream error", "stream_error"),
+            ("goaway", "goaway"),
+            ("refused_stream", "refused_stream"),
+            ("internal_error", "internal_error"),
+            ("flow_control_error", "flow_control_error"),
+            ("frame_size_error", "frame_size_error"),
+            ("timed out", "timeout"),
+        ]
+        .into_iter()
+        .filter_map(|(needle, label)| message.contains(needle).then_some(label))
+        .collect();
+        fields.insert("categories".into(), serde_json::json!(categories));
+        fields.insert("detailsRedacted".into(), serde_json::json!(true));
+        causes.push(serde_json::Value::Object(fields));
+        error = cause.source();
+    }
+    if error.is_some() {
+        causes.push(serde_json::json!({"truncated": true}));
+    }
+    causes
 }
 
 fn response_headers(resp: &reqwest::Response) -> Vec<(String, String)> {

@@ -2072,6 +2072,11 @@ where
             _ = &mut timeout => return WebSocketRead::Timeout,
             _ = keepalive.tick() => Message::Ping(Vec::new()),
         };
+        let control_frame = if matches!(&message, Message::Pong(_)) {
+            "pong"
+        } else {
+            "ping"
+        };
         // Both control writes share the read deadline and caller's cancellation guard.
         let send = ws.send(message);
         let send_timeout = tokio::time::sleep(WEBSOCKET_KEEPALIVE_SEND_TIMEOUT);
@@ -2080,11 +2085,16 @@ where
             biased;
             result = send => {
                 if let Err(error) = result {
+                    log_control_write_failure(control_frame, "send_error", Some(&error));
                     return WebSocketRead::KeepaliveError(error.to_string());
                 }
             }
-            _ = &mut timeout => return WebSocketRead::Timeout,
+            _ = &mut timeout => {
+                log_control_write_failure(control_frame, "read_deadline", None);
+                return WebSocketRead::Timeout;
+            }
             _ = &mut send_timeout => {
+                log_control_write_failure(control_frame, "send_timeout", None);
                 return WebSocketRead::KeepaliveError(format!(
                     "send timed out after {}ms",
                     WEBSOCKET_KEEPALIVE_SEND_TIMEOUT.as_millis(),
@@ -2092,6 +2102,25 @@ where
             }
         }
     }
+}
+
+fn log_control_write_failure(
+    control_frame: &'static str,
+    reason: &'static str,
+    error: Option<&(dyn std::error::Error + 'static)>,
+) {
+    create_logger("codex").warn(
+        "codex_websocket_control_write_failed",
+        Some(serde_json::Map::from_iter([
+            ("controlFrame".into(), serde_json::json!(control_frame)),
+            ("reason".into(), serde_json::json!(reason)),
+            ("effectiveTransport".into(), serde_json::json!("websocket")),
+            (
+                "causes".into(),
+                serde_json::json!(super::client::sanitized_transport_error_causes(error)),
+            ),
+        ])),
+    );
 }
 
 struct WsEvent {

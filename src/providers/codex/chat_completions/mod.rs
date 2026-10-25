@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use crate::monitor::TokenUsage;
 use crate::provider::RequestContext;
 
-use super::client::{CodexError, CodexHttpClient};
+use super::client::{CodexError, CodexHttpClient, HttpBodyDiagnostics};
 use request::TranslatedRequest;
 
 pub struct ChatCompletionsBackend {
@@ -50,7 +50,8 @@ impl ChatCompletionsBackend {
         };
 
         if !upstream.status().is_success() {
-            return upstream_error_response(upstream, self.client.body_idle_timeout_ms()).await;
+            return upstream_error_response(upstream, self.client.body_idle_timeout_ms(), &ctx)
+                .await;
         }
         if request.stream {
             return stream::streaming_response(
@@ -103,6 +104,10 @@ async fn collect_body(
     ctx: Option<&RequestContext>,
     mut completion: Option<&mut response::CompletionState>,
 ) -> (Vec<u8>, Result<(), ChatError>) {
+    let diagnostics_ctx = ctx;
+    // Error bodies need diagnostics, but are not generation progress.
+    let ctx = ctx.filter(|_| completion.is_some());
+    let mut diagnostics = HttpBodyDiagnostics::new(&upstream, std::time::Instant::now());
     let mut stream = upstream.bytes_stream();
     let mut bytes = Vec::new();
     let mut frame_start = 0;
@@ -111,6 +116,7 @@ async fn collect_body(
     let result = 'read: loop {
         match tokio::time::timeout(Duration::from_millis(idle_timeout_ms), stream.next()).await {
             Ok(Some(Ok(chunk))) => {
+                diagnostics.record_chunk(chunk.len());
                 if !started {
                     if let Some(ctx) = ctx
                         && let Some(monitor) = ctx.monitor.as_ref()
@@ -185,12 +191,18 @@ async fn collect_body(
                 }
             }
             Ok(Some(Err(error))) => {
+                if let Some(ctx) = diagnostics_ctx {
+                    diagnostics.log_failure(ctx, "chat_buffered", "read_error", Some(&error));
+                }
                 break Err(ChatError::upstream(format!(
                     "Codex response body read failed: {error}"
                 )));
             }
             Ok(None) => break Ok(()),
             Err(_) => {
+                if let Some(ctx) = diagnostics_ctx {
+                    diagnostics.log_failure(ctx, "chat_buffered", "idle_timeout", None);
+                }
                 break Err(ChatError::timeout(format!(
                     "Timed out waiting {idle_timeout_ms}ms for the next Codex response body chunk"
                 )));
@@ -213,10 +225,14 @@ fn codex_error_response(mut error: CodexError) -> Response {
     response
 }
 
-async fn upstream_error_response(upstream: reqwest::Response, idle_timeout_ms: u64) -> Response {
+async fn upstream_error_response(
+    upstream: reqwest::Response,
+    idle_timeout_ms: u64,
+    ctx: &RequestContext,
+) -> Response {
     let status = upstream.status();
     let headers = stream::response_headers(upstream.headers());
-    let (bytes, read_result) = collect_body(upstream, idle_timeout_ms, None, None).await;
+    let (bytes, read_result) = collect_body(upstream, idle_timeout_ms, Some(ctx), None).await;
     if let Err(error) = read_result {
         let mut response = error.response();
         response.headers_mut().extend(headers);

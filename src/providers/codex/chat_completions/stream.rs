@@ -10,6 +10,7 @@ use crate::monitor::TokenUsage;
 use crate::providers::codex::native::{NativeResponseOutcome, find_sse_boundary_from};
 use crate::{provider::RequestContext, traffic::MAX_SSE_CAPTURE_BYTES};
 
+use super::super::client::HttpBodyDiagnostics;
 use super::{ChatError, response::CompletionState};
 
 type UpstreamStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
@@ -24,6 +25,7 @@ pub fn streaming_response(
     let outcome = NativeResponseOutcome::default();
     let headers = response_headers(upstream.headers());
     let state = StreamState {
+        diagnostics: HttpBodyDiagnostics::new(&upstream, std::time::Instant::now()),
         upstream: Box::pin(upstream.bytes_stream()),
         pending: BytesMut::new(),
         pending_scan: 0,
@@ -85,6 +87,12 @@ async fn next_frame(
         {
             Ok(Some(Ok(chunk))) => state.observe_chunk(&chunk),
             Ok(Some(Err(error))) => {
+                state.diagnostics.log_failure(
+                    &state.ctx,
+                    "chat_stream",
+                    "read_error",
+                    Some(&error),
+                );
                 state.fail(ChatError::upstream(format!(
                     "Codex response body read failed: {error}"
                 )));
@@ -99,6 +107,9 @@ async fn next_frame(
                 }
             }
             Err(_) => {
+                state
+                    .diagnostics
+                    .log_failure(&state.ctx, "chat_stream", "idle_timeout", None);
                 state.fail(ChatError::timeout(format!(
                     "Timed out waiting {}ms for the next Codex response body chunk",
                     state.body_idle_timeout_ms
@@ -109,6 +120,7 @@ async fn next_frame(
 }
 
 struct StreamState {
+    diagnostics: HttpBodyDiagnostics,
     upstream: UpstreamStream,
     pending: BytesMut,
     pending_scan: usize,
@@ -127,6 +139,7 @@ struct StreamState {
 
 impl StreamState {
     fn observe_chunk(&mut self, chunk: &[u8]) {
+        self.diagnostics.record_chunk(chunk.len());
         if !chunk.is_empty() && !self.generation_started {
             if let Some(monitor) = self.ctx.monitor.as_ref() {
                 monitor.generation_started(&self.ctx.req_id);

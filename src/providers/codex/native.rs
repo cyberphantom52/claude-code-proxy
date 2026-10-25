@@ -19,7 +19,7 @@ use crate::traffic::{
     MAX_STREAM_CAPTURE_FRAME_BYTES,
 };
 
-use super::client::{CodexError, CodexHttpClient};
+use super::client::{CodexError, CodexHttpClient, HttpBodyDiagnostics};
 use super::translate::model_allowlist::{
     assert_allowed_model, model_parallel_tool_calls, model_reasoning_summary, model_verbosity,
     resolve_model_effort, resolve_model_request, resolve_service_tier_value, uses_responses_lite,
@@ -415,12 +415,14 @@ async fn buffered_response(
     let outcome = NativeResponseOutcome::default();
     let mut observer = NativeResponseObserver::new(ctx, false, true, outcome.clone());
     observer.buffer_terminal = true;
+    let mut diagnostics = HttpBodyDiagnostics::new(&upstream, std::time::Instant::now());
     let mut stream = upstream.bytes_stream();
     let mut received_bytes = 0_usize;
     let mut response = loop {
         match tokio::time::timeout(Duration::from_millis(body_idle_timeout_ms), stream.next()).await
         {
             Ok(Some(Ok(chunk))) => {
+                diagnostics.record_chunk(chunk.len());
                 let remaining = MAX_SSE_CAPTURE_BYTES.saturating_sub(received_bytes);
                 let inspected = remaining.min(chunk.len());
                 received_bytes += inspected;
@@ -446,6 +448,12 @@ async fn buffered_response(
                 }
             }
             Ok(Some(Err(error))) => {
+                diagnostics.log_failure(
+                    &observer.ctx,
+                    "native_buffered",
+                    "read_error",
+                    Some(&error),
+                );
                 observer.finish("read_error");
                 break openai_error(
                     StatusCode::BAD_GATEWAY,
@@ -466,6 +474,7 @@ async fn buffered_response(
                 );
             }
             Err(_) => {
+                diagnostics.log_failure(&observer.ctx, "native_buffered", "idle_timeout", None);
                 observer.finish("idle_timeout");
                 break openai_error(
                     StatusCode::GATEWAY_TIMEOUT,
@@ -556,6 +565,7 @@ fn passthrough_response(
     let outcome = NativeResponseOutcome::default();
     let observer = NativeResponseObserver::new(ctx, is_sse, inspect_sse, outcome.clone());
     let state = Some(NativeBodyState {
+        diagnostics: HttpBodyDiagnostics::new(&upstream, std::time::Instant::now()),
         stream: Box::pin(upstream.bytes_stream()),
         observer,
         body_idle_timeout_ms,
@@ -569,10 +579,17 @@ fn passthrough_response(
         .await
         {
             Ok(Some(Ok(chunk))) => {
+                state.diagnostics.record_chunk(chunk.len());
                 state.observer.observe(&chunk);
                 Some((Ok::<Bytes, io::Error>(chunk), Some(state)))
             }
             Ok(Some(Err(error))) => {
+                state.diagnostics.log_failure(
+                    &state.observer.ctx,
+                    "native_stream",
+                    "read_error",
+                    Some(&error),
+                );
                 let message = format!("Native Responses body read failed: {error}");
                 state.observer.finish("read_error");
                 Some((Err(io::Error::other(message)), None))
@@ -582,6 +599,12 @@ fn passthrough_response(
                 None
             }
             Err(_) => {
+                state.diagnostics.log_failure(
+                    &state.observer.ctx,
+                    "native_stream",
+                    "idle_timeout",
+                    None,
+                );
                 let message = format!(
                     "Timed out waiting {}ms for the next Codex response body chunk",
                     state.body_idle_timeout_ms
@@ -632,6 +655,7 @@ type UpstreamByteStream =
     Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static>>;
 
 struct NativeBodyState {
+    diagnostics: HttpBodyDiagnostics,
     stream: UpstreamByteStream,
     observer: NativeResponseObserver,
     body_idle_timeout_ms: u64,
