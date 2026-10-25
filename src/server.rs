@@ -1372,18 +1372,7 @@ async fn dispatch_request(
                         "request_too_large",
                         "Request body exceeded the size limit",
                     );
-                    log_request_completed(
-                        &log,
-                        RequestLogContext {
-                            req_id: &req_id,
-                            provider: None,
-                            model: None,
-                            count_tokens,
-                            status: response.status(),
-                            started_at,
-                        },
-                    );
-                    let (response, details) = record_failed_response(
+                    return failed_request_response(
                         &log,
                         FailedResponseLogContext {
                             req_id: &req_id,
@@ -1393,37 +1382,16 @@ async fn dispatch_request(
                             started_at,
                         },
                         response,
+                        request_guard,
                     )
                     .await;
-                    monitor_failed(
-                        state.monitor.as_ref(),
-                        &req_id,
-                        Some(response.status()),
-                        details
-                            .as_ref()
-                            .map(|details| details.message.as_str())
-                            .unwrap_or("Invalid JSON"),
-                    );
-                    return with_request_id(response, &req_id);
                 }
             };
 
         match parse_json_body(&body_bytes) {
             Ok(body) => body,
             Err(response) => {
-                let status = response.status();
-                log_request_completed(
-                    &log,
-                    RequestLogContext {
-                        req_id: &req_id,
-                        provider: None,
-                        model: None,
-                        count_tokens,
-                        status: response.status(),
-                        started_at,
-                    },
-                );
-                let (response, details) = record_failed_response(
+                return failed_request_response(
                     &log,
                     FailedResponseLogContext {
                         req_id: &req_id,
@@ -1433,18 +1401,9 @@ async fn dispatch_request(
                         started_at,
                     },
                     *response,
+                    request_guard,
                 )
                 .await;
-                monitor_failed(
-                    state.monitor.as_ref(),
-                    &req_id,
-                    Some(status),
-                    details
-                        .as_ref()
-                        .map(|details| details.message.as_str())
-                        .unwrap_or("Invalid JSON"),
-                );
-                return with_request_id(response, &req_id);
             }
         }
     };
@@ -1515,18 +1474,7 @@ async fn dispatch_request(
                             state.registry.unknown_model_message()
                         ),
                     );
-                    log_request_completed(
-                        &log,
-                        RequestLogContext {
-                            req_id: &req_id,
-                            provider: None,
-                            model: None,
-                            count_tokens,
-                            status: response.status(),
-                            started_at,
-                        },
-                    );
-                    let (response, details) = record_failed_response(
+                    return failed_request_response(
                         &log,
                         FailedResponseLogContext {
                             req_id: &req_id,
@@ -1536,18 +1484,9 @@ async fn dispatch_request(
                             started_at,
                         },
                         response,
+                        request_guard,
                     )
                     .await;
-                    monitor_failed(
-                        state.monitor.as_ref(),
-                        &req_id,
-                        Some(response.status()),
-                        details
-                            .as_ref()
-                            .map(|details| details.message.as_str())
-                            .unwrap_or("Missing model"),
-                    );
-                    return with_request_id(response, &req_id);
                 }
             };
 
@@ -1590,18 +1529,7 @@ async fn dispatch_request(
                             state.registry.unknown_model_message()
                         ),
                     );
-                    log_request_completed(
-                        &log,
-                        RequestLogContext {
-                            req_id: &req_id,
-                            provider: None,
-                            model: Some(&model),
-                            count_tokens,
-                            status: response.status(),
-                            started_at,
-                        },
-                    );
-                    let (response, details) = record_failed_response(
+                    return failed_request_response(
                         &log,
                         FailedResponseLogContext {
                             req_id: &req_id,
@@ -1611,18 +1539,9 @@ async fn dispatch_request(
                             started_at,
                         },
                         response,
+                        request_guard,
                     )
                     .await;
-                    monitor_failed(
-                        state.monitor.as_ref(),
-                        &req_id,
-                        Some(response.status()),
-                        details
-                            .as_ref()
-                            .map(|details| details.message.as_str())
-                            .unwrap_or("Unknown model"),
-                    );
-                    return with_request_id(response, &req_id);
                 }
             };
 
