@@ -1244,6 +1244,7 @@ impl CodexHttpClient {
             .stream_codex_http_events_inner(body, ctx, publisher)
             .await?;
         stream.replace_receiver(receiver);
+        stream.transport = ActualTransport::Http;
         Ok(stream)
     }
 
@@ -1727,7 +1728,7 @@ impl CodexHttpClient {
     ) -> Result<OwnerAwareCodexResponse, CodexError> {
         use crate::config::CodexTransport;
 
-        let transport = config::codex_transport();
+        let mut transport = config::codex_transport();
         let codex_auto_review = body.codex_auto_review && body.model == "codex-auto-review";
         // Reviewer handshake headers must never share an ordinary pooled socket.
         let continuation = continuation.filter(|_| !codex_auto_review);
@@ -1765,6 +1766,9 @@ impl CodexHttpClient {
         let mut active_continuation = continuation.cloned();
         let mut auth_refresh_attempted = false;
         let mut transport_failures = 0u32;
+        let mut recovery_deadline = None;
+        let mut http_fallback = false;
+        let mut safe_http_fallback = true;
         let mut http_body_json = None;
         let mut serialize_http_body = || -> Result<Bytes, CodexError> {
             if let Some(body_json) = &http_body_json {
@@ -1787,15 +1791,31 @@ impl CodexHttpClient {
             let result = match transport {
                 CodexTransport::Http => {
                     let body_json = serialize_http_body()?;
-                    self.attempt_post_http(
+                    let attempt = self.attempt_post_http(
                         &auth,
                         &body_json,
                         ctx,
                         body.client_metadata.is_some(),
                         codex_auto_review,
-                    )
-                    .await
-                    .map(|response| OwnerAwareCodexResponse::new(response, None))
+                    );
+                    let response = if http_fallback {
+                        tokio::time::timeout_at(
+                            tokio::time::Instant::from_std(
+                                recovery_deadline.expect("HTTP fallback has a recovery deadline"),
+                            ),
+                            attempt,
+                        )
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(CodexError::new(
+                                504,
+                                "Connection recovery exceeded its 60-second budget".to_string(),
+                            ))
+                        })
+                    } else {
+                        attempt.await
+                    };
+                    response.map(|response| OwnerAwareCodexResponse::new(response, None))
                 }
                 CodexTransport::WebSocket | CodexTransport::Auto => {
                     let ws_headers = build_codex_response_headers(
@@ -1825,6 +1845,7 @@ impl CodexHttpClient {
                         super::websocket::WEBSOCKET_IDLE_TIMEOUT_MS,
                         active_continuation.as_ref(),
                         auth.provenance(&self.base_url),
+                        &mut safe_http_fallback,
                     )
                     .await;
 
@@ -1860,6 +1881,47 @@ impl CodexHttpClient {
                     }
                 }
             };
+
+            if matches!(&result, Ok(response) if response.transport == ActualTransport::Http)
+                || matches!(&result, Err(error) if matches!(error.origin, CodexErrorOrigin::Http | CodexErrorOrigin::BufferedHttp))
+            {
+                safe_http_fallback = false;
+            }
+            if result.is_err()
+                || result.as_ref().is_ok_and(|response| {
+                    should_retry_codex_status(response.status)
+                        || super::events::first_event_failure(&response.body).is_some()
+                })
+            {
+                recovery_deadline.get_or_insert_with(|| Instant::now() + Duration::from_secs(60));
+            }
+            if transport == CodexTransport::Auto
+                && transport_failures >= MAX_BUFFERED_TRANSPORT_RETRIES
+                && safe_http_fallback
+                && !super::threads::replaying()
+                && let Err(error) = &result
+                && error.origin == CodexErrorOrigin::WebSocket
+                && is_retryable_transport_error(error)
+            {
+                let delay = compute_backoff_delay(transport_failures, error.retry_after.as_deref());
+                let deadline = recovery_deadline.expect("failed attempt starts recovery deadline");
+                if !delay.exceeds_budget
+                    && Duration::from_millis(delay.wait_ms)
+                        < deadline.saturating_duration_since(Instant::now())
+                {
+                    if has_opaque_native_history(body) {
+                        Arc::make_mut(&mut auth)
+                            .require_opaque_provenance(&self.base_url)
+                            .map_err(auth_refresh_error)?;
+                    }
+                    invalidate_live_continuation_pool(active_continuation.as_ref());
+                    active_continuation = full_context_continuation(active_continuation.as_ref());
+                    transport = CodexTransport::Http;
+                    http_fallback = true;
+                    sleep(delay.wait_ms).await;
+                    continue;
+                }
+            }
 
             if let Ok(response) = &result {
                 let text = String::from_utf8_lossy(&response.body);

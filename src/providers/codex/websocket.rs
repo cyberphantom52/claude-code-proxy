@@ -69,6 +69,7 @@ pub type CodexWebSocketEventReceiver =
 
 pub(crate) struct CodexWebSocketEventStream {
     receiver: CodexWebSocketEventReceiver,
+    pub(super) transport: ActualTransport,
     provenance: Arc<Mutex<Option<super::models::OperationProvenance>>>,
     socket_id: Arc<AtomicU64>,
     full_context_retry: Arc<AtomicBool>,
@@ -95,6 +96,7 @@ impl CodexWebSocketEventStream {
             Self {
                 provenance: provenance.clone(),
                 receiver,
+                transport: ActualTransport::WebSocket,
                 socket_id: socket_id.clone(),
                 full_context_retry: full_context_retry.clone(),
                 provider_retry_handoff: provider_retry_handoff.clone(),
@@ -805,6 +807,7 @@ pub(super) async fn codex_websocket_request(
     idle_timeout_ms: u64,
     reservation: Option<&ContinuationReservation>,
     provenance: Option<super::models::OperationProvenance>,
+    safe_http_fallback: &mut bool,
 ) -> Result<OwnerAwareCodexResponse, CodexError> {
     super::rate_limits::record(Vec::new());
     let continuation = reservation.map(ContinuationReservation::candidate);
@@ -906,6 +909,7 @@ pub(super) async fn codex_websocket_request(
         pool_owner,
         Some(&entry),
         traffic,
+        safe_http_fallback,
     )
     .await;
     drop(guard);
@@ -2101,6 +2105,7 @@ async fn collect_ws_events<S>(
     pool_owner: Option<&ConversationIdentity>,
     pool_entry: Option<&Arc<PoolEntry>>,
     traffic: Option<&TrafficCapture>,
+    safe_http_fallback: &mut bool,
 ) -> Result<(Vec<u8>, Option<WsEvent>), CodexError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -2190,11 +2195,25 @@ where
                                 }),
                             );
                         }
+                        // Unknown content cannot prove that buffered replay is safe.
+                        *safe_http_fallback = false;
                         // Write invalid JSON as-is
                         continue;
                     }
                 };
 
+                // A discarded partial body must never hide text or tool replay risk.
+                *safe_http_fallback &= matches!(
+                    parsed.get("type").and_then(serde_json::Value::as_str),
+                    Some(
+                        "keepalive"
+                            | "codex.rate_limits"
+                            | "response.created"
+                            | "response.in_progress"
+                    )
+                ) && parsed
+                    .pointer("/response/output")
+                    .is_none_or(|output| output.as_array().is_some_and(Vec::is_empty));
                 // Convert to SSE bytes
                 if let Some(tc) = traffic {
                     tc.write_json_event("040-upstream-event", &parsed);

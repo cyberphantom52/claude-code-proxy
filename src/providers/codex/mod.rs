@@ -784,6 +784,7 @@ enum LiveStreamStart {
     Retry {
         error: client::CodexError,
         full_context_retry_attempted: bool,
+        safe_http_fallback: bool,
     },
 }
 
@@ -803,7 +804,7 @@ async fn live_stream_response(
     mut request_body: Arc<translate::request::ResponsesRequest>,
     continuation: ContinuationReservation,
     mut compaction: LiveStreamCompaction,
-    transport: config::CodexTransport,
+    mut transport: config::CodexTransport,
 ) -> Response {
     let model = model.to_string();
     let mut request_continuation = continuation.clone();
@@ -812,6 +813,7 @@ async fn live_stream_response(
     let mut attempt = 0_u32;
     let started_at = Instant::now();
     let mut empty_retry = false;
+    let mut safe_http_fallback = true;
     let mut retry_started = None;
     let mut continuation = Some(continuation);
 
@@ -944,8 +946,13 @@ async fn live_stream_response(
             LiveRecovery {
                 client: client.clone(),
                 attempts: attempt,
+                safe_http_fallback,
                 deadline: retry_started.map(|at| at + EMPTY_COMPLETION_RETRY_BUDGET),
-                websocket: transport != config::CodexTransport::Http,
+                transport: if upstream_events.transport == client::ActualTransport::Http {
+                    config::CodexTransport::Http
+                } else {
+                    transport
+                },
             },
             upstream_events,
             message_id.clone(),
@@ -1009,7 +1016,9 @@ async fn live_stream_response(
             LiveStreamStart::Retry {
                 error,
                 full_context_retry_attempted,
+                safe_http_fallback: retry_safe,
             } => {
+                safe_http_fallback &= retry_safe;
                 if error.detail.as_deref() == Some("operation_provenance_changed")
                     && compaction.portable_request.is_some()
                     && !threads::replaying()
@@ -1044,7 +1053,11 @@ async fn live_stream_response(
                 let empty = error.detail.as_deref() == Some(EMPTY_CODEX_COMPLETION_DETAIL);
                 empty_retry |= empty;
                 let delay = compute_backoff_delay(attempt, error.retry_after.as_deref());
-                if attempt >= MAX_RETRYABLE_LIVE_STREAM_RETRIES
+                let fallback = attempt >= MAX_RETRYABLE_LIVE_STREAM_RETRIES
+                    && safe_http_fallback
+                    && !empty_retry
+                    && allow_post_upgrade_http_fallback(transport, &error);
+                if (attempt >= MAX_RETRYABLE_LIVE_STREAM_RETRIES && !fallback)
                     || (empty_retry
                         && !allow_empty_completion_retry(
                             attempt,
@@ -1076,10 +1089,18 @@ async fn live_stream_response(
                     &ctx,
                     "reconnecting",
                     attempt + 1,
-                    "Response interrupted; retrying before output",
+                    if fallback {
+                        "WebSocket recovery exhausted; retrying this request over HTTP"
+                    } else {
+                        "Response interrupted; retrying before output"
+                    },
                 );
                 retry_started.get_or_insert_with(Instant::now);
-                attempt += 1;
+                if fallback {
+                    transport = config::CodexTransport::Http;
+                } else {
+                    attempt += 1;
+                }
                 let remaining =
                     EMPTY_COMPLETION_RETRY_BUDGET.saturating_sub(retry_started.unwrap().elapsed());
                 let _ = tokio::time::timeout(remaining, sleep(delay.wait_ms)).await;
@@ -1140,6 +1161,7 @@ fn log_empty_completion_retry(
 
 fn provider_retry(
     upstream_events: &websocket::CodexWebSocketEventStream,
+    safe_http_fallback: bool,
     error: client::CodexError,
 ) -> LiveStreamStart {
     let full_context_retry_attempted = upstream_events.used_full_context_retry();
@@ -1147,19 +1169,21 @@ fn provider_retry(
     LiveStreamStart::Retry {
         error,
         full_context_retry_attempted,
+        safe_http_fallback,
     }
 }
 
 struct LiveRecovery {
     client: Arc<CodexHttpClient>,
     attempts: u32,
+    safe_http_fallback: bool,
     deadline: Option<Instant>,
-    websocket: bool,
+    transport: config::CodexTransport,
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn live_stream_response_once(
-    reconnect: LiveRecovery,
+    mut reconnect: LiveRecovery,
     mut upstream_events: websocket::CodexWebSocketEventStream,
     message_id: String,
     model: &str,
@@ -1189,7 +1213,11 @@ async fn live_stream_response_once(
             Ok(payload) => payload,
             Err(err) => {
                 if err.detail.as_deref() == Some("operation_provenance_changed") {
-                    return provider_retry(&upstream_events, err);
+                    return provider_retry(
+                        &upstream_events,
+                        reconnect.safe_http_fallback && translator.can_reconnect(),
+                        err,
+                    );
                 }
                 if err.origin == client::CodexErrorOrigin::Http {
                     abort_request_state(
@@ -1200,7 +1228,11 @@ async fn live_stream_response_once(
                     return LiveStreamStart::Response(map_codex_error_to_response(&err));
                 }
                 if retryable_live_start_codex_error(&err) {
-                    return provider_retry(&upstream_events, err);
+                    return provider_retry(
+                        &upstream_events,
+                        reconnect.safe_http_fallback && translator.can_reconnect(),
+                        err,
+                    );
                 }
                 abort_request_state(
                     compaction_scope(&request_continuation).as_ref(),
@@ -1210,6 +1242,7 @@ async fn live_stream_response_once(
                 return LiveStreamStart::Response(map_codex_error_to_response(&err));
             }
         };
+        reconnect.safe_http_fallback &= !hosted_search_progress(&payload);
         if !generation_started && codex_generation_event(&payload) {
             if let Some(monitor) = ctx.monitor.as_ref() {
                 monitor.generation_started(&ctx.req_id);
@@ -1242,9 +1275,14 @@ async fn live_stream_response_once(
                     if failure.retryable() {
                         return provider_retry(
                             &upstream_events,
+                            reconnect.safe_http_fallback && translator.can_reconnect(),
                             codex_event_failure_error(
                                 &failure,
-                                client::CodexErrorOrigin::WebSocket,
+                                if upstream_events.transport == client::ActualTransport::Http {
+                                    client::CodexErrorOrigin::Http
+                                } else {
+                                    client::CodexErrorOrigin::WebSocket
+                                },
                             ),
                         );
                     }
@@ -1298,7 +1336,7 @@ async fn live_stream_response_once(
                     ),
                 ])),
             );
-            return provider_retry(&upstream_events, empty_live_completion_error());
+            return provider_retry(&upstream_events, false, empty_live_completion_error());
         }
         if translator.has_semantic_output() && !pending_chunk.is_empty() {
             record_live_stream_downstream_capture(&ctx, &pending_chunk);
@@ -1352,6 +1390,7 @@ async fn live_stream_response_once(
 
     provider_retry(
         &upstream_events,
+        reconnect.safe_http_fallback && translator.can_reconnect(),
         client::CodexError {
             status: 0,
             message: "WebSocket connection closed before terminal Codex response event".to_string(),
@@ -1372,6 +1411,17 @@ fn empty_live_completion_error() -> client::CodexError {
         usage_limit: None,
         origin: client::CodexErrorOrigin::WebSocket,
     }
+}
+
+fn hosted_search_progress(payload: &serde_json::Value) -> bool {
+    matches!(
+        payload.get("type").and_then(serde_json::Value::as_str),
+        Some(
+            "response.web_search_call.in_progress"
+                | "response.web_search_call.searching"
+                | "response.web_search_call.completed"
+        )
+    )
 }
 
 fn codex_generation_event(payload: &serde_json::Value) -> bool {
@@ -1495,6 +1545,8 @@ fn remaining_live_stream_response(
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         heartbeat.tick().await;
         let mut reconnects = reconnect.attempts;
+        let mut transport = reconnect.transport;
+        let mut safe_http_fallback = reconnect.safe_http_fallback;
         let mut recovery_deadline = reconnect.deadline;
         let mut restored_pending = false;
         'events: loop {
@@ -1551,7 +1603,9 @@ fn remaining_live_stream_response(
                 ))
             });
             let item = match item {
-                Ok(payload) if reconnect.websocket && translator.can_reconnect() => {
+                Ok(payload)
+                    if transport != config::CodexTransport::Http && translator.can_reconnect() =>
+                {
                     match events::classify_event_failure(&payload)
                         .filter(|failure| failure.retryable())
                     {
@@ -1566,6 +1620,7 @@ fn remaining_live_stream_response(
             };
             match item {
                 Ok(payload) => {
+                    safe_http_fallback &= !hosted_search_progress(&payload);
                     if restored_pending {
                         recovery::notify(
                             &ctx,
@@ -1642,11 +1697,13 @@ fn remaining_live_stream_response(
                     }
                 }
                 Err(mut err) => {
-                    if reconnect.websocket
+                    if transport != config::CodexTransport::Http
                         && err.origin == client::CodexErrorOrigin::WebSocket
                         && retryable_live_start_codex_error(&err)
                         && translator.can_reconnect()
                     {
+                        let fallback_allowed =
+                            safe_http_fallback && allow_post_upgrade_http_fallback(transport, &err);
                         let deadline = *recovery_deadline
                             .get_or_insert_with(|| Instant::now() + EMPTY_COMPLETION_RETRY_BUDGET);
                         upstream_events.mark_provider_retry_handoff();
@@ -1715,6 +1772,49 @@ fn remaining_live_stream_response(
                                     }
                                 }
                                 Err(_) => break,
+                            }
+                        }
+                        if fallback_allowed
+                            && reconnects >= MAX_RETRYABLE_LIVE_STREAM_RETRIES
+                            && matches!(
+                                err.origin,
+                                client::CodexErrorOrigin::WebSocket
+                                    | client::CodexErrorOrigin::WebSocketHandshake
+                            )
+                            && retryable_live_start_codex_error(&err)
+                        {
+                            let delay =
+                                compute_backoff_delay(reconnects, err.retry_after.as_deref());
+                            if !delay.exceeds_budget
+                                && Duration::from_millis(delay.wait_ms)
+                                    < deadline.saturating_duration_since(Instant::now())
+                            {
+                                transport = config::CodexTransport::Http;
+                                rate_limits::record(Vec::new());
+                                let open_http = async {
+                                    sleep(delay.wait_ms).await;
+                                    reconnect
+                                        .client
+                                        .stream_codex_http_events_for_owner(&request_body, &ctx)
+                                        .await
+                                };
+                                let result = tokio::select! {
+                                    biased;
+                                    _ = tx.closed() => return,
+                                    result = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), open_http) => result,
+                                };
+                                match result {
+                                    Ok(Ok(events)) => {
+                                        upstream_events = events;
+                                        if let Some(body) = upstream_sse_body.as_mut() {
+                                            body.clear();
+                                        }
+                                        restored_pending = true;
+                                        continue 'events;
+                                    }
+                                    Ok(Err(error)) => err = error,
+                                    Err(_) => {}
+                                }
                             }
                         }
                     }
@@ -1910,6 +2010,17 @@ fn is_empty_codex_success_completion(events: &[ReducerEvent]) -> bool {
         }
     }
     saw_success_terminal
+}
+
+fn allow_post_upgrade_http_fallback(
+    transport: config::CodexTransport,
+    error: &client::CodexError,
+) -> bool {
+    transport == config::CodexTransport::Auto
+        && error.origin == client::CodexErrorOrigin::WebSocket
+        && retryable_live_start_codex_error(error)
+        && error.detail.as_deref() != Some(EMPTY_CODEX_COMPLETION_DETAIL)
+        && !threads::replaying()
 }
 
 fn retryable_live_start_codex_error(err: &client::CodexError) -> bool {
