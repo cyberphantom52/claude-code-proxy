@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -428,7 +429,11 @@ async fn buffered_response(
                 received_bytes += inspected;
                 observer.observe(&chunk[..inspected]);
                 if let Some(terminal) = observer.buffered_terminal.take() {
-                    observer.finish("complete");
+                    observer.finish(if terminal.is_ok() {
+                        "complete"
+                    } else {
+                        "validation_error"
+                    });
                     break match terminal {
                         Ok(event) => buffered_terminal_response(event, status),
                         Err(message) => {
@@ -661,6 +666,288 @@ struct NativeBodyState {
     body_idle_timeout_ms: u64,
 }
 
+#[derive(Default)]
+struct NativeBufferedOutputs {
+    response_id: Option<String>,
+    sequence_number: Option<u64>,
+    items: BTreeMap<usize, (Value, bool)>,
+    item_ids: BTreeMap<String, usize>,
+    retained_bytes: u64,
+}
+
+impl NativeBufferedOutputs {
+    fn observe(&mut self, event: &Value) -> Result<(), String> {
+        if let Some(sequence) = event.get("sequence_number") {
+            let sequence = sequence
+                .as_u64()
+                .ok_or("invalid native event sequence number")?;
+            if self
+                .sequence_number
+                .is_some_and(|previous| sequence <= previous)
+            {
+                return Err("native event sequence moved backwards or repeated".into());
+            }
+            self.sequence_number = Some(sequence);
+        }
+        for id in [event.get("response_id"), event.pointer("/response/id")]
+            .into_iter()
+            .flatten()
+        {
+            let id = id
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .ok_or("invalid native response identity")?;
+            if self
+                .response_id
+                .as_deref()
+                .is_some_and(|previous| previous != id)
+            {
+                return Err("native response identity changed within the event stream".into());
+            }
+            self.response_id.get_or_insert_with(|| id.to_string());
+        }
+        if super::events::event_is_terminal(event) {
+            return Ok(());
+        }
+        let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
+        if !kind.starts_with("response.") {
+            return Ok(());
+        }
+        let item_event = matches!(
+            kind,
+            "response.output_item.added" | "response.output_item.done"
+        );
+        if !item_event && event.get("output_index").is_none() {
+            return Ok(());
+        }
+        if self.response_id.is_none() {
+            return Err("native output arrived without a response identity".into());
+        }
+        let index = event
+            .get("output_index")
+            .and_then(Value::as_u64)
+            .and_then(|index| usize::try_from(index).ok())
+            .filter(|index| *index < MAX_SSE_CAPTURE_BYTES / 256)
+            .ok_or("native output event requires a bounded output index")?;
+        let (old, done) = self
+            .items
+            .get(&index)
+            .map(|(item, done)| (item, *done))
+            .unwrap_or((&Value::Null, false));
+        if done && kind.ends_with(".delta") {
+            return Err("native output changed after its finalized snapshot".into());
+        }
+        let (item, finalized) = if item_event {
+            let item = event
+                .get("item")
+                .ok_or("native output event did not contain an item")?;
+            // The done event is authoritative data, not permission to execute
+            // a tool. Check its actual status against the eventual terminal.
+            validate_native_buffered_item(item, false, false)?;
+            native_buffered_item_identity(old, item)?;
+            if done && old != item {
+                return Err("native finalized output item changed".into());
+            }
+            if kind.ends_with(".added") && old.get("type").is_some() {
+                return Err("native output item start repeated".into());
+            }
+            if let Some(id) = item.get("id").and_then(Value::as_str) {
+                if self
+                    .item_ids
+                    .get(id)
+                    .is_some_and(|previous| *previous != index)
+                {
+                    return Err("native output item identity moved to another index".into());
+                }
+                self.item_ids.insert(id.to_string(), index);
+            }
+            (item.clone(), kind.ends_with(".done"))
+        } else {
+            let id = event
+                .get("item_id")
+                .map(|id| {
+                    id.as_str()
+                        .filter(|id| !id.is_empty())
+                        .ok_or("invalid native output item identity")
+                })
+                .transpose()?;
+            if let Some(id) = id {
+                if old
+                    .get("id")
+                    .filter(|id| !id.is_null())
+                    .is_some_and(|previous| previous != id)
+                    || self
+                        .item_ids
+                        .get(id)
+                        .is_some_and(|previous| *previous != index)
+                {
+                    return Err("native output event changed item identity".into());
+                }
+                if !self.item_ids.contains_key(id) {
+                    self.item_ids.insert(id.to_string(), index);
+                }
+            }
+            if self.items.contains_key(&index)
+                && id.is_none_or(|id| old.get("id").and_then(Value::as_str) == Some(id))
+            {
+                return Ok(());
+            }
+            if done {
+                return Err("native finalized output event changed item identity".into());
+            }
+            // Reserve an observed index/identity, not invented output. Only a
+            // real done snapshot or nonempty terminal output can finalize it.
+            let item = if let Some(id) = id {
+                let mut item = if old.is_null() {
+                    json!({})
+                } else {
+                    old.clone()
+                };
+                item["id"] = Value::String(id.to_string());
+                item
+            } else {
+                Value::Null
+            };
+            (item, false)
+        };
+        let old_bytes = self.items.get(&index).map_or(0, |(item, _)| {
+            super::request_summary::serialized_json_bytes(item).max(256)
+        });
+        let retained_bytes = self
+            .retained_bytes
+            .saturating_sub(old_bytes)
+            .saturating_add(super::request_summary::serialized_json_bytes(&item).max(256));
+        if retained_bytes > MAX_SSE_CAPTURE_BYTES as u64 {
+            return Err("native finalized output exceeded the response byte limit".into());
+        }
+        self.retained_bytes = retained_bytes;
+        self.items.insert(index, (item, finalized));
+        Ok(())
+    }
+
+    fn complete(&self, event: &mut Value) -> Result<(), String> {
+        // Failures keep their actual native error/Response payload, never an
+        // assembled successful output. The shared classifier runs first.
+        if super::events::classify_event_failure(event).is_some() {
+            return Ok(());
+        }
+        let allow_incomplete = super::events::response_is_incomplete_terminal(event)
+            || super::events::response_is_interrupted_terminal(event);
+        let response = event
+            .get_mut("response")
+            .ok_or("native terminal event omitted its response")?;
+        let output = match response.get("output") {
+            None => None,
+            Some(Value::Array(output)) => Some(output),
+            Some(_) => return Err("native terminal response output must be an array".into()),
+        };
+        if let Some(output) = output.filter(|output| !output.is_empty()) {
+            let mut ids = BTreeSet::new();
+            for (index, item) in output.iter().enumerate() {
+                validate_native_buffered_item(item, true, allow_incomplete)?;
+                if let Some(id) = item.get("id").and_then(Value::as_str)
+                    && (!ids.insert(id)
+                        || self
+                            .item_ids
+                            .get(id)
+                            .is_some_and(|previous| *previous != index))
+                {
+                    return Err(
+                        "native terminal output duplicated or moved an item identity".into(),
+                    );
+                }
+            }
+            for (index, (item, done)) in &self.items {
+                let terminal_item = output
+                    .get(*index)
+                    .ok_or("native terminal output omitted a streamed item")?;
+                native_buffered_item_identity(item, terminal_item)?;
+                if *done && !native_buffered_snapshot_matches(item, terminal_item) {
+                    return Err(
+                        "native terminal output disagrees with its finalized snapshot".into(),
+                    );
+                }
+            }
+        } else if !self.items.is_empty() {
+            let mut output = Vec::with_capacity(self.items.len());
+            for (expected, (index, (item, done))) in self.items.iter().enumerate() {
+                if expected != *index || !done {
+                    return Err("native terminal output cannot be assembled from incomplete or gapped item snapshots".into());
+                }
+                validate_native_buffered_item(item, true, allow_incomplete)?;
+                output.push(item.clone());
+            }
+            response["output"] = Value::Array(output);
+        }
+        Ok(())
+    }
+}
+
+fn validate_native_buffered_item(
+    item: &Value,
+    finalized: bool,
+    allow_incomplete: bool,
+) -> Result<(), String> {
+    if !item.is_object()
+        || item
+            .get("type")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+    {
+        return Err("native output snapshot requires an object with a type".into());
+    }
+    if item
+        .get("id")
+        .is_some_and(|id| !id.is_null() && id.as_str().is_none_or(str::is_empty))
+    {
+        return Err("native output snapshot has an invalid item identity".into());
+    }
+    if finalized
+        && item
+            .get("status")
+            .filter(|status| !status.is_null())
+            .is_some_and(|status| {
+                status != "completed" && !(allow_incomplete && status == "incomplete")
+            })
+    {
+        return Err("native output snapshot is not finalized".into());
+    }
+    Ok(())
+}
+
+fn native_buffered_item_identity(previous: &Value, item: &Value) -> Result<(), String> {
+    for key in ["type", "id", "call_id", "name", "namespace"] {
+        if previous
+            .get(key)
+            .filter(|value| !value.is_null())
+            .is_some_and(|value| item.get(key) != Some(value))
+        {
+            return Err("native output snapshot changed item identity".into());
+        }
+    }
+    Ok(())
+}
+
+fn native_buffered_snapshot_matches(snapshot: &Value, authoritative: &Value) -> bool {
+    match (snapshot, authoritative) {
+        (Value::Object(snapshot), Value::Object(authoritative)) => {
+            snapshot.iter().all(|(key, value)| {
+                authoritative
+                    .get(key)
+                    .is_some_and(|current| native_buffered_snapshot_matches(value, current))
+            })
+        }
+        (Value::Array(snapshot), Value::Array(authoritative)) => {
+            snapshot.len() == authoritative.len()
+                && snapshot
+                    .iter()
+                    .zip(authoritative)
+                    .all(|(previous, current)| native_buffered_snapshot_matches(previous, current))
+        }
+        _ => snapshot == authoritative,
+    }
+}
+
 struct NativeResponseObserver {
     ctx: RequestContext,
     is_sse: bool,
@@ -669,6 +956,7 @@ struct NativeResponseObserver {
     terminal_seen: bool,
     buffer_terminal: bool,
     buffered_terminal: Option<Result<Value, String>>,
+    buffered_outputs: NativeBufferedOutputs,
     generation_started: bool,
     raw: Vec<u8>,
     raw_truncated: u64,
@@ -699,6 +987,7 @@ impl NativeResponseObserver {
             terminal_seen: false,
             buffer_terminal: false,
             buffered_terminal: None,
+            buffered_outputs: NativeBufferedOutputs::default(),
             generation_started: false,
             raw: Vec::new(),
             raw_truncated: 0,
@@ -847,8 +1136,25 @@ impl NativeResponseObserver {
         self.update_usage(&value);
         value = self.update_outcome(value);
         self.terminal_seen |= super::events::event_is_terminal(&value);
-        if self.buffer_terminal && self.terminal_seen {
-            self.buffered_terminal = Some(Ok(value.clone()));
+        if self.buffer_terminal {
+            match self.buffered_outputs.observe(&value) {
+                Err(message) => {
+                    self.outcome.fail(message.clone());
+                    self.buffered_terminal = Some(Err(message));
+                }
+                Ok(()) if self.terminal_seen => {
+                    let mut terminal = value.clone();
+                    let result = self
+                        .buffered_outputs
+                        .complete(&mut terminal)
+                        .map(|()| terminal);
+                    if let Err(message) = &result {
+                        self.outcome.fail(message.clone());
+                    }
+                    self.buffered_terminal = Some(result);
+                }
+                Ok(()) => {}
+            }
         }
         if self.ctx.traffic.is_none() {
             return;
