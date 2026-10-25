@@ -1532,6 +1532,9 @@ impl CodexHttpClient {
 
                         super::record_upstream_telemetry(&ctx, &payload);
                         let event_kind = super::events::classify_stream_event(&payload);
+                        // Replay safety must survive provisional filtering and failed envelopes.
+                        let commits_replay = http_event_commits_replay(&payload, event_kind);
+                        replay_committed |= commits_replay;
                         let failure = super::events::classify_event_failure(&payload);
                         if !semantic_output_forwarded
                             && let Some(limit) = super::events::usage_limit_from_event_with_headers(
@@ -1568,9 +1571,6 @@ impl CodexHttpClient {
                         ) {
                             continue;
                         }
-
-                        let commits_replay = http_event_commits_replay(&payload, event_kind);
-                        replay_committed |= commits_replay;
 
                         if !semantic_output_forwarded
                             && !replay_committed
@@ -3320,6 +3320,9 @@ fn http_event_commits_replay(
     payload: &serde_json::Value,
     event_kind: super::events::CodexStreamEventKind,
 ) -> bool {
+    if super::codex_event_blocks_replay(payload) {
+        return true;
+    }
     if event_kind != super::events::CodexStreamEventKind::Semantic {
         return false;
     }
