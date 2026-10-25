@@ -66,7 +66,10 @@ fn is_quota_header(name: &str) -> bool {
         return false;
     }
     PLAN_HEADERS.contains(&name)
-        || name.starts_with("x-codex-credits-")
+        || matches!(
+            name,
+            "x-codex-credits-has-credits" | "x-codex-credits-unlimited" | "x-codex-credits-balance"
+        )
         || WINDOW_SUFFIXES.iter().any(|suffix| name.ends_with(suffix))
 }
 
@@ -79,44 +82,143 @@ pub fn telemetry_headers(headers: &HeaderMap) -> Vec<(HeaderName, HeaderValue)> 
         .collect()
 }
 
-/// The same headers, rebuilt from a `codex.rate_limits` event. The event names
-/// its extra limit families by label where the headers name them by id, so only
-/// the default family and the plan are reconstructed.
-pub fn event_headers(payload: &Value) -> Vec<(HeaderName, HeaderValue)> {
+/// A response head replaces the attempt; an event replaces one limit family.
+pub enum Update {
+    Response(Vec<(HeaderName, HeaderValue)>),
+    Event {
+        prefix: Option<String>,
+        headers: Vec<(HeaderName, HeaderValue)>,
+    },
+}
+
+impl From<Vec<(HeaderName, HeaderValue)>> for Update {
+    fn from(headers: Vec<(HeaderName, HeaderValue)>) -> Self {
+        Self::Response(headers)
+    }
+}
+
+/// Rebuild an event's named limit family using Codex's header normalization.
+/// Invalid/unsupported family names are never relabeled as the default quota.
+pub fn event_headers(payload: &Value) -> Update {
+    let prefix = (|| {
+        if payload.get("type")?.as_str()? != "codex.rate_limits" {
+            return None;
+        }
+        let family = payload
+            .get("metered_limit_name")
+            .filter(|value| !value.is_null())
+            .or_else(|| payload.get("limit_name").filter(|value| !value.is_null()));
+        let family = match family {
+            Some(value) => value.as_str()?,
+            None => "codex",
+        }
+        .trim()
+        .to_ascii_lowercase()
+        .replace('_', "-");
+        if (family != "codex" && !family.starts_with("codex-"))
+            || !family
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return None;
+        }
+        Some(format!("x-{family}"))
+    })();
     let mut headers = Vec::new();
+    let Some(ref family_prefix) = prefix else {
+        return Update::Event { prefix, headers };
+    };
     for window in ["primary", "secondary"] {
         let Some(values) = payload.pointer(&format!("/rate_limits/{window}")) else {
             continue;
         };
+        // A window without its observed usage is not a quota snapshot.
+        if !values
+            .get("used_percent")
+            .and_then(Value::as_f64)
+            .is_some_and(f64::is_finite)
+        {
+            continue;
+        }
         for (field, suffix) in [
             ("used_percent", "used-percent"),
             ("window_minutes", "window-minutes"),
             ("reset_at", "reset-at"),
             ("reset_after_seconds", "reset-after-seconds"),
         ] {
-            let Some(number) = values.get(field).and_then(Value::as_f64) else {
+            let Some(value) = values.get(field).and_then(Value::as_number) else {
                 continue;
             };
+            if field != "used_percent" && value.as_i64().is_none() {
+                continue;
+            }
             push_header(
                 &mut headers,
-                &format!("x-codex-{window}-{suffix}"),
-                &format_number(number),
+                &format!("{family_prefix}-{window}-{suffix}"),
+                &value.to_string(),
             );
         }
     }
     if let Some(plan) = payload.get("plan_type").and_then(Value::as_str) {
         push_header(&mut headers, "x-codex-plan-type", plan);
     }
-    headers
+    if let Some(credits) = payload.get("credits")
+        && let (Some(has_credits), Some(unlimited)) = (
+            credits.get("has_credits").and_then(Value::as_bool),
+            credits.get("unlimited").and_then(Value::as_bool),
+        )
+    {
+        push_header(
+            &mut headers,
+            "x-codex-credits-has-credits",
+            &has_credits.to_string(),
+        );
+        push_header(
+            &mut headers,
+            "x-codex-credits-unlimited",
+            &unlimited.to_string(),
+        );
+        if let Some(balance) = credits.get("balance").and_then(Value::as_str) {
+            push_header(&mut headers, "x-codex-credits-balance", balance);
+        }
+    }
+    Update::Event { prefix, headers }
 }
 
-/// Replace this operation's telemetry. Empty clears the preceding attempt's
-/// numbers; outside a request scope nothing is retained.
-pub fn record(mut headers: Vec<(HeaderName, HeaderValue)>) {
-    headers.retain(|(name, _)| is_quota_header(name.as_str()));
+/// Response heads (including empty resets) replace the attempt's telemetry.
+/// Events replace their family's windows, retaining absent credits/plan and other
+/// families, like Codex snapshots. Nothing survives outside this request scope.
+pub fn record(update: impl Into<Update>) {
     let _ = SNAPSHOT.try_with(|snapshot| {
         if let Ok(mut snapshot) = snapshot.0.lock() {
-            *snapshot = headers;
+            match update.into() {
+                Update::Response(mut headers) => {
+                    headers.retain(|(name, _)| is_quota_header(name.as_str()));
+                    *snapshot = headers;
+                }
+                Update::Event {
+                    prefix: Some(prefix),
+                    headers,
+                } => {
+                    let has_credits = headers
+                        .iter()
+                        .any(|(name, _)| name.as_str().starts_with("x-codex-credits-"));
+                    let has_plan = headers.iter().any(|(name, _)| name == "x-codex-plan-type");
+                    snapshot.retain(|(name, _)| {
+                        let name = name.as_str();
+                        let family_window = name.strip_prefix(&prefix).is_some_and(|suffix| {
+                            suffix.starts_with("-primary-")
+                                || suffix.starts_with("-secondary-")
+                                || suffix == "-limit-name"
+                        });
+                        !family_window
+                            && !(has_credits && name.starts_with("x-codex-credits-"))
+                            && !(has_plan && name == "x-codex-plan-type")
+                    });
+                    snapshot.extend(headers);
+                }
+                Update::Event { prefix: None, .. } => {}
+            }
         }
     });
 }
@@ -139,15 +241,6 @@ pub fn stamp(target: &mut HeaderMap) {
 pub fn stamp_response(mut response: Response) -> Response {
     stamp(response.headers_mut());
     response
-}
-
-/// Codex sends whole numbers as integers; JSON parsing turns them into floats.
-fn format_number(number: f64) -> String {
-    if number.fract() == 0.0 {
-        format!("{}", number as i64)
-    } else {
-        format!("{number}")
-    }
 }
 
 fn push_header(headers: &mut Vec<(HeaderName, HeaderValue)>, name: &str, value: &str) {
